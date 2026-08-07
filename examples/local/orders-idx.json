@@ -1,0 +1,14 @@
+{
+  "operation": "create-index",
+  "table": "public.orders",
+  "index": "orders_created_at_idx",
+  "definition": {
+    "method": "btree",
+    "columns": [
+      { "name": "created_at", "descending": true }
+    ],
+    "where": "status <> 'deleted'"
+  },
+  "pace_seconds": 2,
+  "pace_reason": "let autovacuum catch up between partitions"
+}

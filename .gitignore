@@ -1,0 +1,15 @@
+# Build output and demo scratch. `make clean` removes this directory.
+# It holds the compiled binary, coverage reports, generated plan artifacts and
+# the file state store the demo targets use.
+build/
+
+# Plan artifacts are environment-bound: the topology fingerprint ties one to a
+# single database's catalog, so a plan built against staging is refused against
+# production. What belongs in version control is the SPECIFICATION, the way you
+# commit .tf and not .tfplan. See docs/HANDOFF.md P1.
+*.plan
+
+# Local configuration may carry a DSN.
+partitionctl.yaml
+
+.DS_Store

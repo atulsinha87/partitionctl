@@ -1,0 +1,254 @@
+package protocol
+
+// NodeKind is the type tag the executor dispatches on. The vocabulary is fixed
+// at nine kinds by TRD §7.2.2 and is a versioned engine contract: adding a kind
+// requires a [PlanFormatVersion] bump.
+//
+// There is deliberately no barrier kind. A barrier is a node with N incoming
+// edges, which the graph's edge set already expresses.
+type NodeKind string
+
+// The nine node kinds (TRD §7.2.2).
+const (
+	// KindCatalogAssert evaluates catalog predicates and fails the run if any
+	// is false. No lock. Introduced by CreatePartitionedIndex.
+	KindCatalogAssert NodeKind = "catalog.assert"
+
+	// KindIndexCreateParentInvalid issues CREATE INDEX ON ONLY <parent>,
+	// creating the deliberately invalid parent index. ShareUpdateExclusive.
+	KindIndexCreateParentInvalid NodeKind = "index.create_parent_invalid"
+
+	// KindIndexCreateConcurrently issues CREATE INDEX CONCURRENTLY on one leaf.
+	// ShareUpdateExclusive, non-transactional, no finite statement_timeout
+	// (FR-EXEC-5, FR-EXEC-6).
+	KindIndexCreateConcurrently NodeKind = "index.create_concurrently"
+
+	// KindIndexAttach issues ALTER INDEX <parent> ATTACH PARTITION <child>.
+	// ShareUpdateExclusive.
+	KindIndexAttach NodeKind = "index.attach"
+
+	// KindIndexVerify asserts indisvalid / indisready / indislive /
+	// attachment. No lock, terminal on false.
+	KindIndexVerify NodeKind = "index.verify"
+
+	// KindWait is a fixed pause emitted by the planner for pacing (FR-ORD-3).
+	// The executor introduces no delays of its own.
+	KindWait NodeKind = "wait"
+
+	// KindIndexDropConcurrently issues DROP INDEX CONCURRENTLY on an
+	// *unattached* leaf index. Destructive: authorization-gated.
+	KindIndexDropConcurrently NodeKind = "index.drop_concurrently"
+
+	// KindIndexReindexConcurrently issues REINDEX INDEX CONCURRENTLY on one
+	// leaf index. ShareUpdateExclusive, non-transactional.
+	KindIndexReindexConcurrently NodeKind = "index.reindex_concurrently"
+
+	// KindIndexDropPartitioned issues DROP INDEX on a partitioned parent and
+	// cascades to every attached child. Destructive: authorization-gated. The
+	// only kind that takes AccessExclusiveLock, on the parent and every leaf
+	// simultaneously (TRD §7.2.10).
+	KindIndexDropPartitioned NodeKind = "index.drop_partitioned"
+)
+
+// LockLevel is the heaviest lock a node kind takes on a user relation, as
+// stated in TRD §7.2.2. It exists so `render` and `plan` output can warn the
+// operator (FR-DROP-5); the executor does not act on it.
+type LockLevel string
+
+// The lock levels in the vocabulary.
+const (
+	LockNone                 LockLevel = ""
+	LockShareUpdateExclusive LockLevel = "ShareUpdateExclusive"
+	LockAccessExclusive      LockLevel = "AccessExclusive"
+)
+
+// allNodeKinds is the vocabulary in TRD §7.2.2 table order.
+var allNodeKinds = []NodeKind{
+	KindCatalogAssert,
+	KindIndexCreateParentInvalid,
+	KindIndexCreateConcurrently,
+	KindIndexAttach,
+	KindIndexVerify,
+	KindWait,
+	KindIndexDropConcurrently,
+	KindIndexReindexConcurrently,
+	KindIndexDropPartitioned,
+}
+
+// AllNodeKinds returns the complete node vocabulary in TRD §7.2.2 table order.
+// The returned slice is a copy.
+func AllNodeKinds() []NodeKind {
+	out := make([]NodeKind, len(allNodeKinds))
+	copy(out, allNodeKinds)
+	return out
+}
+
+// Valid reports whether k is one of the nine kinds.
+func (k NodeKind) Valid() bool {
+	switch k {
+	case KindCatalogAssert,
+		KindIndexCreateParentInvalid,
+		KindIndexCreateConcurrently,
+		KindIndexAttach,
+		KindIndexVerify,
+		KindWait,
+		KindIndexDropConcurrently,
+		KindIndexReindexConcurrently,
+		KindIndexDropPartitioned:
+		return true
+	}
+	return false
+}
+
+// IsDestructive reports whether k destroys a catalog object. Exactly two kinds
+// are destructive, and every destructive node carries exactly one
+// [AuthorizationMode] that the executor re-evaluates against live state
+// immediately before dispatch (FR-AUTH-1, FR-AUTH-5, INV-2).
+func (k NodeKind) IsDestructive() bool {
+	switch k {
+	case KindIndexDropConcurrently, KindIndexDropPartitioned:
+		return true
+	}
+	return false
+}
+
+// IssuesDDL reports whether k sends a DDL statement. False for
+// [KindCatalogAssert], [KindIndexVerify] and [KindWait], which touch no
+// catalog object.
+func (k NodeKind) IssuesDDL() bool {
+	switch k {
+	case KindIndexCreateParentInvalid,
+		KindIndexCreateConcurrently,
+		KindIndexAttach,
+		KindIndexDropConcurrently,
+		KindIndexReindexConcurrently,
+		KindIndexDropPartitioned:
+		return true
+	}
+	return false
+}
+
+// MustRunOutsideTransaction reports whether k's statement must be issued
+// outside any explicit transaction block (FR-EXEC-6). True for every
+// CONCURRENTLY form, which PostgreSQL rejects inside a transaction.
+func (k NodeKind) MustRunOutsideTransaction() bool {
+	switch k {
+	case KindIndexCreateConcurrently,
+		KindIndexDropConcurrently,
+		KindIndexReindexConcurrently:
+		return true
+	}
+	return false
+}
+
+// AllowsStatementTimeout reports whether a finite statement_timeout may be set
+// for k.
+//
+// FR-EXEC-5 forbids it on [KindIndexCreateConcurrently], which legitimately
+// runs for hours. [KindIndexReindexConcurrently] is included here because it
+// has the same unbounded duration profile: it is a full index rebuild on a leaf
+// that may be 10 TB.
+//
+// [KindIndexDropConcurrently] is included for a different reason. It is fast in
+// itself, but a concurrent drop waits for every transaction that can still see
+// the index before it finishes, and that wait is bounded by the target's
+// workload rather than by the statement. Killing it at a finite
+// statement_timeout leaves the index with indislive = false, which is precisely
+// the wreckage the planner then has to recognize and recover from. The resume
+// cleanup path already issues its own drop with no finite statement_timeout and
+// documents this reasoning; the two paths must not disagree about the same
+// statement.
+//
+// lock_timeout is always set, on every DDL kind.
+func (k NodeKind) AllowsStatementTimeout() bool {
+	switch k {
+	case KindIndexCreateConcurrently, KindIndexReindexConcurrently, KindIndexDropConcurrently:
+		return false
+	}
+	return true
+}
+
+// WaitsForConcurrentTransactions reports whether k's statement blocks on the
+// application's own transactions as part of doing its work, rather than only
+// while acquiring its initial lock.
+//
+// This is the CONCURRENTLY family. Each of these statements has one or more
+// wait-for-lockers phases in which it takes a ShareLock on every concurrent
+// transaction's virtual XID through the regular lock manager, which means
+// lock_timeout bounds those waits too. That wait is not a lock queue that can
+// be retried later; it is the visibility barrier the statement must clear
+// before it can finish, and its length is a property of the target's workload.
+//
+// The executor uses this to give these kinds a much larger lock_timeout than
+// the short bound that protects ordinary DDL from queueing in front of
+// application traffic (FR-EXEC-5).
+func (k NodeKind) WaitsForConcurrentTransactions() bool {
+	switch k {
+	case KindIndexCreateConcurrently, KindIndexDropConcurrently, KindIndexReindexConcurrently:
+		return true
+	}
+	return false
+}
+
+// Retryable reports whether a failure of k may be retried at all. Errors are
+// still classified as retryable or terminal by the executor (FR-EXEC-3); this
+// only says the kind is not inherently single-shot.
+func (k NodeKind) Retryable() bool { return k.IssuesDDL() }
+
+// RetrySafe reports whether k's statement may be re-issued verbatim, in the
+// same process, after a failure the classifier called retryable.
+//
+// # Why this is not the same question as Retryable
+//
+// A retryable *error class* says the condition may pass. It says nothing about
+// whether the statement is still the right one to send, and for most of the DDL
+// here it is not, because the statement commits catalog state before it can
+// fail:
+//
+//   - CREATE INDEX CONCURRENTLY commits its phase-1 catalog entry and then
+//     waits for lockers, twice. A failure in either wait (55P03) leaves an
+//     INVALID index behind, so re-issuing gives 42P07 duplicate_table, which is
+//     terminal. The retry cannot succeed, and its terminal error replaces the
+//     lock timeout that actually killed the build.
+//   - CREATE INDEX ... ON ONLY and DROP INDEX CONCURRENTLY have the same shape
+//     whenever the statement committed but its response was lost to a reset
+//     connection: the retry meets 42P07 or 42704 undefined_object.
+//
+// ALTER INDEX ... ATTACH PARTITION is the exception: PostgreSQL's
+// ATExecAttachPartitionIdx silently no-ops when the child is already attached
+// to that parent, so re-issuing it is genuinely idempotent.
+//
+// The recovery for an unsafe kind is `resume`, which drops the wreckage under
+// provenance and rebuilds (FR-PLAN-6, AC-5). The executor therefore leaves the
+// node resumable and stops the run rather than re-issuing. Deciding this per
+// kind, rather than by re-reading the catalog, is what keeps the executor
+// dispatching on node kind alone and knowing nothing about indexes.
+func (k NodeKind) RetrySafe() bool {
+	return k == KindIndexAttach
+}
+
+// LockLevel returns the heaviest lock k takes on a user relation (TRD §7.2.2).
+func (k NodeKind) LockLevel() LockLevel {
+	switch k {
+	case KindIndexCreateParentInvalid,
+		KindIndexCreateConcurrently,
+		KindIndexAttach,
+		KindIndexDropConcurrently,
+		KindIndexReindexConcurrently:
+		return LockShareUpdateExclusive
+	case KindIndexDropPartitioned:
+		return LockAccessExclusive
+	}
+	return LockNone
+}
+
+func (k NodeKind) String() string { return string(k) }
+
+// CheckNodeKind returns an error matching [ErrUnknownNodeKind] if k is outside
+// the vocabulary.
+func CheckNodeKind(k NodeKind) error {
+	if k.Valid() {
+		return nil
+	}
+	return ErrUnknownNodeKind.Detailf("%q is not one of %v", string(k), allNodeKinds)
+}

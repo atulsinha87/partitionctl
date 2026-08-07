@@ -1,0 +1,264 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"flag"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/atulsinha/partitionctl/engine/executor"
+	"github.com/atulsinha/partitionctl/engine/protocol"
+)
+
+// cmdRender implements `render <plan>` (FR-CLI-4).
+//
+// It is offline. It reads the plan file and emits SQL, connecting to nothing,
+// which is the whole difference from `execute --dry-run`: one answers "what
+// would run", the other answers "would it still run cleanly right now"
+// (TRD §7.2.12).
+//
+// The SQL is re-rendered from each node's structured parameters through
+// [executor.Render]. The plan's own rendered_sql field is never echoed: it is a
+// non-authoritative human preview, and re-rendering is what keeps it off the
+// injection surface (FR-PLANFILE-7, T2). A runbook that disagreed with what the
+// executor would send would be worse than no runbook.
+func (a *App) cmdRender(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("render", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+
+	rollback := fs.Bool("rollback", false, "emit the unwind runbook instead (TRD §13.2)")
+	confirm := fs.Bool("confirm-exclusive-lock", false,
+		"acknowledge that the unwind's final statement takes an AccessExclusiveLock on the parent "+
+			"and every leaf; without it that statement is emitted commented out (TRD §13.2.1)")
+	out := fs.String("o", "", "write to this file instead of stdout")
+	lockTimeout := fs.Duration("lock-timeout", 5*time.Second,
+		"lock_timeout to set in the runbook's session preamble")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	planPath, err := requirePositional(fs, "<plan>")
+	if err != nil {
+		return err
+	}
+
+	plan, err := loadPlan(planPath)
+	if err != nil {
+		return err
+	}
+	if err := plan.Validate(); err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	if *rollback {
+		err = renderRollback(&buf, plan, *confirm, *lockTimeout)
+	} else {
+		err = renderForward(&buf, plan, *lockTimeout)
+	}
+	if err != nil {
+		return err
+	}
+
+	if *out == "" {
+		_, err = a.Stdout.Write(buf.Bytes())
+		return err
+	}
+	if err := writeFileAtomic(*out, buf.Bytes()); err != nil {
+		return protocol.ErrFailure.Detailf("writing %s: %v", *out, err)
+	}
+	fmt.Fprintf(a.Stderr, "wrote %s\n", *out)
+	return nil
+}
+
+// renderForward emits the runbook that reaches the plan's end state.
+func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout time.Duration) error {
+	order, err := plan.TopologicalOrder()
+	if err != nil {
+		return err
+	}
+	writeHeader(w, plan, "forward", lockTimeout)
+
+	for i, id := range order {
+		n, ok := plan.NodeByID(id)
+		if !ok {
+			return protocol.ErrInvalidPlan.Detailf("topological order names unknown node %q", id)
+		}
+		fmt.Fprintf(w, "\n-- [%d/%d] %s  %s\n", i+1, len(order), n.Kind, n.ID)
+		if n.EstimatedSeconds > 0 {
+			fmt.Fprintf(w, "--   estimate %s (FR-PLAN-9; advisory)\n", humanSeconds(n.EstimatedSeconds))
+		}
+		if lock := n.Kind.LockLevel(); lock != protocol.LockNone {
+			fmt.Fprintf(w, "--   lock %s\n", lock)
+		}
+		if n.Kind.MustRunOutsideTransaction() {
+			fmt.Fprintln(w, "--   MUST NOT run inside a transaction block; PostgreSQL rejects it (FR-EXEC-6)")
+		}
+		if !n.Kind.AllowsStatementTimeout() {
+			fmt.Fprintln(w, "--   run with no finite statement_timeout: this legitimately takes hours (FR-EXEC-5)")
+		}
+		if n.Authorization != nil {
+			fmt.Fprintf(w, "--   DESTRUCTIVE. Authorization mode %s on %s.\n",
+				n.Authorization.Mode, n.Authorization.Object)
+			fmt.Fprintln(w, "--   The engine re-evaluates this against live state before dispatch (FR-AUTH-5).")
+			fmt.Fprintln(w, "--   Running it by hand skips that check. Satisfy yourself first.")
+		}
+
+		sql, err := executor.Render(n)
+		if err != nil {
+			return err
+		}
+		if sql == "" {
+			fmt.Fprintf(w, "--   no statement: %s\n", describeNonDDL(n))
+			continue
+		}
+		fmt.Fprintf(w, "%s;\n", sql)
+	}
+
+	fmt.Fprintln(w, "\n-- End of runbook.")
+	fmt.Fprintln(w, "-- Verify the result with: partitionctl verify <plan>")
+	return nil
+}
+
+// renderRollback emits the unwind runbook (TRD §13.2, §13.2.1).
+//
+// Unwinding a partial create is only partially online, and the reason is two
+// PostgreSQL restrictions with no workaround: DROP INDEX CONCURRENTLY cannot be
+// used on a partitioned index, and an attached child index cannot be dropped
+// individually because there is no ALTER INDEX ... DETACH PARTITION. So the
+// unwind splits in two, and the split is the whole content of this runbook:
+//
+//   - leaf indexes that were built but never attached come out online, with
+//     DROP INDEX CONCURRENTLY at ShareUpdateExclusiveLock;
+//   - the parent index, and with it every attached child by cascade, comes out
+//     with one DROP INDEX that takes AccessExclusiveLock on the parent and every
+//     leaf simultaneously.
+//
+// The second statement is gated. Without --confirm-exclusive-lock it is emitted
+// commented out, because an operator should never reach an AccessExclusiveLock
+// on their largest table by copying a block of text (TRD §13.2.1).
+func renderRollback(w *bytes.Buffer, plan *protocol.Plan, confirmed bool, lockTimeout time.Duration) error {
+	if plan.Target.Index == nil {
+		return protocol.ErrFailure.Detailf("this plan's target names no index, so there is nothing to unwind")
+	}
+	parentIndex := *plan.Target.Index
+	writeHeader(w, plan, "rollback", lockTimeout)
+
+	fmt.Fprintln(w, "--")
+	fmt.Fprintln(w, "-- Roll forward is the default and is fully online: `partitionctl resume <plan>`")
+	fmt.Fprintln(w, "-- converges without ever taking an AccessExclusiveLock. Unwinding does not.")
+	fmt.Fprintln(w, "-- Use this only when the build must vacate the cluster (TRD §13.2).")
+	fmt.Fprintln(w, "--")
+
+	// Phase 1: the leaf indexes this plan would have created. Each is dropped
+	// online, and each is skipped by the operator if it is already attached.
+	children := plannedChildIndexes(plan)
+	fmt.Fprintf(w, "\n-- Phase 1 of 2: unattached leaf indexes (%d), online, ShareUpdateExclusiveLock.\n", len(children))
+	fmt.Fprintln(w, "-- Each of these is skipped if the index is already attached to the parent:")
+	fmt.Fprintln(w, "-- an attached child is a dependency of its partitioned parent and cannot be")
+	fmt.Fprintln(w, "-- dropped individually. It is removed by the cascade in phase 2 instead.")
+	fmt.Fprintln(w, "--")
+	fmt.Fprintln(w, "-- Check attachment first:")
+	fmt.Fprintf(w, "--   SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid\n")
+	fmt.Fprintf(w, "--    WHERE i.inhparent = %s::regclass;\n", sqlLiteral(parentIndex.Quoted()))
+	for _, child := range children {
+		fmt.Fprintf(w, "DROP INDEX CONCURRENTLY IF EXISTS %s;\n", child.Quoted())
+	}
+	if len(children) == 0 {
+		fmt.Fprintln(w, "-- (this plan created no leaf indexes)")
+	}
+
+	// Phase 2: the parent, and everything attached to it.
+	fmt.Fprintln(w, "\n-- Phase 2 of 2: the parent index.")
+	fmt.Fprintln(w, "-- DROP INDEX CONCURRENTLY is rejected on a partitioned index, so this is the")
+	fmt.Fprintln(w, "-- only statement available, and it takes AccessExclusiveLock on the parent AND")
+	fmt.Fprintln(w, "-- on every leaf partition simultaneously. It blocks reads and writes on the")
+	fmt.Fprintln(w, "-- whole tree for as long as it takes to acquire, which means queueing behind")
+	fmt.Fprintln(w, "-- every open transaction touching any leaf. No data is rewritten.")
+	line := fmt.Sprintf("DROP INDEX %s;", parentIndex.Quoted())
+	if confirmed {
+		fmt.Fprintf(w, "%s\n", line)
+	} else {
+		fmt.Fprintln(w, "--")
+		fmt.Fprintln(w, "-- Emitted commented out. Re-run with --confirm-exclusive-lock to emit it")
+		fmt.Fprintln(w, "-- as a live statement (TRD §13.2.1).")
+		fmt.Fprintf(w, "-- %s\n", line)
+	}
+
+	fmt.Fprintln(w, "\n-- Confirm the catalog is back to its pre-run state:")
+	fmt.Fprintln(w, "--   partitionctl verify --expect-absent <plan>")
+	return nil
+}
+
+// writeHeader emits the runbook preamble: what this is, what it came from, and
+// the session settings every statement below assumes.
+func writeHeader(w *bytes.Buffer, plan *protocol.Plan, kind string, lockTimeout time.Duration) {
+	fmt.Fprintf(w, "-- partitionctl %s runbook\n", kind)
+	fmt.Fprintf(w, "-- plan       %s\n", plan.PlanID)
+	fmt.Fprintf(w, "-- operation  %s\n", plan.Operation)
+	fmt.Fprintf(w, "-- target     %s", plan.Target.Table)
+	if plan.Target.Index != nil {
+		fmt.Fprintf(w, " index %s", plan.Target.Index)
+	}
+	if plan.Target.Database != "" {
+		fmt.Fprintf(w, " in database %s", plan.Target.Database)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "-- digest     %s\n", plan.Digest)
+	fmt.Fprintf(w, "-- planned    %s\n", plan.CreatedAt)
+	fmt.Fprintln(w, "--")
+	fmt.Fprintln(w, "-- Generated offline from the plan artifact. No database was contacted, so nothing")
+	fmt.Fprintln(w, "-- here reflects the catalog's current state. For a live pre-flight, use:")
+	fmt.Fprintln(w, "--   partitionctl execute --dry-run <plan>")
+	fmt.Fprintln(w, "--")
+	fmt.Fprintln(w, "-- Every statement below assumes this session preamble. lock_timeout is not")
+	fmt.Fprintln(w, "-- optional: without it a statement queues behind a long transaction forever")
+	fmt.Fprintln(w, "-- and blocks everything behind it (FR-EXEC-5).")
+	fmt.Fprintf(w, "SET lock_timeout = %s;\n", sqlLiteral(lockTimeout.String()))
+	fmt.Fprintln(w, "SET statement_timeout = 0;  -- index builds legitimately run for hours")
+}
+
+// plannedChildIndexes lists the leaf indexes the plan creates, in plan order.
+func plannedChildIndexes(plan *protocol.Plan) []protocol.ObjectName {
+	var out []protocol.ObjectName
+	for i := range plan.Nodes {
+		n := &plan.Nodes[i]
+		if n.Kind != protocol.KindIndexCreateConcurrently {
+			continue
+		}
+		p, ok := n.Params.(*protocol.CreateConcurrentlyParams)
+		if !ok {
+			continue
+		}
+		out = append(out, p.Index)
+	}
+	return out
+}
+
+// describeNonDDL explains a node that sends no statement.
+func describeNonDDL(n *protocol.Node) string {
+	switch n.Kind {
+	case protocol.KindCatalogAssert:
+		if p, ok := n.Params.(*protocol.CatalogAssertParams); ok {
+			return fmt.Sprintf("%d catalog precondition(s), evaluated before anything runs", len(p.Assertions))
+		}
+		return "catalog preconditions"
+	case protocol.KindIndexVerify:
+		if p, ok := n.Params.(*protocol.VerifyParams); ok {
+			return fmt.Sprintf("%d catalog assertion(s) over pg_index and pg_inherits", len(p.Checks))
+		}
+		return "catalog assertions"
+	case protocol.KindWait:
+		if p, ok := n.Params.(*protocol.WaitParams); ok {
+			return fmt.Sprintf("pause %ds: %s", p.Seconds, p.Reason)
+		}
+		return "pause"
+	}
+	return string(n.Kind)
+}
+
+// sqlLiteral renders a single-quoted SQL string literal.
+func sqlLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
