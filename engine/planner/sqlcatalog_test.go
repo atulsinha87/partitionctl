@@ -186,7 +186,7 @@ var (
 	treeCols     = []string{"oid", "level", "isleaf", "schema", "name", "relkind", "owner_oid", "owner", "relpages", "parent_oid", "bound"}
 	indexCols    = []string{"oid", "schema", "name", "relkind", "owner_oid", "relpages", "table_oid", "table_schema", "table_name",
 		"indisvalid", "indisready", "indislive", "indisunique", "indisprimary", "indisexclusion",
-		"parent_index_oid", "conname", "contype"}
+		"parent_index_oid", "conname", "contype", "comment"}
 	roleCols = []string{"oid", "rolname", "is_member"}
 )
 
@@ -199,6 +199,22 @@ func treeRow(oid int64, level int64, isLeaf bool, schema, name, kind string, own
 }
 
 func indexRow(oid int64, schema, name, kind string, owner, pages, tableOID int64, tableSchema, tableName string,
+	valid, ready, live, unique, primary, exclusion bool, parentIdx int64, conname, contype string) []driver.Value {
+	return append(indexRowBase(oid, schema, name, kind, owner, pages, tableOID, tableSchema, tableName,
+		valid, ready, live, unique, primary, exclusion, parentIdx, conname, contype), "")
+}
+
+// markedIndexRow is indexRow with a PartitionCTL ownership marker in the
+// comment column, which is what the planner reads to prove an object is its own
+// (AC-6). It rides along with the rest of the index state, so ownership costs no
+// extra query (NFR-PERF-1).
+func markedIndexRow(oid int64, schema, name, kind string, owner, pages, tableOID int64, tableSchema, tableName string,
+	valid, ready, live, unique, primary, exclusion bool, parentIdx int64, conname, contype, comment string) []driver.Value {
+	return append(indexRowBase(oid, schema, name, kind, owner, pages, tableOID, tableSchema, tableName,
+		valid, ready, live, unique, primary, exclusion, parentIdx, conname, contype), comment)
+}
+
+func indexRowBase(oid int64, schema, name, kind string, owner, pages, tableOID int64, tableSchema, tableName string,
 	valid, ready, live, unique, primary, exclusion bool, parentIdx int64, conname, contype string) []driver.Value {
 	return []driver.Value{oid, schema, name, kind, owner, pages, tableOID, tableSchema, tableName,
 		valid, ready, live, unique, primary, exclusion, parentIdx, conname, contype}
@@ -890,5 +906,44 @@ func TestSQLCatalogMidStreamFailures(t *testing.T) {
 				t.Fatalf("err = %v, want ErrCatalogUnavailable", err)
 			}
 		})
+	}
+}
+
+// The ownership marker comes back with the rest of the index state, in the same
+// pass. Reading it per index would cost a round trip per leaf, which does not
+// fit inside NFR-PERF-1 at a thousand partitions.
+func TestSQLCatalogReadsTheOwnershipMarkerInTheSamePass(t *testing.T) {
+	marker, err := protocol.FormatMarker(protocol.Marker{
+		Run: "run-7", Plan: "sha256:abc", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("FormatMarker: %v", err)
+	}
+	s := newStubDB().respond(qIndexesOnRelations, indexCols,
+		markedIndexRow(902, "public", "ours", "i", 10, 34, 201, "public", "orders_2026_01",
+			false, true, true, false, false, false, 0, "", "", marker),
+		indexRow(903, "public", "theirs", "i", 10, 34, 201, "public", "orders_2026_01",
+			false, true, true, false, false, false, 0, "", ""),
+	)
+	c := NewSQLCatalog(openStub(t, s))
+
+	got, err := c.IndexesOnRelations(ctx(), []uint32{201})
+	if err != nil {
+		t.Fatalf("IndexesOnRelations: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d indexes, want 2", len(got))
+	}
+	if m, status := got[0].Marker(); status != protocol.MarkerOurs || m.Run != "run-7" {
+		t.Errorf("marked index: status = %v, marker = %+v", status, m)
+	}
+	if _, status := got[1].Marker(); status != protocol.MarkerAbsent {
+		t.Errorf("unmarked index: status = %v, want absent", status)
+	}
+
+	// One query, not one per index.
+	if n := len(s.recorded()); n != 1 {
+		t.Errorf("issued %d queries for two indexes, want 1 (NFR-PERF-1)", n)
 	}
 }

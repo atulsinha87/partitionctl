@@ -591,14 +591,14 @@ func parentIndexNode(parent, parentIndex protocol.ObjectName, def protocol.Index
 		Index:      parentIndex,
 		Definition: def,
 	}
-	return protocol.Node{
+	return withMarkerPreview(protocol.Node{
 		ID:               nodeParentIndex,
 		Kind:             protocol.KindIndexCreateParentInvalid,
 		Params:           params,
 		DependsOn:        []protocol.NodeID{nodeAssert},
 		RenderedSQL:      renderCreateParentInvalid(params),
 		EstimatedSeconds: catalogOnlySeconds,
-	}
+	})
 }
 
 // dropNode removes the INVALID leaf index left by an interrupted CREATE INDEX
@@ -645,13 +645,13 @@ func createNode(
 		Definition:  def,
 		ParentIndex: &pi,
 	}
-	return protocol.Node{
+	return withMarkerPreview(protocol.Node{
 		ID:               nodeID("create", leaf),
 		Kind:             protocol.KindIndexCreateConcurrently,
 		Params:           params,
 		RenderedSQL:      renderCreateConcurrently(params),
 		EstimatedSeconds: seconds,
-	}
+	})
 }
 
 // leafVerifyNode checks the child before it is attached: indisvalid, indisready
@@ -676,13 +676,13 @@ func leafVerifyNode(leaf, child protocol.ObjectName) protocol.Node {
 // no statement is issued for that.
 func attachNode(leaf, child, parentIndex protocol.ObjectName) protocol.Node {
 	params := &protocol.AttachParams{ParentIndex: parentIndex, ChildIndex: child}
-	return protocol.Node{
+	return withMarkerPreview(protocol.Node{
 		ID:               nodeID("attach", leaf),
 		Kind:             protocol.KindIndexAttach,
 		Params:           params,
 		RenderedSQL:      renderAttach(params),
 		EstimatedSeconds: catalogOnlySeconds,
-	}
+	})
 }
 
 // waitNode is the planner-emitted pause between leaves (FR-ORD-3). It is a node

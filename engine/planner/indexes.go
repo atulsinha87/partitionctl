@@ -260,9 +260,16 @@ func DecideCleanup(ctx context.Context, cr CatalogReader, claims ClaimLookup, c 
 				"cannot be read (FR-PLAN-7)", c.ChildIndex.String(), c.Leaf.Name.String(), c.Condition)
 	}
 
-	marker, status, err := IndexMarker(ctx, cr, c.ChildIndex)
-	if err != nil {
-		return CleanupHalt, protocol.DropVerdict{}, err
+	// The comment came back with the rest of the index state in the discovery
+	// pass, so the common path costs no extra query at all. The per-index read
+	// is the fallback for a caller that inspected the tree some other way.
+	marker, status := c.Existing.Marker()
+	if c.Existing.Comment == "" {
+		var err error
+		marker, status, err = IndexMarker(ctx, cr, c.ChildIndex)
+		if err != nil {
+			return CleanupHalt, protocol.DropVerdict{}, err
+		}
 	}
 	in := protocol.ProvenanceDropInput{Object: c.ChildIndex, Status: status, Marker: marker}
 	// The claim is only consulted where it can change the answer, so a marked

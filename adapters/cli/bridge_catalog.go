@@ -153,6 +153,7 @@ func indexStateOf(i planner.Index, all map[protocol.ObjectName]planner.Index) cr
 		Valid:         i.IsValid,
 		Ready:         i.IsReady,
 		Live:          i.IsLive,
+		Comment:       i.Comment,
 	}
 	if i.ParentIndexOID != 0 {
 		for name, cand := range all {

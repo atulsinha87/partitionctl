@@ -309,7 +309,8 @@ SELECT ic.oid::int8,
        i.indisexclusion,
        COALESCE(inh.inhparent::oid::int8, 0),
        COALESCE(con.conname, '')::text,
-       COALESCE(con.contype::text, '')::text
+       COALESCE(con.contype::text, '')::text,
+       COALESCE(pg_catalog.obj_description(ic.oid, 'pg_class'), '')::text
 FROM pg_catalog.pg_index i
 JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
@@ -429,12 +430,12 @@ func scanIndex(s scanner) (Index, error) {
 		tableSchema, tableName                            string
 		isValid, isReady, isLive                          bool
 		isUnique, isPrimary, isExclusion                  bool
-		conName, conType                                  string
+		conName, conType, comment                         string
 	)
 	if err := s.Scan(&oid, &schema, &indexName, &relKind, &ownerOID, &relPages,
 		&tableOID, &tableSchema, &tableName,
 		&isValid, &isReady, &isLive, &isUnique, &isPrimary, &isExclusion,
-		&parentIndexOID, &conName, &conType); err != nil {
+		&parentIndexOID, &conName, &conType, &comment); err != nil {
 		return Index{}, ErrCatalogUnavailable.Wrap(err)
 	}
 	return Index{
@@ -454,6 +455,7 @@ func scanIndex(s scanner) (Index, error) {
 		ParentIndexOID: uint32(parentIndexOID),
 		ConstraintName: conName,
 		ConstraintType: conType,
+		Comment:        comment,
 	}, nil
 }
 

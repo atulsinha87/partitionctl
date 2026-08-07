@@ -107,44 +107,69 @@ func TestExecuteAllowsAPlanWithNoDestructiveNode(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 
-// seedClaim leaves behind the state a process killed mid-CREATE INDEX
-// CONCURRENTLY leaves: a run in FAILED whose node for the victim object is
-// still in flight, so the object is claimed but unmarked.
+// seedClaim leaves behind exactly what a process killed mid-CREATE INDEX
+// CONCURRENTLY leaves: a FAILED run whose *create* node for the victim object
+// is still in flight, so the object is claimed but carries no marker.
 //
-// The claim is held by a run of a *different* plan, because that is the
-// scenario FR-CLI-9 is about: a run crashed, the operator re-planned, and the
-// new artifact has a new digest.
+// The claim has to come from a create node. A drop node names the object it
+// would destroy, for the audit trail, and that is deliberately not a claim: a
+// plan saying "drop X" must never be the proof that X is ours to drop (AC-6,
+// protocol.NodeKind.ClaimsOwnership).
+//
+// The run belongs to a *different* plan, because that is the scenario FR-CLI-9
+// is about: a run crashed, the operator re-planned, and the new artifact has a
+// new digest.
 func (h *harness) seedClaim(p *protocol.Plan) {
 	h.t.Helper()
 
-	older := h.dropPlan()
-	older.PlanID = "plan-drop-fixture-older"
-	if err := older.Seal(); err != nil {
+	victim := obj("public", protocol.ChildIndexName(testIndex, "orders_2026_01"))
+	leaf := obj("public", "orders_2026_01")
+	parentIndex := obj("public", testIndex)
+
+	crashed := &protocol.Plan{
+		FormatVersion: protocol.PlanFormatVersion,
+		PlanID:        "plan-crashed-build",
+		Operation:     protocol.OpCreateIndex,
+		CreatedAt:     protocol.NewTimestamp(h.Now()),
+		Target: protocol.Target{
+			Database: testDBName,
+			Table:    obj("public", "orders"),
+			Index:    &parentIndex,
+		},
+		TopologyFingerprint: h.liveFingerprint(),
+		Nodes: []protocol.Node{{
+			ID:   "create:orders_2026_01",
+			Kind: protocol.KindIndexCreateConcurrently,
+			Params: &protocol.CreateConcurrentlyParams{
+				Partition:   leaf,
+				Index:       victim,
+				ParentIndex: &parentIndex,
+				Definition: protocol.IndexDefinition{
+					Columns: []protocol.IndexColumn{{Name: "created_at"}},
+				},
+			},
+		}},
+	}
+	if err := crashed.Seal(); err != nil {
 		h.t.Fatalf("Seal: %v", err)
 	}
-	if older.Digest == p.Digest {
-		h.t.Fatal("fixture error: the prior plan must have a different digest")
+	if crashed.Digest == p.Digest {
+		h.t.Fatal("fixture error: the crashed run's plan must have a different digest")
 	}
-	run := h.seedRun(older)
+	run := h.seedRun(crashed)
 
-	// The node has dispatched, so its record claims the object. Orphan recovery
-	// will have put it back in PENDING, which still claims.
-	for i := range older.Nodes {
-		n := &older.Nodes[i]
-		if _, ok := n.Object(); !ok {
-			continue
+	// The node dispatched, so its record claims the object. The process then
+	// died before the ownership marker could be written.
+	for _, to := range []protocol.NodeState{protocol.NodeReady, protocol.NodeRunning} {
+		from := protocol.NodePending
+		if to == protocol.NodeRunning {
+			from = protocol.NodeReady
 		}
-		for _, to := range []protocol.NodeState{protocol.NodeReady, protocol.NodeRunning} {
-			from := protocol.NodePending
-			if to == protocol.NodeRunning {
-				from = protocol.NodeReady
-			}
-			if _, err := h.Store.TransitionNode(ctx(), state.NodeTransition{
-				RunID: run.RunID, NodeID: n.ID, From: from, To: to,
-				IncrementAttempt: to == protocol.NodeRunning,
-			}); err != nil {
-				h.t.Fatalf("TransitionNode: %v", err)
-			}
+		if _, err := h.Store.TransitionNode(ctx(), state.NodeTransition{
+			RunID: run.RunID, NodeID: "create:orders_2026_01", From: from, To: to,
+			IncrementAttempt: to == protocol.NodeRunning,
+		}); err != nil {
+			h.t.Fatalf("TransitionNode: %v", err)
 		}
 	}
 

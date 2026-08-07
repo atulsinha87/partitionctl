@@ -20,8 +20,12 @@
 //     state immediately before dispatch, and the satisfied mode plus its
 //     evidence is recorded before the statement runs (FR-AUTH-5, FR-AUTH-6,
 //     INV-2). A plan is a proposal, never a permission.
-//   - Provenance for an object the executor is about to create is committed
-//     before the DDL that creates it (INV-1).
+//   - The ownership marker is written onto every object the executor creates,
+//     immediately after the statement that creates it returns (INV-1 as
+//     amended). The record that covers the window between the two is the node
+//     checkpoint, which is durable before dispatch: a crash there leaves an
+//     object with a live claim and no marker, which `resume` adopts, and the
+//     reverse can never occur.
 //   - Errors are classified by PostgreSQL SQLSTATE, not by string matching, and
 //     only retryable classes are retried, with bounded exponential backoff plus
 //     jitter (FR-EXEC-3, FR-EXEC-4).
@@ -37,10 +41,9 @@
 //
 // # Scope of this build
 //
-// Seven of the nine node kinds are implemented: the set
-// CreatePartitionedIndex emits. index.reindex_concurrently and
-// index.drop_partitioned return [ErrUnsupportedNodeKind], raised as a
-// pre-flight check before any statement runs. See [SupportedKinds].
+// All nine node kinds are implemented. A kind outside the vocabulary is refused
+// with [ErrUnsupportedNodeKind] as a pre-flight check, before any statement
+// runs, so adding one stays a versioned engine change. See [SupportedKinds].
 //
 // # Ports
 //

@@ -355,6 +355,13 @@ func (f *FakeCatalog) IndexComment(ctx context.Context, index protocol.ObjectNam
 	if err := f.call("IndexComment"); err != nil {
 		return "", false, err
 	}
+	// The comment normally rides along with the index state; this method is the
+	// per-index fallback, so it answers from either place.
+	for _, i := range f.Indexes {
+		if i.Name == index && i.Comment != "" {
+			return i.Comment, true, nil
+		}
+	}
 	comment, ok := f.Comments[index.String()]
 	if !ok || comment == "" {
 		// An unqualified name resolves the way the server would: by bare name,

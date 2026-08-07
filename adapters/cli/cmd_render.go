@@ -114,11 +114,43 @@ func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout time.Durati
 			continue
 		}
 		fmt.Fprintf(w, "%s;\n", sql)
+
+		// TRD §14.2: the runbook must reach the same catalog state the engine
+		// would. That includes the ownership marker, or an operator who ran the
+		// runbook by hand would leave objects this tool can never prove are its
+		// own, and every later plan would halt on them (FR-PLAN-7, AC-6).
+		//
+		// The marker records run "manual" because that is the truth: no run
+		// executed it. The prior marker is unknown from here, so a rewrite kind
+		// re-establishes rather than preserves; the runbook is a debugging and
+		// audit aid, not a resume path.
+		marker, ok, err := protocol.RenderMarkerStatement(n, manualMarker(plan), protocol.Marker{}, protocol.MarkerAbsent)
+		if err != nil {
+			return err
+		}
+		if ok {
+			fmt.Fprintln(w, "--   ownership marker: what lets a later run prove this object is PartitionCTL's")
+			fmt.Fprintf(w, "%s;\n", marker)
+		}
 	}
 
 	fmt.Fprintln(w, "\n-- End of runbook.")
 	fmt.Fprintln(w, "-- Verify the result with: partitionctl verify <plan>")
 	return nil
+}
+
+// manualMarker is the ownership marker a hand-run runbook writes.
+//
+// run is the literal "manual", not a fabricated run id. A marker is evidence,
+// and evidence that names a run which never existed is worse than evidence that
+// says plainly it came from a human.
+func manualMarker(plan *protocol.Plan) protocol.Marker {
+	return protocol.Marker{
+		Run:  "manual",
+		Plan: plan.Digest,
+		Op:   string(plan.Operation),
+		At:   protocol.MarkerTime(plan.CreatedAt.Time),
+	}
 }
 
 // renderRollback emits the unwind runbook (TRD §13.2, §13.2.1).

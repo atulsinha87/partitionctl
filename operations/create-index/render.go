@@ -54,6 +54,25 @@ func renderCreateConcurrently(p *protocol.CreateConcurrentlyParams) string {
 	return b.String()
 }
 
+// withMarkerPreview appends the ownership marker the executor writes after the
+// node's statement, so the artifact a human approves shows every statement the
+// run will issue rather than all but one (G2, FR-PLANFILE-7).
+//
+// The run and plan fields read "pending" because neither exists yet: a plan is
+// not bound to a run until `execute` opens one, and the digest cannot name
+// itself. The executor substitutes the real values; this string is never sent
+// anywhere.
+func withMarkerPreview(n protocol.Node) protocol.Node {
+	stmt, ok, err := protocol.RenderMarkerStatement(&n, protocol.Marker{
+		Run: "pending", Plan: "pending", Op: string(protocol.OpCreateIndex), At: "pending",
+	}, protocol.Marker{}, protocol.MarkerAbsent)
+	if err != nil || !ok {
+		return n
+	}
+	n.RenderedSQL += "\n" + stmt + ";"
+	return n
+}
+
 // renderAttach previews ALTER INDEX <parent> ATTACH PARTITION <child>.
 func renderAttach(p *protocol.AttachParams) string {
 	return "ALTER INDEX " + p.ParentIndex.Quoted() +

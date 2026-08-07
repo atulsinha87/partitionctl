@@ -154,6 +154,19 @@ type Index struct {
 	ConstraintName string
 	// ConstraintType is pg_constraint.contype: "p", "u" or "x", else empty.
 	ConstraintType string
+	// Comment is obj_description(index, 'pg_class'): where PartitionCTL records
+	// that it created the object ([protocol.Marker]).
+	//
+	// It rides along with the rest of the index state rather than being fetched
+	// per index, because ownership is a per-index question and asking it one
+	// index at a time would cost a round trip per leaf. Discovery has to stay
+	// O(1) queries in the number of partitions (NFR-PERF-1).
+	Comment string
+}
+
+// Marker classifies whatever comment the index carries.
+func (i Index) Marker() (protocol.Marker, protocol.MarkerStatus) {
+	return protocol.ParseMarker(i.Comment)
 }
 
 func (i Index) String() string { return i.Name.String() }
