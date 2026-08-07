@@ -65,8 +65,24 @@ func Render(n *protocol.Node) (string, error) {
 		}
 		return "DROP INDEX CONCURRENTLY " + p.Index.Quoted(), nil
 
-	case protocol.KindIndexReindexConcurrently, protocol.KindIndexDropPartitioned:
-		return "", unsupportedKind(n)
+	case protocol.KindIndexReindexConcurrently:
+		p, err := paramsOf[*protocol.ReindexConcurrentlyParams](n)
+		if err != nil {
+			return "", err
+		}
+		return "REINDEX INDEX CONCURRENTLY " + p.Index.Quoted(), nil
+
+	case protocol.KindIndexDropPartitioned:
+		p, err := paramsOf[*protocol.DropPartitionedParams](n)
+		if err != nil {
+			return "", err
+		}
+		// No CASCADE and no CONCURRENTLY. The statement cascades to every
+		// attached child index on its own, and PostgreSQL rejects the
+		// concurrent form on a partitioned index outright (TRD §7.2.10). No
+		// IF EXISTS either: an index that is already gone is a topology
+		// question the planner answers, not something to paper over mid-run.
+		return "DROP INDEX " + p.Index.Quoted(), nil
 	}
 	return "", protocol.ErrUnknownNodeKind.Detailf("node %q: %q", n.ID, n.Kind)
 }
@@ -149,7 +165,7 @@ func renderCreateIndex(n *protocol.Node, c createIndex) (string, error) {
 			}
 			b.WriteString(protocol.QuoteIdentifier(k))
 			b.WriteString(" = ")
-			b.WriteString(quoteLiteral(c.Definition.StorageParams[k]))
+			b.WriteString(protocol.QuoteLiteral(c.Definition.StorageParams[k]))
 		}
 		b.WriteString(")")
 	}
@@ -193,15 +209,6 @@ func renderIndexColumn(b *strings.Builder, c protocol.IndexColumn) {
 			b.WriteString(" NULLS LAST")
 		}
 	}
-}
-
-// quoteLiteral renders a storage-parameter value as a single-quoted SQL
-// literal. Values are operator-supplied strings, so doubling the quote is the
-// whole escape: PostgreSQL processes no backslash escapes inside a standard
-// string literal when standard_conforming_strings is on, which it is by default
-// on every supported version.
-func quoteLiteral(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 // paramsOf recovers a node's concrete params type. [protocol.Node.Validate]

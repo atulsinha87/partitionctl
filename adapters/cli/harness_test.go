@@ -136,6 +136,33 @@ type fakeVerifyCatalog struct {
 	// Parents maps a child index to the partitioned index it is attached to.
 	Parents map[protocol.ObjectName]protocol.ObjectName
 	Leaves  []protocol.ObjectName
+	// Comments maps an index's identity form to the comment on it, which is
+	// where the PartitionCTL ownership marker lives.
+	Comments map[string]string
+}
+
+func (f *fakeVerifyCatalog) IndexComment(_ context.Context, index protocol.ObjectName) (string, bool, error) {
+	c, ok := f.Comments[index.String()]
+	if !ok || c == "" {
+		return "", false, nil
+	}
+	return c, true, nil
+}
+
+// Mark writes a well-formed PartitionCTL ownership marker onto an index, which
+// is what proves the object is this tool's to clean up (AC-6).
+func (f *fakeVerifyCatalog) Mark(index protocol.ObjectName, run string) {
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run: run, Plan: "sha256:fake", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		panic("cli: fakeVerifyCatalog.Mark: " + err.Error())
+	}
+	if f.Comments == nil {
+		f.Comments = map[string]string{}
+	}
+	f.Comments[index.String()] = text
 }
 
 func (f *fakeVerifyCatalog) Index(_ context.Context, name protocol.ObjectName) (verifier.IndexState, bool, error) {

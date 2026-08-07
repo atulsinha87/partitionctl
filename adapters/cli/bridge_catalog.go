@@ -189,6 +189,10 @@ func indexStateOf(i planner.Index, all map[protocol.ObjectName]planner.Index) cr
 type catalogEvaluator struct {
 	assert *assertEvaluator
 	verify *verifier.Verifier
+	// marker is the read surface the ownership marker comes off. It is the same
+	// catalog the verifier holds; it is named separately because reading a
+	// marker is an authorization question, not a verification one.
+	marker verifier.Catalog
 }
 
 var _ executor.CatalogEvaluator = (*catalogEvaluator)(nil)
@@ -234,4 +238,19 @@ func (e *catalogEvaluator) Verify(ctx context.Context, checks []protocol.VerifyC
 		}
 	}
 	return out, nil
+}
+
+// Marker implements [executor.CatalogEvaluator] (FR-AUTH-2 as amended).
+//
+// It reads the ownership marker off the object itself, through the same
+// verifier catalog the index.verify checks use. An index that does not exist,
+// or that carries no comment, is [protocol.MarkerAbsent] and a nil error:
+// absence is an answer, and it is the answer that halts a destructive decision
+// rather than one that hides an outage.
+func (e *catalogEvaluator) Marker(ctx context.Context, object protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error) {
+	if e.marker == nil {
+		return protocol.Marker{}, protocol.MarkerAbsent, executor.ErrMissingPort.Detailf(
+			"the ownership marker on %s cannot be read: no verifier catalog is configured", object)
+	}
+	return verifier.IndexMarker(ctx, e.marker, object)
 }

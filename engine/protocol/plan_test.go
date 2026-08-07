@@ -122,7 +122,11 @@ func TestPlanValidateEnforcesDropInvariants(t *testing.T) {
 		}
 	})
 
-	t.Run("another destructive node alongside", func(t *testing.T) {
+	// INV-8 as amended. An unattached orphan leaf index survives the parent's
+	// cascade, so the only correct drop sequence removes the orphans first and
+	// then drops the parent (TRD §7.2.13). The original invariant forbade any
+	// other destructive node, which made every correct drop plan invalid.
+	t.Run("orphan cleanup alongside the partitioned drop is permitted", func(t *testing.T) {
 		p := base()
 		p.Nodes = append(p.Nodes, Node{
 			ID:     "orphan-cleanup",
@@ -132,9 +136,8 @@ func TestPlanValidateEnforcesDropInvariants(t *testing.T) {
 				Mode: AuthProvenance, Object: orphan, Relation: &leaf,
 			},
 		})
-		err := p.Validate()
-		if !errors.Is(err, ErrInvalidPlan) || !strings.Contains(err.Error(), "INV-8") {
-			t.Fatalf("got %v", err)
+		if err := p.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
 		}
 	})
 

@@ -130,7 +130,7 @@ func TestPackageDeclaresItsOwnSeams(t *testing.T) {
 			return true
 		})
 	}
-	for _, want := range []string{"CatalogReader", "ProvenanceReader"} {
+	for _, want := range []string{"CatalogReader", "ClaimReader"} {
 		if !found[want] {
 			t.Errorf("package does not declare the %s interface", want)
 		}

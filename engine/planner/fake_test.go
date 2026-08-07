@@ -187,20 +187,45 @@ func TestFakeCatalogResolvesOwnerName(t *testing.T) {
 	}
 }
 
-func TestFakeProvenance(t *testing.T) {
+func TestFakeClaims(t *testing.T) {
 	known := name("public", "orders_idx_p1")
-	p := NewFakeProvenance(known)
+	c := NewFakeClaims(known)
 
-	if ok, err := p.HasProvenance(ctx(), known); err != nil || !ok {
-		t.Errorf("HasProvenance(known) = %v, %v", ok, err)
+	if run, ok, err := c.ClaimsObject(ctx(), known); err != nil || !ok || run == "" {
+		t.Errorf("ClaimsObject(known) = %q, %v, %v", run, ok, err)
 	}
-	if ok, err := p.HasProvenance(ctx(), name("public", "someone_elses_idx")); err != nil || ok {
-		t.Errorf("HasProvenance(unknown) = %v, %v", ok, err)
+	if _, ok, err := c.ClaimsObject(ctx(), name("public", "someone_elses_idx")); err != nil || ok {
+		t.Errorf("ClaimsObject(unknown) = %v, %v", ok, err)
 	}
 
 	sentinel := errors.New("state store unreachable")
-	p.Err = sentinel
-	if _, err := p.HasProvenance(ctx(), known); !errors.Is(err, sentinel) {
+	c.Err = sentinel
+	if _, _, err := c.ClaimsObject(ctx(), known); !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want the injected error", err)
+	}
+}
+
+// The marker helpers round-trip through the real parser, so a fake cannot
+// produce a marker the production code would classify differently.
+func TestFakeCatalogMarkers(t *testing.T) {
+	idxName := name("public", "orders_idx_p1")
+	f := NewFakeCatalog().Mark(idxName, "run-7")
+
+	m, status, err := IndexMarker(ctx(), f, idxName)
+	if err != nil {
+		t.Fatalf("IndexMarker: %v", err)
+	}
+	if status != protocol.MarkerOurs || m.Run != "run-7" {
+		t.Fatalf("status = %v, marker = %+v", status, m)
+	}
+
+	f.Comment(idxName, "the DBA wrote this")
+	if _, status, err := IndexMarker(ctx(), f, idxName); err != nil || status != protocol.MarkerForeign {
+		t.Fatalf("status = %v, err = %v; a human comment is foreign", status, err)
+	}
+
+	if _, status, err := IndexMarker(ctx(), f, name("public", "nothing_here")); err != nil ||
+		status != protocol.MarkerAbsent {
+		t.Fatalf("status = %v, err = %v; an unknown index is absent, not an error", status, err)
 	}
 }

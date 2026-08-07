@@ -198,14 +198,23 @@ func InspectChildren(ctx context.Context, cr CatalogReader, topo Topology, paren
 // name but is not usable.
 type CleanupDecision string
 
-// The cleanup decisions.
+// The cleanup decisions. They are the rows of the destructive-action decision
+// table ([protocol.DecideProvenanceDrop]) named from the planner's side.
 const (
 	// CleanupNone: nothing to remove.
 	CleanupNone CleanupDecision = "none"
 
 	// CleanupDropWithProvenance: emit index.drop_concurrently with
-	// authorization mode provenance, ahead of the rebuild (FR-PLAN-6, AC-5).
+	// authorization mode provenance, ahead of the rebuild. The object carries
+	// PartitionCTL's ownership marker, which is a catalog fact, so `execute`
+	// may perform it (FR-PLAN-6, AC-5).
 	CleanupDropWithProvenance CleanupDecision = "drop_with_provenance"
+
+	// CleanupAdoptThenDrop: the object is unmarked but a run still holds a live
+	// claim on it, so it is ours by a crash rather than by a marker. The
+	// executor writes the marker onto it and only then drops it. This is the
+	// one path reserved to `resume` (FR-CLI-9).
+	CleanupAdoptThenDrop CleanupDecision = "adopt_then_drop"
 
 	// CleanupHalt: refuse to plan. Accompanied by an error matching
 	// [ErrForeignInvalidIndex] (FR-PLAN-7, AC-6).
@@ -214,48 +223,67 @@ const (
 
 func (d CleanupDecision) String() string { return string(d) }
 
+// Destructive reports whether the decision ends in a drop.
+func (d CleanupDecision) Destructive() bool {
+	return d == CleanupDropWithProvenance || d == CleanupAdoptThenDrop
+}
+
 // DecideCleanup decides what to do about whatever already occupies a leaf's
 // generated child index name.
 //
 // The rule this enforces is NFR-REL-3: PartitionCTL never issues a destructive
-// statement against an object it cannot prove it created. An INVALID index with
-// a committed provenance record is its own half-built work and is dropped
-// (FR-PLAN-6). An INVALID index without one belongs to somebody else, and the
-// planner halts and emits no plan rather than cleaning it up (FR-PLAN-7, AC-6).
-// A nil ProvenanceLookup therefore means "no provenance", which halts: the safe
-// direction when execution state has been lost (§7.2.5, R3).
+// statement against an object it cannot prove it created. Ownership is read off
+// the object itself, as a [protocol.Marker] in its comment, so a stale record
+// can no longer authorize destroying a same-named object somebody else made
+// (AC-6). The full table is [protocol.DecideProvenanceDrop], and the executor
+// re-evaluates the identical function at dispatch (FR-AUTH-5).
 //
-// An index with indislive = false is treated the same way, and for the same
-// reason. It looks like a drop in flight, but it is equally the residue of one
-// that died: a killed process, a reset connection or a statement_timeout leaves
-// exactly that state with nothing running, and PostgreSQL's documented recovery
-// is to reissue the DROP INDEX CONCURRENTLY. Refusing unconditionally made this
-// state recoverable by `plan` plus `execute`, whose leafChain checks provenance
-// and emits a drop, but not by `resume`, which is the command the tool itself
-// names after an interruption. The advisory lock (FR-LOCK-1) already excludes a
-// second PartitionCTL run against this target, so provenance is the right
-// question here too.
-func DecideCleanup(ctx context.Context, prov ProvenanceLookup, c ChildIndexPlan) (CleanupDecision, error) {
+// A nil ClaimLookup means "no claim", which is the safe direction: with
+// execution state unavailable the only thing that can authorize a drop is the
+// marker, which is exactly the property that makes this design survive a PITR
+// restore (§7.2.5, R3).
+//
+// An index with indislive = false is treated the same way as an INVALID one,
+// and for the same reason. It looks like a drop in flight, but it is equally
+// the residue of one that died: a killed process, a reset connection or a
+// statement_timeout leaves exactly that state with nothing running, and
+// PostgreSQL's documented recovery is to reissue the DROP INDEX CONCURRENTLY.
+// The advisory lock (FR-LOCK-1) already excludes a second PartitionCTL run
+// against this target.
+func DecideCleanup(ctx context.Context, cr CatalogReader, claims ClaimLookup, c ChildIndexPlan) (CleanupDecision, protocol.DropVerdict, error) {
 	if !c.Exists() || !c.Condition.NeedsCleanup() {
-		return CleanupNone, nil
+		return CleanupNone, protocol.DropVerdict{}, nil
+	}
+	if cr == nil {
+		return CleanupHalt, protocol.DropVerdict{}, ErrForeignInvalidIndex.Detailf(
+			"index %s on %s is %s and no catalog reader is available, so its ownership marker "+
+				"cannot be read (FR-PLAN-7)", c.ChildIndex.String(), c.Leaf.Name.String(), c.Condition)
 	}
 
-	if prov == nil {
-		return CleanupHalt, ErrForeignInvalidIndex.Detailf(
-			"index %s on %s is %s and no provenance source is available, so PartitionCTL cannot "+
-				"prove it created it (FR-PLAN-7). Review it and drop it by hand if it is yours",
-			c.ChildIndex.String(), c.Leaf.Name.String(), c.Condition)
-	}
-
-	owned, err := prov.HasProvenance(ctx, c.ChildIndex)
+	marker, status, err := IndexMarker(ctx, cr, c.ChildIndex)
 	if err != nil {
-		return CleanupHalt, err
+		return CleanupHalt, protocol.DropVerdict{}, err
 	}
-	if !owned {
-		return CleanupHalt, ErrForeignInvalidIndex.Detailf(
-			"index %s on %s is %s and has no PartitionCTL provenance record, so it is not "+
-				"PartitionCTL's to drop (FR-PLAN-7, AC-6). Review it and drop it by hand if it is yours",
-			c.ChildIndex.String(), c.Leaf.Name.String(), c.Condition)
+	in := protocol.ProvenanceDropInput{Object: c.ChildIndex, Status: status, Marker: marker}
+	// The claim is only consulted where it can change the answer, so a marked
+	// object costs no state-store read at all.
+	if status == protocol.MarkerAbsent && claims != nil {
+		run, found, err := claims.ClaimsObject(ctx, c.ChildIndex)
+		if err != nil {
+			return CleanupHalt, protocol.DropVerdict{}, err
+		}
+		if found {
+			in.ClaimRun = run
+		}
 	}
-	return CleanupDropWithProvenance, nil
+
+	v := protocol.DecideProvenanceDrop(in)
+	switch v.Action {
+	case protocol.DropAuthorized:
+		return CleanupDropWithProvenance, v, nil
+	case protocol.DropAdoptThenDrop:
+		return CleanupAdoptThenDrop, v, nil
+	}
+	return CleanupHalt, v, ErrForeignInvalidIndex.Detailf(
+		"index %s on %s is %s: %s", c.ChildIndex.String(), c.Leaf.Name.String(), c.Condition, v.Reason)
 }

@@ -254,9 +254,10 @@ func TestIndexStateHealthy(t *testing.T) {
 	}
 }
 
-func TestNoProvenanceProvesNothing(t *testing.T) {
-	ok, err := NoProvenance().HasProvenance(context.Background(), obj("anything"))
+func TestNoClaimsHoldsNone(t *testing.T) {
+	run, ok, err := NoClaims().ClaimsObject(context.Background(), obj("anything"))
+	_ = run
 	if ok || err != nil {
-		t.Fatalf("HasProvenance() = (%v, %v), want (false, nil)", ok, err)
+		t.Fatalf("ClaimsObject() = (%v, %v), want (false, nil)", ok, err)
 	}
 }

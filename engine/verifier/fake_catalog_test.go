@@ -13,9 +13,10 @@ import (
 // fakeCatalog is an in-memory [Catalog]. The whole engine is unit-testable with
 // no live PostgreSQL (HANDOFF §3), and this is the verifier's half of that.
 type fakeCatalog struct {
-	indexes map[string]IndexState
-	parents map[string]protocol.ObjectName
-	leaves  map[string][]protocol.ObjectName
+	indexes  map[string]IndexState
+	parents  map[string]protocol.ObjectName
+	leaves   map[string][]protocol.ObjectName
+	comments map[string]string
 
 	// Injected read failures, one per method, so a catalog error can be
 	// distinguished from a false assertion in every code path.
@@ -24,6 +25,7 @@ type fakeCatalog struct {
 	failAttached    error
 	failLeaves      error
 	failTree        error
+	failComment     error
 
 	calls []string
 }
@@ -32,10 +34,43 @@ var _ Catalog = (*fakeCatalog)(nil)
 
 func newFakeCatalog() *fakeCatalog {
 	return &fakeCatalog{
-		indexes: map[string]IndexState{},
-		parents: map[string]protocol.ObjectName{},
-		leaves:  map[string][]protocol.ObjectName{},
+		indexes:  map[string]IndexState{},
+		parents:  map[string]protocol.ObjectName{},
+		leaves:   map[string][]protocol.ObjectName{},
+		comments: map[string]string{},
 	}
+}
+
+// IndexComment implements [Catalog].
+func (f *fakeCatalog) IndexComment(_ context.Context, index protocol.ObjectName) (string, bool, error) {
+	f.calls = append(f.calls, "IndexComment:"+index.String())
+	if f.failComment != nil {
+		return "", false, f.failComment
+	}
+	c, ok := f.comments[index.String()]
+	if !ok || c == "" {
+		return "", false, nil
+	}
+	return c, true, nil
+}
+
+// comment sets an arbitrary comment on an index, which is how a test builds the
+// "somebody else wrote this" case.
+func (f *fakeCatalog) comment(index protocol.ObjectName, text string) *fakeCatalog {
+	f.comments[index.String()] = text
+	return f
+}
+
+// mark writes a well-formed PartitionCTL ownership marker onto an index.
+func (f *fakeCatalog) mark(index protocol.ObjectName, run string) *fakeCatalog {
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run: run, Plan: "sha256:fake", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		panic("verifier: fakeCatalog.mark: " + err.Error())
+	}
+	return f.comment(index, text)
 }
 
 // putIndex records an index and returns the catalog for chaining.

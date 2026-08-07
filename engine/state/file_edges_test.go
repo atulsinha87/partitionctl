@@ -16,54 +16,56 @@ import (
 func TestFileStoreRecordSequences(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFileStore(t)
-	run := mustCreateRun(t, s, testPlan(t, "cic"), "run-seq")
+	run := mustCreateRun(t, s, testPlan(t, "drop"), "run-seq")
+	object := protocol.NewObjectName("public", "idx")
 
 	for i := 0; i < 3; i++ {
-		if _, err := s.WriteProvenance(ctx, Provenance{
-			RunID: run.RunID, NodeID: "cic",
-			Object: protocol.NewObjectName("public", "idx"), ObjectKind: ObjectIndex,
+		if _, err := s.RecordAuthorization(ctx, AuthorizationRecord{
+			RunID: run.RunID, NodeID: "drop", Mode: protocol.AuthProvenance,
+			Object: object, Evidence: markerEvidence(object),
 		}, nil); err != nil {
-			t.Fatalf("WriteProvenance %d: %v", i, err)
+			t.Fatalf("RecordAuthorization %d: %v", i, err)
 		}
 	}
-	found, err := s.FindProvenance(ctx, ProvenanceQuery{Object: protocol.NewObjectName("public", "idx")})
+	found, err := s.ListAuthorizations(ctx, run.RunID)
 	if err != nil {
-		t.Fatalf("FindProvenance: %v", err)
+		t.Fatalf("ListAuthorizations: %v", err)
 	}
 	if len(found) != 3 {
 		t.Fatalf("got %d records, want 3", len(found))
 	}
 	seen := map[string]bool{}
-	for _, p := range found {
-		if seen[p.ProvenanceID] {
-			t.Fatalf("provenance id %q was reused", p.ProvenanceID)
+	for _, a := range found {
+		if seen[a.AuthorizationID] {
+			t.Fatalf("authorization id %q was reused", a.AuthorizationID)
 		}
-		seen[p.ProvenanceID] = true
+		seen[a.AuthorizationID] = true
 	}
 
 	// A stray file in the record directory must not derail the sequence or the
 	// scan.
-	if err := os.WriteFile(filepath.Join(s.provDir(run.RunID), "README.txt"), []byte("hi"), 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(s.authDir(run.RunID), "README.txt"), []byte("hi"), 0o640); err != nil {
 		t.Fatalf("write stray file: %v", err)
 	}
 	reopened, err := OpenFileStore(s.Root(), FileOptions{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if _, err := reopened.WriteProvenance(ctx, Provenance{
-		RunID: run.RunID, Object: protocol.NewObjectName("public", "idx2"), ObjectKind: ObjectIndex,
+	if _, err := reopened.RecordAuthorization(ctx, AuthorizationRecord{
+		RunID: run.RunID, NodeID: "drop", Mode: protocol.AuthProvenance,
+		Object: object, Evidence: markerEvidence(object),
 	}, nil); err != nil {
-		t.Fatalf("WriteProvenance after reopen: %v", err)
+		t.Fatalf("RecordAuthorization after reopen: %v", err)
 	}
-	again, err := reopened.FindProvenance(ctx, ProvenanceQuery{Object: protocol.NewObjectName("public", "idx2")})
+	again, err := reopened.ListAuthorizations(ctx, run.RunID)
 	if err != nil {
-		t.Fatalf("FindProvenance: %v", err)
+		t.Fatalf("ListAuthorizations: %v", err)
 	}
-	if len(again) != 1 {
-		t.Fatalf("got %d records, want 1", len(again))
+	if len(again) != 4 {
+		t.Fatalf("got %d records, want 4", len(again))
 	}
-	if seen[again[0].ProvenanceID] {
-		t.Fatalf("a reopened store reused the provenance id %q", again[0].ProvenanceID)
+	if seen[again[3].AuthorizationID] {
+		t.Fatalf("a reopened store reused the authorization id %q", again[3].AuthorizationID)
 	}
 }
 
@@ -208,9 +210,10 @@ func TestGuardedActionErrorSurvivesAnAuditFailure(t *testing.T) {
 	run := mustCreateRun(t, s, testPlan(t, "cic"), "run-guard-audit")
 
 	ddlErr := errors.New("deadlock detected")
-	_, err := s.WriteProvenance(ctx, Provenance{
-		RunID: run.RunID, NodeID: "cic",
-		Object: protocol.NewObjectName("public", "idx"), ObjectKind: ObjectIndex,
+	object := protocol.NewObjectName("public", "idx")
+	_, err := s.RecordAuthorization(ctx, AuthorizationRecord{
+		RunID: run.RunID, NodeID: "cic", Mode: protocol.AuthProvenance,
+		Object: object, Evidence: markerEvidence(object),
 	}, func(ctx context.Context) error {
 		// Make the trail unwritable while the action runs, so the outcome
 		// event cannot be appended.

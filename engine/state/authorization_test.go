@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/atulsinha/partitionctl/engine/protocol"
 )
@@ -12,6 +11,47 @@ import (
 func ptrName(schema, name string) *protocol.ObjectName {
 	o := protocol.NewObjectName(schema, name)
 	return &o
+}
+
+// The three evidence shapes the decision table produces. Building them here
+// rather than by hand is the point: RequiredEvidence is checked against what
+// protocol.DecideProvenanceDrop and protocol.DecideLeftoverDrop actually emit.
+func markerEvidence(object protocol.ObjectName) map[string]string {
+	return protocol.DecideProvenanceDrop(protocol.ProvenanceDropInput{
+		Object: object,
+		Status: protocol.MarkerOurs,
+		Marker: protocol.Marker{
+			Run: "run-1", Plan: "sha256:aaa", Op: string(protocol.OpCreateIndex),
+			Role: protocol.MarkerRoleLeaf, At: "2026-08-07T00:00:00Z",
+		},
+	}).Evidence
+}
+
+func leftoverEvidence(object protocol.ObjectName, base string) map[string]string {
+	e := protocol.DecideLeftoverDrop(protocol.LeftoverDropInput{
+		Object: object, BaseExists: true, BaseStatus: protocol.MarkerOurs,
+		BaseMarker: protocol.Marker{
+			Run: "run-1", Plan: "sha256:aaa", Op: string(protocol.OpCreateIndex),
+			Role: protocol.MarkerRoleLeaf, At: "2026-08-07T00:00:00Z",
+		},
+	}).Evidence
+	if e == nil {
+		// The name is not a leftover; the caller is asserting the refusal, so
+		// hand back a shape that satisfies RequiredEvidence and let Validate's
+		// naming check be the thing that fails.
+		e = map[string]string{
+			"mode": string(protocol.AuthLeftover), "object": object.String(),
+			"leftover_class": "ccnew", "base_index": base,
+		}
+	}
+	return e
+}
+
+func explicitEvidence(object protocol.ObjectName) map[string]string {
+	return map[string]string{
+		"mode": string(protocol.AuthExplicit), "object": object.String(),
+		"confirmation": protocol.ConfirmExclusiveLock,
+	}
 }
 
 // FR-AUTH-1…4 and INV-7 on the record's shape: a justification that cites
@@ -29,10 +69,20 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "provenance with a cited record",
+			name: "provenance sourced from the object's own marker",
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthProvenance
-				a.ProvenanceID = "run-1:prov:00000001"
+				a.Evidence = markerEvidence(a.Object)
+			},
+		},
+		{
+			name: "provenance sourced from a live claim",
+			mutate: func(a *AuthorizationRecord) {
+				a.Mode = protocol.AuthProvenance
+				a.Evidence = map[string]string{
+					"mode": string(protocol.AuthProvenance), "object": a.Object.String(),
+					"source": "claim", "claim_run": "run-9",
+				}
 			},
 		},
 		{
@@ -41,16 +91,49 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "provenance naming a marker source but no marker run",
+			mutate: func(a *AuthorizationRecord) {
+				a.Mode = protocol.AuthProvenance
+				a.Evidence = map[string]string{
+					"mode": string(protocol.AuthProvenance), "object": a.Object.String(),
+					"source": "marker",
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "provenance naming a claim source but no claiming run",
+			mutate: func(a *AuthorizationRecord) {
+				a.Mode = protocol.AuthProvenance
+				a.Evidence = map[string]string{
+					"mode": string(protocol.AuthProvenance), "object": a.Object.String(),
+					"source": "claim",
+				}
+			},
+			wantErr: true,
+		},
+		{
+			name: "provenance naming an invented source",
+			mutate: func(a *AuthorizationRecord) {
+				a.Mode = protocol.AuthProvenance
+				a.Evidence = map[string]string{
+					"mode": string(protocol.AuthProvenance), "object": a.Object.String(),
+					"source": "because-i-said-so",
+				}
+			},
+			wantErr: true,
+		},
+		{
 			name: "leftover with both conditions",
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthLeftover
 				a.Object = protocol.NewObjectName("public", "orders_idx_ccnew1")
 				a.Relation = ptrName("public", "orders_2026_03")
-				a.ReindexRunID = "run-reindex-9"
+				a.Evidence = leftoverEvidence(a.Object, "public.orders_idx")
 			},
 		},
 		{
-			name: "leftover with the naming match but no run history is refused (INV-7, AC-19)",
+			name: "leftover with the naming match but no evidence is refused (INV-7, AC-19)",
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthLeftover
 				a.Object = protocol.NewObjectName("public", "orders_idx_ccnew1")
@@ -59,12 +142,12 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "leftover with run history but no naming match is refused (INV-7)",
+			name: "leftover with evidence but no naming match is refused (INV-7)",
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthLeftover
 				a.Object = protocol.NewObjectName("public", "just_an_index")
 				a.Relation = ptrName("public", "orders_2026_03")
-				a.ReindexRunID = "run-reindex-9"
+				a.Evidence = leftoverEvidence(a.Object, "public.just")
 			},
 			wantErr: true,
 		},
@@ -73,7 +156,7 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthLeftover
 				a.Object = protocol.NewObjectName("public", "orders_idx_ccold")
-				a.ReindexRunID = "run-reindex-9"
+				a.Evidence = leftoverEvidence(a.Object, "public.orders_idx")
 			},
 			wantErr: true,
 		},
@@ -82,6 +165,7 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthExplicit
 				a.Confirmation = protocol.ConfirmExclusiveLock
+				a.Evidence = explicitEvidence(a.Object)
 			},
 		},
 		{
@@ -99,6 +183,7 @@ func TestAuthorizationRecordValidate(t *testing.T) {
 			mutate: func(a *AuthorizationRecord) {
 				a.Mode = protocol.AuthExplicit
 				a.Confirmation = protocol.ConfirmExclusiveLock
+				a.Evidence = explicitEvidence(a.Object)
 				a.NodeID = ""
 			},
 			wantErr: true,
@@ -138,12 +223,11 @@ func TestRecordAuthorizationCommitsBeforeTheStatement(t *testing.T) {
 	var seenDuringStatement int
 
 	rec := AuthorizationRecord{
-		RunID:        run.RunID,
-		NodeID:       "drop",
-		Mode:         protocol.AuthProvenance,
-		Object:       object,
-		ProvenanceID: "run-auth:prov:00000001",
-		Evidence:     map[string]string{"indisvalid": "false"},
+		RunID:    run.RunID,
+		NodeID:   "drop",
+		Mode:     protocol.AuthProvenance,
+		Object:   object,
+		Evidence: markerEvidence(object),
 	}
 	got, err := s.RecordAuthorization(ctx, rec, func(ctx context.Context) error {
 		recs, lerr := s.ListAuthorizations(ctx, run.RunID)
@@ -177,7 +261,7 @@ func TestRecordAuthorizationRefusesTheStatementWhenTheRecordFails(t *testing.T) 
 				RunID: "run-auth2", NodeID: "drop", Mode: protocol.AuthLeftover,
 				Object:   protocol.NewObjectName("public", "orders_idx_ccnew"),
 				Relation: ptrName("public", "orders_2026_03"),
-				// No ReindexRunID: naming alone is forgeable (AC-19).
+				// No evidence: naming alone is forgeable (AC-19).
 			},
 		},
 		{
@@ -185,6 +269,7 @@ func TestRecordAuthorizationRefusesTheStatementWhenTheRecordFails(t *testing.T) 
 			rec: AuthorizationRecord{
 				RunID: "nope", NodeID: "drop", Mode: protocol.AuthExplicit,
 				Object: protocol.NewObjectName("public", "idx"), Confirmation: protocol.ConfirmExclusiveLock,
+				Evidence: explicitEvidence(protocol.NewObjectName("public", "idx")),
 			},
 		},
 	}
@@ -220,10 +305,12 @@ func TestRecordAuthorizationRetainsTheRecordWhenTheStatementFails(t *testing.T) 
 	run := mustCreateRun(t, s, testPlan(t, "drop"), "run-auth3")
 
 	stmtErr := errors.New("canceling statement due to lock timeout")
+	object := protocol.NewObjectName("public", "orders_idx")
 	_, err := s.RecordAuthorization(ctx, AuthorizationRecord{
 		RunID: run.RunID, NodeID: "drop", Mode: protocol.AuthExplicit,
-		Object:       protocol.NewObjectName("public", "orders_idx"),
+		Object:       object,
 		Confirmation: protocol.ConfirmExclusiveLock,
+		Evidence:     explicitEvidence(object),
 	}, func(ctx context.Context) error { return stmtErr })
 
 	if !errors.Is(err, stmtErr) {
@@ -255,102 +342,5 @@ func TestRecordAuthorizationRetainsTheRecordWhenTheStatementFails(t *testing.T) 
 	}
 	if !sawRecorded || !sawFailed {
 		t.Fatalf("trail is missing events: recorded=%v failed=%v", sawRecorded, sawFailed)
-	}
-}
-
-// FR-AUTH-3 / INV-7 / AC-19: the leftover mode's second condition is recorded
-// run history, and a leaf's history lives on its partitioned parent.
-func TestReindexRunFor(t *testing.T) {
-	ctx := context.Background()
-	s, c := newFileStore(t)
-
-	reindexPlan := testPlanWithID(t, "p-reindex", "orders")
-	reindexPlan.Operation = protocol.OpReindexIndex
-	reindexPlan.Digest = ""
-	if err := reindexPlan.Seal(); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	run := mustCreateRun(t, s, reindexPlan, "run-reindex")
-	c.Advance(time.Minute)
-	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
-		RunID: run.RunID, From: RunRunning, To: RunCompleted,
-	}); err != nil {
-		t.Fatalf("SetRunStatus: %v", err)
-	}
-
-	parent := protocol.NewObjectName("public", "orders")
-	leaf := protocol.NewObjectName("public", "orders_2026_03")
-	unrelated := protocol.NewObjectName("public", "events")
-
-	tests := []struct {
-		name string
-		q    ReindexHistoryQuery
-		want bool
-	}{
-		{
-			name: "the leaf alone finds nothing, because the run targets the parent",
-			q:    ReindexHistoryQuery{Database: "appdb", Relations: []protocol.ObjectName{leaf}},
-			want: false,
-		},
-		{
-			name: "leaf plus parent finds the run",
-			q:    ReindexHistoryQuery{Database: "appdb", Relations: []protocol.ObjectName{leaf, parent}},
-			want: true,
-		},
-		{
-			name: "an unrelated relation finds nothing (AC-19)",
-			q:    ReindexHistoryQuery{Database: "appdb", Relations: []protocol.ObjectName{unrelated}},
-			want: false,
-		},
-		{
-			name: "a since bound the run satisfies",
-			q: ReindexHistoryQuery{Database: "appdb", Relations: []protocol.ObjectName{parent},
-				Since: baseTime.Add(30 * time.Second)},
-			want: true,
-		},
-		{
-			name: "a since bound the run predates (FR-LB-4)",
-			q: ReindexHistoryQuery{Database: "appdb", Relations: []protocol.ObjectName{parent},
-				Since: baseTime.Add(2 * time.Hour)},
-			want: false,
-		},
-		{
-			name: "the wrong database finds nothing",
-			q:    ReindexHistoryQuery{Database: "otherdb", Relations: []protocol.ObjectName{parent}},
-			want: false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, found, err := ReindexRunFor(ctx, s, tc.q)
-			if err != nil {
-				t.Fatalf("ReindexRunFor: %v", err)
-			}
-			if found != tc.want {
-				t.Fatalf("found = %v, want %v", found, tc.want)
-			}
-			if found && got.Operation != protocol.OpReindexIndex {
-				t.Errorf("matched a %s run", got.Operation)
-			}
-		})
-	}
-}
-
-// A create run for the same table is not reindex history.
-func TestReindexRunForIgnoresOtherOperations(t *testing.T) {
-	ctx := context.Background()
-	s, _ := newFileStore(t)
-	mustCreateRun(t, s, testPlanWithID(t, "p-create", "orders"), "run-create")
-
-	parent := protocol.NewObjectName("public", "orders")
-	_, found, err := ReindexRunFor(ctx, s, ReindexHistoryQuery{
-		Database: "appdb", Relations: []protocol.ObjectName{parent},
-	})
-	if err != nil {
-		t.Fatalf("ReindexRunFor: %v", err)
-	}
-	if found {
-		t.Fatal("a create run was accepted as reindex history (FR-AUTH-3)")
 	}
 }

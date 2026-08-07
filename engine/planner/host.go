@@ -130,10 +130,11 @@ type Request struct {
 	// (FR-PLAN-9).
 	Estimator Estimator
 
-	// Provenance reads PartitionCTL's record of what it created (FR-PLAN-6,
-	// FR-PLAN-7). It may be nil, which [DecideCleanup] treats as "no
-	// provenance": the safe direction.
-	Provenance ProvenanceLookup
+	// Claims reports whether a run still holds a live claim on an object
+	// (FR-PLAN-6, FR-PLAN-7). It may be nil, which [DecideCleanup] treats as
+	// "no claim": the safe direction, and the one that leaves the object's own
+	// ownership marker as the only thing that can authorize a drop.
+	Claims ClaimLookup
 
 	// PlanID is the identity the host assigned to the plan being built. An
 	// operation may use it to derive node IDs.
@@ -218,10 +219,10 @@ type Host struct {
 	// [DefaultEstimator].
 	Estimator Estimator
 
-	// Provenance reads PartitionCTL's record of what it created. Optional; nil
-	// means no provenance is available, which halts rather than dropping
-	// (FR-PLAN-7).
-	Provenance ProvenanceLookup
+	// Claims reports whether a run still holds a live claim on an object.
+	// Optional; nil means no claim is available, which halts on an unmarked
+	// object rather than dropping it (FR-PLAN-7).
+	Claims ClaimLookup
 
 	// Now returns the planning timestamp. Nil means time.Now. Tests set it to
 	// make a plan a pure function of its inputs.
@@ -310,7 +311,7 @@ func (h *Host) Run(ctx context.Context, op OperationPlanner, spec Specification)
 		Database:         database,
 		ServerVersionNum: version,
 		Estimator:        h.Estimator.withDefaults(),
-		Provenance:       h.Provenance,
+		Claims:           h.Claims,
 		PlanID:           planID,
 		Now:              now,
 	})

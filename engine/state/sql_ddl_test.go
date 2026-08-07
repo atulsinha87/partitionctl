@@ -63,9 +63,7 @@ func TestSchemaDDLQuotesTheIdentifier(t *testing.T) {
 	}
 }
 
-// The DDL must actually install the two in-database guards, because the Go API
-// is only half of the enforcement story for INV-3 and INV-6.
-func TestSchemaDDLInstallsTheInvariantGuards(t *testing.T) {
+func TestSchemaDDLContents(t *testing.T) {
 	ddl, err := SchemaDDL(DefaultSchema)
 	if err != nil {
 		t.Fatalf("SchemaDDL: %v", err)
@@ -76,15 +74,12 @@ func TestSchemaDDLInstallsTheInvariantGuards(t *testing.T) {
 		name string
 		want string
 	}{
-		{name: "INV-3 trigger function", want: "audit_event_append_only() RETURNS trigger"},
-		{name: "INV-3 trigger", want: "BEFORE UPDATE OR DELETE ON"},
-		{name: "INV-3 revoke", want: "REVOKE UPDATE, DELETE, TRUNCATE ON"},
-		{name: "INV-6 trigger function", want: "run_digest_immutable() RETURNS trigger"},
-		{name: "INV-6 trigger", want: "BEFORE UPDATE ON"},
 		{name: "schema is created", want: "CREATE SCHEMA IF NOT EXISTS"},
 		{name: "audit table", want: "audit_event ("},
 		{name: "per-run audit sequence is unique", want: "UNIQUE (run_id, seq)"},
 		{name: "schema version is recorded", want: "schema_version"},
+		{name: "a node record names the object it claims", want: "object_schema text NOT NULL DEFAULT ''"},
+		{name: "the claim lookup has an index", want: "node_state_object_idx"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -92,6 +87,32 @@ func TestSchemaDDLInstallsTheInvariantGuards(t *testing.T) {
 				t.Errorf("the bootstrap DDL does not contain %q", tc.want)
 			}
 		})
+	}
+}
+
+// Bootstrap is the adoption cost of the SQL store: it runs against the
+// customer's production database, and every privilege it needs is one more
+// conversation with a DBA. It is CREATE SCHEMA, CREATE TABLE, CREATE INDEX and
+// one seeded row, and nothing else. INV-3 and INV-6 are enforced by this
+// package's Go API, which has no path that violates either.
+func TestBootstrapNeedsNothingBeyondCreateTable(t *testing.T) {
+	ddl, err := SchemaDDL(DefaultSchema)
+	if err != nil {
+		t.Fatalf("SchemaDDL: %v", err)
+	}
+	for i, stmt := range ddl {
+		upper := strings.ToUpper(strings.TrimSpace(stmt))
+		switch {
+		case strings.HasPrefix(upper, "CREATE SCHEMA"),
+			strings.HasPrefix(upper, "CREATE TABLE"),
+			strings.HasPrefix(upper, "CREATE INDEX"),
+			strings.HasPrefix(upper, "INSERT INTO"):
+		default:
+			t.Errorf("bootstrap statement %d needs a privilege beyond CREATE TABLE:\n%s", i, stmt)
+		}
+	}
+	if n := len(ddl); n > 12 {
+		t.Errorf("bootstrap is %d statements; keep it small enough for a DBA to read", n)
 	}
 }
 
@@ -108,9 +129,6 @@ func TestSchemaDDLIsIdempotent(t *testing.T) {
 		case strings.HasPrefix(upper, "CREATE SCHEMA IF NOT EXISTS"),
 			strings.HasPrefix(upper, "CREATE TABLE IF NOT EXISTS"),
 			strings.HasPrefix(upper, "CREATE INDEX IF NOT EXISTS"),
-			strings.HasPrefix(upper, "CREATE OR REPLACE FUNCTION"),
-			strings.HasPrefix(upper, "CREATE OR REPLACE TRIGGER"),
-			strings.HasPrefix(upper, "REVOKE"),
 			strings.Contains(upper, "ON CONFLICT"):
 			// Re-runnable.
 		default:
@@ -227,13 +245,13 @@ func TestNewSQLStoreRejectsBadInput(t *testing.T) {
 // TestSkipBootstrapIssuesNoDDLOnARead is the store-side half of AC-1: "plan
 // never opens a write transaction" and TRD §7.2.12's "plan connects read-only".
 //
-// The planner reads provenance whenever it finds an index that is not healthy,
-// which is exactly the post-crash re-plan. That read goes through ready() ->
-// EnsureSchema, so with the default options `plan` issues CREATE SCHEMA, CREATE
-// TABLE, CREATE FUNCTION, CREATE TRIGGER and REVOKE against the target. An
-// operator planning as a deliberately read-only role, or against a hot standby,
-// gets a bootstrap failure instead of a plan, with no indication that a WRITE
-// was attempted.
+// The planner reads the claim table whenever it finds an index that is not
+// healthy and carries no ownership marker, which is exactly the post-crash
+// re-plan. That read goes through ready() -> EnsureSchema, so with the default
+// options `plan` issues the whole bootstrap against the target. An operator
+// planning as a deliberately read-only role, or against a hot standby, gets a
+// bootstrap failure instead of a plan, with no indication that a WRITE was
+// attempted.
 func TestSkipBootstrapIssuesNoDDLOnARead(t *testing.T) {
 	ctx := context.Background()
 	db, fake := openFakeDB(t)
@@ -244,52 +262,14 @@ func TestSkipBootstrapIssuesNoDDLOnARead(t *testing.T) {
 
 	// The read itself may fail (the fake answers no rows); what matters is
 	// what was issued.
-	_, _ = s.FindProvenance(ctx, ProvenanceQuery{
-		Object:   protocol.NewObjectName("public", "orders_idx_p1"),
-		Database: "appdb",
-	})
+	_, _, _ = ClaimsObjectIn(ctx, s, "appdb", protocol.NewObjectName("public", "orders_idx_p1"))
 
 	for _, q := range fake.Queries() {
 		upper := strings.ToUpper(strings.TrimSpace(q))
 		for _, verb := range []string{"CREATE ", "REVOKE ", "GRANT ", "ALTER ", "DROP ", "COMMENT "} {
 			if strings.HasPrefix(upper, verb) {
-				t.Errorf("a read-only provenance lookup issued DDL: %s", q)
+				t.Errorf("a read-only claim lookup issued DDL: %s", q)
 			}
 		}
-	}
-}
-
-// TestAuditTrailRefusesTruncate is INV-3: "the audit trail is append-only".
-//
-// A BEFORE UPDATE OR DELETE ... FOR EACH ROW trigger does not fire on TRUNCATE,
-// and REVOKE ... FROM PUBLIC has no effect on the table's owner, which is the
-// role that ran the bootstrap and normally the role PartitionCTL connects as.
-// So the fastest way to erase the entire trail was the one path left unguarded,
-// while the slower DELETE was correctly refused.
-func TestAuditTrailRefusesTruncate(t *testing.T) {
-	ddl, err := SchemaDDL(DefaultSchema)
-	if err != nil {
-		t.Fatalf("SchemaDDL: %v", err)
-	}
-	joined := strings.Join(ddl, "\n")
-
-	if !strings.Contains(joined, "BEFORE TRUNCATE") {
-		t.Error("no BEFORE TRUNCATE trigger on audit_event; TRUNCATE erases the trail (INV-3)")
-	}
-	// A TRUNCATE trigger is only legal, and only fires, at statement level.
-	truncateStmt := ""
-	for _, s := range ddl {
-		if strings.Contains(s, "BEFORE TRUNCATE") {
-			truncateStmt = s
-		}
-	}
-	if truncateStmt == "" {
-		t.Fatal("no TRUNCATE trigger statement found")
-	}
-	if !strings.Contains(truncateStmt, "FOR EACH STATEMENT") {
-		t.Errorf("the TRUNCATE trigger is not statement-level, so it never fires:\n%s", truncateStmt)
-	}
-	if !strings.Contains(truncateStmt, "audit_event_append_only()") {
-		t.Errorf("the TRUNCATE trigger does not raise the append-only exception:\n%s", truncateStmt)
 	}
 }

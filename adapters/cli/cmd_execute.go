@@ -75,12 +75,6 @@ func (a *App) cmdExecute(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// FR-CLI-9, before the database is even opened: `resume` is the only
-	// command permitted to perform provenance-authorized cleanup.
-	if err := refuseProvenanceCleanup(plan, planPath); err != nil {
-		return err
-	}
-
 	db, err := a.openDB(ctx, cfg)
 	if err != nil {
 		return err
@@ -153,60 +147,7 @@ func (a *App) cmdExecute(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return a.walk(ctx, cfg, tgt, store, lock, run, plan)
-}
-
-// refuseProvenanceCleanup enforces FR-CLI-9's second sentence: `resume` is the
-// only command permitted to perform provenance-authorized cleanup.
-//
-// # Why the prior-run check is not enough
-//
-// [priorRunSet.refuseExecute] keys on *this plan's digest*, and a re-plan
-// defeats it: CreatedAt alone gives a fresh artifact a new digest, so no prior
-// run matches. The sequence that gets through is the ordinary one after any
-// interruption. Execute is SIGKILLed mid-build, leaving an INVALID child index
-// with a committed provenance record. The operator re-plans, which is the
-// documented way to pick up live catalog state, and per FR-PLAN-6 the new plan
-// now contains an `index.drop_concurrently` node authorized by that provenance.
-// `execute` on the new artifact finds no prior run for the new digest and
-// dispatches the drop.
-//
-// That is the outcome TRD §7.2.12 says the execute/resume split exists to
-// prevent: "a routine re-run can destroy catalog objects". A CI pipeline that
-// runs `plan` then `execute` unattended would silently destroy catalog objects
-// after any interrupted run.
-//
-// The check is a scan of the artifact rather than a runtime gate, so it refuses
-// before the database is opened, before the advisory lock, before a run record
-// exists and before any DDL.
-func refuseProvenanceCleanup(plan *protocol.Plan, planPath string) error {
-	var offenders []string
-	for i := range plan.Nodes {
-		n := &plan.Nodes[i]
-		if !n.Kind.IsDestructive() || n.Authorization == nil {
-			continue
-		}
-		if n.Authorization.Mode != protocol.AuthProvenance {
-			continue
-		}
-		offenders = append(offenders, fmt.Sprintf("  %s  %s  %s", n.ID, n.Kind, n.Authorization.Object))
-	}
-	if len(offenders) == 0 {
-		return nil
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "this plan contains %d provenance-authorized destructive node(s):\n", len(offenders))
-	for _, o := range offenders {
-		b.WriteString(o)
-		b.WriteString("\n")
-	}
-	b.WriteString("no DDL was issued. Continue with:\n")
-	fmt.Fprintf(&b, "  partitionctl resume %s\n", planPath)
-	b.WriteString("`resume` is the only command permitted to perform provenance-authorized cleanup " +
-		"(FR-CLI-9). These nodes drop INVALID indexes left behind by a previous process, so " +
-		"performing them under `execute` would mean a routine re-run can destroy catalog objects")
-	return ErrPriorRunIncomplete.Detailf("%s", b.String())
+	return a.walk(ctx, cfg, tgt, store, lock, run, plan, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +168,7 @@ func (a *App) walk(
 	lock state.Lock,
 	run state.Run,
 	plan *protocol.Plan,
+	allowAdoption bool,
 ) error {
 	holder := state.DefaultHolder()
 	if _, err := store.AcquireLease(ctx, run.RunID, holder, cfg.LeaseTTL); err != nil {
@@ -254,6 +196,12 @@ func (a *App) walk(
 		StatementTimeout:  cfg.StatementTimeout,
 		Heartbeat:         &leaseHeartbeat{store: store, lock: lock, holder: holder},
 		HeartbeatInterval: cfg.HeartbeatInterval,
+
+		// FR-CLI-9: `resume` is the only command permitted to adopt an object
+		// that carries no PartitionCTL ownership marker and is ours only
+		// because an interrupted run still claims it. A drop authorized by a
+		// marker is a catalog fact and `execute` may perform it.
+		AllowAdoption: allowAdoption,
 	})
 	if err != nil {
 		return err
@@ -348,13 +296,17 @@ func (a *App) reportResult(run state.Run, res *executor.Result) {
 func (a *App) evaluator(tgt *Target, store state.StateStore, plan *protocol.Plan) executor.CatalogEvaluator {
 	ev := &catalogEvaluator{}
 	if tgt.Catalog != nil {
-		ev.assert = newAssertEvaluator(tgt.Catalog, provenanceLookup{
+		ev.assert = newAssertEvaluator(tgt.Catalog, claimLookup{
 			store:    store,
 			database: plan.Target.Database,
 		})
 	}
 	if tgt.Verify != nil {
 		ev.verify = verifierFor(tgt)
+		// The ownership marker comes off the same catalog the verification
+		// checks read, which is what keeps "is this ours?" and "is this valid?"
+		// two questions asked of one snapshot.
+		ev.marker = tgt.Verify
 	}
 	return ev
 }

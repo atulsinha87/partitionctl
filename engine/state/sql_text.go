@@ -11,14 +11,12 @@ const runColumns = `run_id, plan_id, plan_digest, operation, database_name, tabl
 	`index_schema, index_name, has_index, status, actor, node_count, cancel_requested, ` +
 	`cancel_requested_at, cancel_actor, cancel_note, last_error, started_at, updated_at, finished_at`
 
-const nodeColumns = `run_id, node_id, kind, state, attempts, last_error, error_kind, started_at, updated_at`
-
-const provenanceColumns = `provenance_id, run_id, node_id, plan_digest, database_name, ` +
-	`object_schema, object_name, object_kind, relation_schema, relation_name, has_relation, actor, recorded_at`
+const nodeColumns = `run_id, node_id, kind, state, object_schema, object_name, attempts, ` +
+	`last_error, error_kind, started_at, updated_at`
 
 const authorizationColumns = `authorization_id, run_id, node_id, mode, database_name, ` +
 	`object_schema, object_name, relation_schema, relation_name, has_relation, ` +
-	`provenance_id, reindex_run_id, confirmation, evidence, granted_at`
+	`confirmation, evidence, granted_at`
 
 const auditColumns = `event_id, run_id, seq, node_id, event_type, detail, occurred_at`
 
@@ -48,8 +46,6 @@ type sqlText struct {
 	selectNode     string
 	selectNodes    string
 	transitionNode string
-
-	insertProvenance string
 
 	insertAuthorization  string
 	selectAuthorizations string
@@ -106,7 +102,7 @@ func newSQLText(schema string) (sqlText, error) {
 		`WHERE database_name = $1 AND table_schema = $2 AND table_name = $3 AND status = 'RUNNING' ` +
 		`ORDER BY started_at LIMIT 1`
 
-	t.insertNode = `INSERT INTO ` + q + `.node_state (` + nodeColumns + `) VALUES ` + placeholders(9)
+	t.insertNode = `INSERT INTO ` + q + `.node_state (` + nodeColumns + `) VALUES ` + placeholders(11)
 
 	t.selectNode = `SELECT ` + nodeColumns + ` FROM ` + q + `.node_state WHERE run_id = $1 AND node_id = $2`
 
@@ -118,10 +114,8 @@ func newSQLText(schema string) (sqlText, error) {
 		`last_error = $5, error_kind = $6, started_at = COALESCE(started_at, $7), updated_at = $8 ` +
 		`WHERE run_id = $1 AND node_id = $2 AND state = $9 RETURNING ` + nodeColumns
 
-	t.insertProvenance = `INSERT INTO ` + q + `.provenance (` + provenanceColumns + `) VALUES ` + placeholders(13)
-
 	t.insertAuthorization = `INSERT INTO ` + q + `.authorization (` + authorizationColumns + `) VALUES ` +
-		`($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15)`
+		`($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)`
 
 	t.selectAuthorizations = `SELECT ` + authorizationColumns + ` FROM ` + q + `.authorization ` +
 		`WHERE run_id = $1 ORDER BY granted_at, authorization_id`
@@ -241,31 +235,4 @@ func (t sqlText) runQuery(q RunQuery) (string, []any) {
 		sb.WriteString(strconv.Itoa(q.Limit))
 	}
 	return sb.String(), args
-}
-
-// provenanceQuery renders a [ProvenanceQuery] as SQL plus its arguments.
-func (t sqlText) provenanceQuery(q ProvenanceQuery) (string, []any) {
-	var (
-		where []string
-		args  []any
-	)
-	add := func(clause string, v any) {
-		args = append(args, v)
-		where = append(where, clause+"$"+strconv.Itoa(len(args)))
-	}
-	add("object_schema = ", q.Object.Schema)
-	add("object_name = ", q.Object.Name)
-	if q.Database != "" {
-		add("database_name = ", q.Database)
-	}
-	if q.RunID != "" {
-		add("run_id = ", string(q.RunID))
-	}
-	if q.Relation != nil {
-		where = append(where, "has_relation")
-		add("relation_schema = ", q.Relation.Schema)
-		add("relation_name = ", q.Relation.Name)
-	}
-	return "SELECT " + provenanceColumns + " FROM " + t.quotedSchema + ".provenance WHERE " +
-		strings.Join(where, " AND ") + " ORDER BY recorded_at, provenance_id", args
 }

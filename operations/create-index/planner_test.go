@@ -15,8 +15,8 @@ var fixedNow = func() time.Time { return time.Date(2026, 8, 7, 12, 0, 0, 0, time
 
 func testPlanner() Planner { return Planner{Now: fixedNow} }
 
-func testPlannerWith(prov ProvenanceReader) Planner {
-	return Planner{Now: fixedNow, Provenance: prov}
+func testPlannerWith(claims ClaimReader) Planner {
+	return Planner{Now: fixedNow, Claims: claims}
 }
 
 // ---------------------------------------------------------------------------
@@ -78,9 +78,8 @@ func TestPlanCleanBuildEmitsTheSpecifiedGraph(t *testing.T) {
 
 func TestPlanNodeKindsAreOnlyTheSpecifiedSix(t *testing.T) {
 	cat := newCatalog("p1", "p2")
-	cat.indexes[child("p1")] = invalidIndex("p1")
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{child("p1"): true}}
-	p := mustPlan(t, testPlannerWith(prov), newSpec(), cat)
+	cat.indexes[child("p1")] = marked(invalidIndex("p1"))
+	p := mustPlan(t, testPlanner(), newSpec(), cat)
 
 	allowed := map[protocol.NodeKind]bool{
 		protocol.KindCatalogAssert:            true,
@@ -247,13 +246,12 @@ func TestPlanFullyCompleteEmitsNoWork(t *testing.T) {
 func TestPlanPartiallyCompleteEmitsOnlyTheRemainingLeaves(t *testing.T) {
 	leaves := []string{"p1", "p2", "p3", "p4"}
 	cat := newCatalog(leaves...)
-	cat.indexes[obj(testIndex)] = parentIndexState(false) // mid-build: invalid parent
-	cat.indexes[child("p1")] = attachedIndex("p1")        // done
-	cat.indexes[child("p2")] = attachedIndex("p2")        // done
-	cat.indexes[child("p3")] = builtIndex("p3")           // built, not attached
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false)) // mid-build: invalid parent
+	cat.indexes[child("p1")] = attachedIndex("p1")                // done
+	cat.indexes[child("p2")] = attachedIndex("p2")                // done
+	cat.indexes[child("p3")] = builtIndex("p3")                   // built, not attached
 
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{obj(testIndex): true}}
-	p := mustPlan(t, testPlannerWith(prov), newSpec(), cat)
+	p := mustPlan(t, testPlanner(), newSpec(), cat)
 
 	// The parent index already exists, so no create_parent_invalid.
 	if hasNode(p, nodeParentIndex) {
@@ -314,17 +312,13 @@ func TestPlanIsIdempotentAcrossReplans(t *testing.T) {
 // FR-PLAN-6 / FR-PLAN-7: INVALID index handling
 // ---------------------------------------------------------------------------
 
-func TestPlanInvalidLeafWithProvenanceEmitsDropBeforeRebuild(t *testing.T) {
+func TestPlanInvalidMarkedLeafEmitsDropBeforeRebuild(t *testing.T) {
 	leaves := []string{"p1", "p2"}
 	cat := newCatalog(leaves...)
-	cat.indexes[obj(testIndex)] = parentIndexState(false)
-	cat.indexes[child("p1")] = invalidIndex("p1")
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+	cat.indexes[child("p1")] = marked(invalidIndex("p1"))
 
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{
-		obj(testIndex): true,
-		child("p1"):    true,
-	}}
-	p := mustPlan(t, testPlannerWith(prov), newSpec(), cat)
+	p := mustPlan(t, testPlanner(), newSpec(), cat)
 
 	drop := node(t, p, nodeID("drop", obj("p1")))
 	if drop.Kind != protocol.KindIndexDropConcurrently {
@@ -370,15 +364,13 @@ func TestPlanInvalidLeafWithProvenanceEmitsDropBeforeRebuild(t *testing.T) {
 	}
 }
 
-func TestPlanInvalidLeafWithoutProvenanceHalts(t *testing.T) {
+func TestPlanUnmarkedInvalidLeafHalts(t *testing.T) {
 	cat := newCatalog("p1", "p2")
-	cat.indexes[obj(testIndex)] = parentIndexState(false)
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+	// The parent index is ours; the leaf carries nothing.
 	cat.indexes[child("p1")] = invalidIndex("p1")
 
-	// Provenance exists for the parent index but NOT for the leaf.
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{obj(testIndex): true}}
-
-	p, err := testPlannerWith(prov).Plan(context.Background(), newSpec(), cat)
+	p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
 	if p != nil {
 		t.Fatalf("Plan() returned a plan of %d nodes; FR-PLAN-7 requires no plan at all", len(p.Nodes))
 	}
@@ -393,23 +385,55 @@ func TestPlanInvalidLeafWithoutProvenanceHalts(t *testing.T) {
 	}
 }
 
-func TestPlanDefaultPlannerHasNoProvenanceAndSoHalts(t *testing.T) {
+func TestPlanDefaultPlannerHasNoClaimSourceAndSoHalts(t *testing.T) {
 	cat := newCatalog("p1")
 	cat.indexes[child("p1")] = invalidIndex("p1")
 
-	// Planner{} has no provenance source. The safe default is to halt, never
-	// to drop.
+	// Planner{} has no claim source, and the object carries no marker. The safe
+	// default is to halt, never to drop.
 	p, err := Plan(context.Background(), newSpec(), cat)
 	if p != nil || !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
 		t.Fatalf("Plan() = (%v, %v), want (nil, ErrAuthorizationUnsatisfied)", p, err)
 	}
 }
 
-func TestPlanInvalidParentIndexWithoutProvenanceHalts(t *testing.T) {
+// The crash window: the CREATE INDEX CONCURRENTLY ran and the process died
+// before the COMMENT could be written. The object is unmarked but the run that
+// died still claims it, so it is adoptable.
+func TestPlanUnmarkedInvalidLeafWithALiveClaimIsDropped(t *testing.T) {
+	cat := newCatalog("p1", "p2")
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+	cat.indexes[child("p1")] = invalidIndex("p1")
+
+	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
+	p := mustPlan(t, testPlannerWith(claims), newSpec(), cat)
+	if !hasNode(p, nodeID("drop", obj("p1"))) {
+		t.Fatal("a claimed, unmarked INVALID index was not planned for cleanup (FR-PLAN-6)")
+	}
+}
+
+// Never overwrite a human's comment, never drop the object under it, and a live
+// claim does not change that.
+func TestPlanInvalidLeafUnderAForeignCommentHalts(t *testing.T) {
+	cat := newCatalog("p1", "p2")
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+	cat.indexes[child("p1")] = commented(invalidIndex("p1"), "built by the DBA team, do not touch")
+
+	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
+	p, err := testPlannerWith(claims).Plan(context.Background(), newSpec(), cat)
+	if p != nil {
+		t.Fatal("Plan() emitted a graph that would drop an index under somebody else's comment")
+	}
+	if !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
+		t.Fatalf("Plan() error = %v, want ErrAuthorizationUnsatisfied", err)
+	}
+}
+
+func TestPlanUnmarkedInvalidParentIndexHalts(t *testing.T) {
 	cat := newCatalog("p1")
 	cat.indexes[obj(testIndex)] = parentIndexState(false)
 
-	p, err := testPlannerWith(&fakeProvenance{}).Plan(context.Background(), newSpec(), cat)
+	p, err := testPlannerWith(&fakeClaims{}).Plan(context.Background(), newSpec(), cat)
 	if p != nil {
 		t.Fatal("Plan() adopted an in-progress parent index it cannot prove it created")
 	}
@@ -426,10 +450,11 @@ func TestPlanInvalidAttachedLeafHalts(t *testing.T) {
 	st.AttachedTo = &parent
 	cat.indexes[child("p1")] = st
 
-	// Even with provenance: PostgreSQL cannot drop an attached child index
-	// individually, so no graph fixes this (TRD §7.2.10).
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{child("p1"): true, obj(testIndex): true}}
-	p, err := testPlannerWith(prov).Plan(context.Background(), newSpec(), cat)
+	// Even when it is provably ours: PostgreSQL cannot drop an attached child
+	// index individually, so no graph fixes this (TRD §7.2.10).
+	cat.indexes[obj(testIndex)] = marked(cat.indexes[obj(testIndex)])
+	cat.indexes[child("p1")] = marked(cat.indexes[child("p1")])
+	p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
 	if p != nil {
 		t.Fatal("Plan() emitted a graph for an attached INVALID leaf index")
 	}
@@ -747,8 +772,8 @@ func TestPlanOrdersLeavesBySchemaThenName(t *testing.T) {
 func TestPlanRoundTripsThroughTheArtifact(t *testing.T) {
 	cat := newCatalog("p1", "p2")
 	cat.indexes[child("p1")] = invalidIndex("p1")
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{child("p1"): true}}
-	p := mustPlan(t, testPlannerWith(prov), newSpec(), cat)
+	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
+	p := mustPlan(t, testPlannerWith(claims), newSpec(), cat)
 
 	data, err := protocol.EncodePlan(p)
 	if err != nil {
@@ -872,11 +897,11 @@ func TestPlanPropagatesCatalogErrors(t *testing.T) {
 	}
 }
 
-func TestPlanPropagatesProvenanceErrors(t *testing.T) {
+func TestPlanPropagatesClaimErrors(t *testing.T) {
 	boom := errors.New("state store unreachable")
 	cat := newCatalog("p1")
 	cat.indexes[child("p1")] = invalidIndex("p1")
-	p, err := testPlannerWith(&fakeProvenance{err: boom}).Plan(context.Background(), newSpec(), cat)
+	p, err := testPlannerWith(&fakeClaims{err: boom}).Plan(context.Background(), newSpec(), cat)
 	if p != nil || !errors.Is(err, boom) {
 		t.Fatalf("Plan() = (%v, %v), want (nil, wrapped %v)", p, err, boom)
 	}
@@ -920,12 +945,12 @@ func TestPlannerUsesTheWallClockByDefault(t *testing.T) {
 	}
 }
 
-func TestPlanPropagatesProvenanceErrorsForTheParentIndex(t *testing.T) {
+func TestPlanPropagatesClaimErrorsForTheParentIndex(t *testing.T) {
 	boom := errors.New("state store unreachable")
 	cat := newCatalog("p1")
 	cat.indexes[obj(testIndex)] = parentIndexState(false)
 
-	p, err := testPlannerWith(&fakeProvenance{err: boom}).Plan(context.Background(), newSpec(), cat)
+	p, err := testPlannerWith(&fakeClaims{err: boom}).Plan(context.Background(), newSpec(), cat)
 	if p != nil || !errors.Is(err, boom) {
 		t.Fatalf("Plan() = (%v, %v), want (nil, wrapped %v)", p, err, boom)
 	}

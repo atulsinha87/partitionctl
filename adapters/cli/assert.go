@@ -32,8 +32,8 @@ import (
 // planner would have used (AC-11, AC-12, AC-26). A false assertion is terminal
 // and is never retried: it is false again a second later.
 type assertEvaluator struct {
-	reader     planner.CatalogReader
-	provenance provenanceLookup
+	reader planner.CatalogReader
+	claims claimLookup
 
 	relations map[protocol.ObjectName]planner.Relation
 	trees     map[uint32][]planner.TreeEntry
@@ -44,13 +44,13 @@ type assertEvaluator struct {
 }
 
 // newAssertEvaluator builds an evaluator over a read-only catalog reader.
-func newAssertEvaluator(r planner.CatalogReader, prov provenanceLookup) *assertEvaluator {
+func newAssertEvaluator(r planner.CatalogReader, claims claimLookup) *assertEvaluator {
 	return &assertEvaluator{
-		reader:     r,
-		provenance: prov,
-		relations:  make(map[protocol.ObjectName]planner.Relation),
-		trees:      make(map[uint32][]planner.TreeEntry),
-		roles:      make(map[string]map[uint32]planner.RoleMembership),
+		reader:    r,
+		claims:    claims,
+		relations: make(map[protocol.ObjectName]planner.Relation),
+		trees:     make(map[uint32][]planner.TreeEntry),
+		roles:     make(map[string]map[uint32]planner.RoleMembership),
 	}
 }
 
@@ -219,16 +219,25 @@ func (e *assertEvaluator) one(ctx context.Context, a protocol.Assertion) (execut
 			// build already happened. It is not a name clash.
 			return pass("%s already exists and is valid", idx.Name)
 		}
-		has, err := e.provenance.HasProvenance(ctx, idx.Name)
+		marker, status, err := planner.IndexMarker(ctx, e.reader, idx.Name)
 		if err != nil {
 			return r, err
 		}
-		if !has {
-			return fail("%s already exists and is %s, and PartitionCTL has no provenance record proving it "+
-				"created it; an in-progress build belonging to something else is never adopted "+
-				"(FR-PLAN-7, AC-6, NFR-REL-3)", idx.Name, idx.Condition())
+		in := protocol.ProvenanceDropInput{Object: idx.Name, Status: status, Marker: marker}
+		if status == protocol.MarkerAbsent {
+			run, found, cerr := e.claims.ClaimsObject(ctx, idx.Name)
+			if cerr != nil {
+				return r, cerr
+			}
+			if found {
+				in.ClaimRun = run
+			}
 		}
-		return pass("%s is an in-progress PartitionCTL build with provenance", idx.Name)
+		if v := protocol.DecideProvenanceDrop(in); !v.Satisfied() {
+			return fail("%s already exists and is %s: %s; an in-progress build belonging to something "+
+				"else is never adopted (FR-PLAN-7, AC-6, NFR-REL-3)", idx.Name, idx.Condition(), v.Reason)
+		}
+		return pass("%s is an in-progress PartitionCTL build this tool owns", idx.Name)
 
 	case protocol.AssertIndexExists:
 		if a.Index == nil {

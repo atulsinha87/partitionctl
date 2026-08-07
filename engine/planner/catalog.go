@@ -242,6 +242,13 @@ type CatalogReader interface {
 	// matching [ErrIndexNotFound] when there is no such index.
 	LookupIndex(ctx context.Context, name protocol.ObjectName) (Index, error)
 
+	// IndexComment returns obj_description(index, 'pg_class'), which is where
+	// PartitionCTL records ownership of an object it created
+	// ([protocol.Marker]). found is false when the index does not exist or
+	// carries no comment; the two are deliberately not distinguished, because
+	// every destructive decision treats them identically.
+	IndexComment(ctx context.Context, index protocol.ObjectName) (comment string, found bool, err error)
+
 	// RoleMemberships reports, for each owning role OID, whether role has that
 	// role's privileges (FR-PLAN-10). The result is keyed by OID and contains
 	// an entry for every OID that exists in pg_roles.
@@ -255,18 +262,36 @@ type ReadOnlyAsserter interface {
 	AssertReadOnly(ctx context.Context) error
 }
 
-// ProvenanceLookup answers whether PartitionCTL recorded creating an object
+// ClaimLookup answers whether some run still holds a live claim on an object
 // (FR-PLAN-6, FR-PLAN-7).
 //
+// It covers exactly one window that the ownership marker cannot: the object
+// exists because a statement ran, and the process died before the marker could
+// be written onto it. Outside that window the marker is the answer, and it is
+// read from the catalog rather than from here.
+//
 // The planner deliberately depends on this one-method view rather than on the
-// whole StateStore: it needs to read provenance, never to write it, and
-// coupling planning to the store's full surface would make the planner
-// untestable without one. Whatever implements the store satisfies this with a
-// two-line adapter.
-type ProvenanceLookup interface {
-	// HasProvenance reports whether a committed provenance record proves
-	// PartitionCTL created the named object (FR-AUTH-2).
-	HasProvenance(ctx context.Context, object protocol.ObjectName) (bool, error)
+// whole StateStore: it reads, never writes, and coupling planning to the store's
+// full surface would make the planner untestable without one. state.ClaimsObject
+// satisfies it with a two-line adapter.
+type ClaimLookup interface {
+	// ClaimsObject reports the run holding a live claim on object, if any.
+	ClaimsObject(ctx context.Context, object protocol.ObjectName) (string, bool, error)
+}
+
+// IndexMarker reads the ownership marker on an index and classifies it. It is
+// the one place a comment becomes a [protocol.MarkerStatus] on this side, so no
+// consumer can invent its own idea of what counts as ours.
+func IndexMarker(ctx context.Context, cr CatalogReader, index protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error) {
+	comment, found, err := cr.IndexComment(ctx, index)
+	if err != nil {
+		return protocol.Marker{}, protocol.MarkerAbsent, err
+	}
+	if !found {
+		return protocol.Marker{}, protocol.MarkerAbsent, nil
+	}
+	m, status := protocol.ParseMarker(comment)
+	return m, status, nil
 }
 
 // strategyFromCode maps pg_partitioned_table.partstrat to the protocol's

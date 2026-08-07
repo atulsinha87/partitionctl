@@ -15,6 +15,11 @@ type AuthorizationDecision struct {
 	Object protocol.ObjectName
 	// Satisfied is the only field that decides anything.
 	Satisfied bool
+	// Adopt reports that the object must be marked as PartitionCTL's *before*
+	// it is dropped, because the only thing proving ownership is a live claim
+	// and the marker is missing. It is the [protocol.DropAdoptThenDrop] row of
+	// the decision table, and it is reserved to `resume` (FR-CLI-9).
+	Adopt bool
 	// Evidence is what made the mode satisfied, recorded before the statement
 	// runs (FR-AUTH-6). It is JSON-marshalled by the state store, so a map is
 	// safe: encoding/json sorts keys.
@@ -28,14 +33,19 @@ type AuthorizationDecision struct {
 //
 // A plan is a proposal, never a permission: the mode the planner wrote is
 // re-checked here, and the run halts if it is unsatisfied, no matter what the
-// plan asserts. The returned error is reserved for a store failure, which is
-// "cannot decide" rather than "denied"; a denial is a nil error with
+// plan asserts. The returned error is reserved for a store or catalog failure,
+// which is "cannot decide" rather than "denied"; a denial is a nil error with
 // Satisfied false.
+//
+// The decision table itself lives in [protocol.DecideProvenanceDrop] and
+// [protocol.DecideLeftoverDrop] and is shared with the planner. There is
+// deliberately one implementation: two would be two places for the answers to
+// diverge, and the second one only ever runs against a production catalog.
 //
 // Every mode is additionally gated on the authorization naming exactly the
 // object the node would destroy. Without that check a plan could authorize one
 // index and drop another.
-func Authorize(ctx context.Context, store AuthorityReader, plan *protocol.Plan, n *protocol.Node) (AuthorizationDecision, error) {
+func Authorize(ctx context.Context, store AuthorityReader, cat CatalogEvaluator, plan *protocol.Plan, n *protocol.Node) (AuthorizationDecision, error) {
 	if !n.Kind.IsDestructive() {
 		return AuthorizationDecision{}, protocol.ErrInvalidPlan.Detailf(
 			"node %q of kind %q is not destructive and needs no authorization", n.ID, n.Kind)
@@ -64,9 +74,9 @@ func Authorize(ctx context.Context, store AuthorityReader, plan *protocol.Plan, 
 
 	switch auth.Mode {
 	case protocol.AuthProvenance:
-		return authorizeProvenance(ctx, store, d, auth)
+		return authorizeProvenance(ctx, store, cat, d, auth)
 	case protocol.AuthLeftover:
-		return authorizeLeftover(ctx, store, d, auth)
+		return authorizeLeftover(ctx, cat, d, auth)
 	case protocol.AuthExplicit:
 		return authorizeExplicit(d, plan, auth)
 	}
@@ -74,67 +84,75 @@ func Authorize(ctx context.Context, store AuthorityReader, plan *protocol.Plan, 
 	return d, nil
 }
 
-// authorizeProvenance is satisfied only by a committed provenance record
-// proving PartitionCTL created the object (FR-AUTH-2). An INVALID index nobody
-// recorded is somebody else's, and the run halts rather than dropping it
-// (AC-6, NFR-REL-3).
-func authorizeProvenance(ctx context.Context, store AuthorityReader, d AuthorizationDecision, auth *protocol.Authorization) (AuthorizationDecision, error) {
-	rec, found, err := store.LookupProvenance(ctx, auth.Object)
+// authorizeProvenance reads ownership off the object itself and falls back to a
+// live claim only where the marker is missing (directive A.5.1, FR-AUTH-2).
+func authorizeProvenance(ctx context.Context, store AuthorityReader, cat CatalogEvaluator, d AuthorizationDecision, auth *protocol.Authorization) (AuthorizationDecision, error) {
+	if cat == nil {
+		return d, ErrMissingPort.Detailf(
+			"a CatalogEvaluator is required to read the ownership marker on %s (FR-AUTH-2)", auth.Object)
+	}
+	marker, status, err := cat.Marker(ctx, auth.Object)
 	if err != nil {
 		return d, err
 	}
-	if !found {
-		d.Reason = "no committed provenance record proves PartitionCTL created " +
-			auth.Object.String() + " (FR-AUTH-2, AC-6)"
-		return d, nil
+
+	in := protocol.ProvenanceDropInput{Object: auth.Object, Status: status, Marker: marker}
+	// The claim is only consulted where it can change the answer, so a healthy
+	// marked object costs no state-store read at all.
+	if status == protocol.MarkerAbsent && store != nil {
+		run, found, err := store.ClaimsObject(ctx, auth.Object)
+		if err != nil {
+			return d, err
+		}
+		if found {
+			in.ClaimRun = string(run)
+		}
 	}
-	d.Satisfied = true
-	d.Evidence = map[string]string{
-		"mode":                string(protocol.AuthProvenance),
-		"object":              auth.Object.String(),
-		"provenance_run_id":   string(rec.RunID),
-		"provenance_node_id":  string(rec.NodeID),
-		"provenance_recorded": rec.CreatedAt.UTC().Format(timeLayout),
-	}
+
+	v := protocol.DecideProvenanceDrop(in)
+	d.Reason = v.Reason
+	d.Evidence = v.Evidence
+	d.Satisfied = v.Satisfied()
+	d.Adopt = v.Action == protocol.DropAdoptThenDrop
 	return d, nil
 }
 
 // authorizeLeftover requires two independent conditions: the name matches
-// PostgreSQL's _ccnew/_ccold convention, and the relation has a recorded
-// PartitionCTL reindex run (FR-AUTH-3, FR-AUTH-7, INV-7).
+// PostgreSQL's _ccnew/_ccold convention, and the *base* index carries a
+// PartitionCTL marker (FR-AUTH-3 as amended, FR-AUTH-7, INV-7).
 //
 // Naming alone is forgeable and non-exclusive. An operator who ran REINDEX
-// CONCURRENTLY by hand and left their own _ccnew behind must not have it
-// deleted by this tool (AC-19).
-func authorizeLeftover(ctx context.Context, store AuthorityReader, d AuthorizationDecision, auth *protocol.Authorization) (AuthorizationDecision, error) {
-	kind, base := protocol.ClassifyLeftover(auth.Object.Name)
-	if kind == protocol.LeftoverNone {
-		d.Reason = auth.Object.String() + " does not match the " +
-			protocol.LeftoverNewPrefix + "/" + protocol.LeftoverOldPrefix +
-			" naming convention (FR-AUTH-3)"
+// CONCURRENTLY by hand on an index this tool never built must not have the
+// wreckage deleted by it (AC-19).
+func authorizeLeftover(ctx context.Context, cat CatalogEvaluator, d AuthorizationDecision, auth *protocol.Authorization) (AuthorizationDecision, error) {
+	base, ok := protocol.LeftoverBase(auth.Object)
+	if !ok {
+		v := protocol.DecideLeftoverDrop(protocol.LeftoverDropInput{Object: auth.Object})
+		d.Reason = v.Reason
 		return d, nil
 	}
-	if auth.Relation == nil {
-		d.Reason = "leftover authorization carries no relation, so reindex-run history cannot be resolved (FR-AUTH-3)"
-		return d, nil
+	if cat == nil {
+		return d, ErrMissingPort.Detailf(
+			"a CatalogEvaluator is required to read the ownership marker on %s (FR-AUTH-3)", base)
 	}
-	ran, err := store.HasReindexRun(ctx, *auth.Relation)
+	marker, status, err := cat.Marker(ctx, base)
 	if err != nil {
 		return d, err
 	}
-	if !ran {
-		d.Reason = "no PartitionCTL reindex run is recorded for " + auth.Relation.String() +
-			", so the leftover is not ours to drop (FR-AUTH-3, INV-7, AC-19)"
-		return d, nil
-	}
-	d.Satisfied = true
-	d.Evidence = map[string]string{
-		"mode":           string(protocol.AuthLeftover),
-		"object":         auth.Object.String(),
-		"leftover_class": string(kind),
-		"base_index":     base,
-		"relation":       auth.Relation.String(),
-		"reindex_run":    "recorded",
+	v := protocol.DecideLeftoverDrop(protocol.LeftoverDropInput{
+		Object: auth.Object,
+		// The marker port cannot distinguish "no such index" from "an index
+		// with no comment", and it does not need to: both halt. BaseExists is
+		// true so the refusal reports the fact this side actually observed.
+		BaseExists: true,
+		BaseStatus: status,
+		BaseMarker: marker,
+	})
+	d.Reason = v.Reason
+	d.Evidence = v.Evidence
+	d.Satisfied = v.Satisfied()
+	if d.Satisfied && auth.Relation != nil {
+		d.Evidence["relation"] = auth.Relation.String()
 	}
 	return d, nil
 }
@@ -143,6 +161,10 @@ func authorizeLeftover(ctx context.Context, store AuthorityReader, d Authorizati
 // directly and the operator supplied the operation's confirmation flag
 // (FR-AUTH-4). Both halves are re-checked here against the plan artifact, which
 // is where the acknowledgement was recorded (FR-DROP-3, AC-13).
+//
+// The ownership marker plays no part, and must not: `drop-index` has to work on
+// an index PartitionCTL never created, which is the entire reason this mode
+// exists.
 func authorizeExplicit(d AuthorizationDecision, plan *protocol.Plan, auth *protocol.Authorization) (AuthorizationDecision, error) {
 	if plan == nil {
 		d.Reason = "explicit authorization cannot be evaluated without the plan artifact"

@@ -25,7 +25,9 @@ func TestStoreFailuresHaltTheRun(t *testing.T) {
 		{"reading node states", func(s *fakeStore) { s.failStates = boom }, false},
 		{"reading the cancellation flag", func(s *fakeStore) { s.failCancel = boom }, false},
 		{"appending an audit event", func(s *fakeStore) { s.failAudit = boom }, false},
-		{"committing provenance", func(s *fakeStore) { s.failProvenance = boom }, false},
+		// The claim is only read when a destructive node finds no marker, so
+		// this one needs a plan that contains one.
+		{"reading a claim", func(s *fakeStore) { s.failClaims = boom }, false},
 	}
 
 	for _, tc := range tests {
@@ -33,7 +35,11 @@ func TestStoreFailuresHaltTheRun(t *testing.T) {
 			h := newHarness()
 			tc.inject(h.store)
 
-			_, err := h.run(t, createChainPlan(t))
+			plan := createChainPlan(t)
+			if tc.name == "reading a claim" {
+				plan = cleanupPlan(t, provenanceAuth(t, "public.orders_created_at_idx_orders_2026_03"))
+			}
+			_, err := h.run(t, plan)
 			if err == nil {
 				t.Fatal("expected the run to halt")
 			}
@@ -50,7 +56,7 @@ func TestStoreFailuresHaltTheRun(t *testing.T) {
 func TestAuthorizationRecordFailureHaltsBeforeTheDrop(t *testing.T) {
 	h := newHarness()
 	const index = "public.orders_created_at_idx_orders_2026_03"
-	h.store.provenance[index] = Provenance{RunID: "run-0", Object: obj(t, index)}
+	h.catalog.mark(t, obj(t, index), "run-0")
 	h.store.failAuthz = errors.New("cannot record authorization")
 
 	_, err := h.run(t, cleanupPlan(t, provenanceAuth(t, index)))
@@ -103,29 +109,47 @@ func TestRunRejectsANilPlan(t *testing.T) {
 // Dispatch-level defenses
 // ---------------------------------------------------------------------------
 
-func TestDispatchRefusesKindsThisBuildCannotRun(t *testing.T) {
+// The vocabulary is closed. A kind outside it must fail loudly at dispatch
+// rather than fall through to a silent no-op, which is what makes adding one a
+// versioned engine change (TRD §7.2.2).
+func TestDispatchRefusesAKindOutsideTheVocabulary(t *testing.T) {
 	h := newHarness()
 	e := h.executor(t)
-	ctx := context.Background()
-
-	reindex := node("n", protocol.KindIndexReindexConcurrently, &protocol.ReindexConcurrentlyParams{
-		Index: obj(t, "public.i"),
-	})
-	if err := e.dispatch(ctx, "run-1", &reindex); !errors.Is(err, ErrUnsupportedNodeKind) {
-		t.Fatalf("error = %v, want ErrUnsupportedNodeKind", err)
-	}
-
-	dropPart := node("n", protocol.KindIndexDropPartitioned, &protocol.DropPartitionedParams{
-		Parent: obj(t, "public.orders"),
-		Index:  obj(t, "public.i"),
-	})
-	if err := e.dispatch(ctx, "run-1", &dropPart); !errors.Is(err, ErrUnsupportedNodeKind) {
-		t.Fatalf("error = %v, want ErrUnsupportedNodeKind", err)
-	}
 
 	unknown := protocol.Node{ID: "n", Kind: protocol.NodeKind("index.teleport")}
-	if err := e.dispatch(ctx, "run-1", &unknown); !errors.Is(err, protocol.ErrUnknownNodeKind) {
+	err := e.dispatch(context.Background(), "run-1", nil, &unknown, AuthorizationDecision{})
+	if !errors.Is(err, protocol.ErrUnknownNodeKind) {
 		t.Fatalf("error = %v, want ErrUnknownNodeKind", err)
+	}
+}
+
+// Preflight is where an unimplementable plan is refused, before any statement
+// runs. This build implements the whole vocabulary, so the only way in is a
+// kind the protocol does not know.
+func TestPreflightRefusesAnUnsupportedKindBeforeAnyStatement(t *testing.T) {
+	h := newHarness()
+	e := h.executor(t)
+	plan := createChainPlan(t)
+	plan.Nodes = append(plan.Nodes, protocol.Node{ID: "nX", Kind: protocol.NodeKind("index.teleport")})
+
+	if err := e.preflight(plan); !errors.Is(err, ErrUnsupportedNodeKind) {
+		t.Fatalf("error = %v, want ErrUnsupportedNodeKind", err)
+	}
+	if h.sql.execCount() != 0 {
+		t.Fatal("preflight issued a statement")
+	}
+}
+
+func TestSupportedKindsIsTheWholeVocabulary(t *testing.T) {
+	got := SupportedKinds()
+	want := protocol.AllNodeKinds()
+	if len(got) != len(want) {
+		t.Fatalf("SupportedKinds has %d kinds, the vocabulary has %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("position %d: %q, want %q (vocabulary order)", i, got[i], want[i])
+		}
 	}
 }
 

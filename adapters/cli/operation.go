@@ -58,8 +58,8 @@ func (o *createIndexOperation) Plan(ctx context.Context, req planner.Request) (p
 	cat := &operationCatalog{reader: req.Catalog, topo: req.Topology}
 
 	inner := createindex.Planner{
-		Now:        func() time.Time { return req.Now.Time },
-		Provenance: provenanceFor(req.Provenance),
+		Now:    func() time.Time { return req.Now.Time },
+		Claims: claimsFor(req.Claims),
 	}
 	plan, err := inner.Plan(ctx, spec, cat)
 	if err != nil {
@@ -72,21 +72,21 @@ func (o *createIndexOperation) Plan(ctx context.Context, req planner.Request) (p
 	}, nil
 }
 
-// provenanceFor adapts the planner's one-method provenance view to the
-// operation's, which declares the identical method under its own name. A nil
-// source means no provenance, which halts on an INVALID index rather than
-// planning its destruction (FR-PLAN-7, NFR-REL-3).
-func provenanceFor(p planner.ProvenanceLookup) createindex.ProvenanceReader {
-	if p == nil {
-		return createindex.NoProvenance()
+// claimsFor adapts the planner's one-method claim view to the operation's,
+// which declares the identical method under its own name. A nil source means no
+// claim, which leaves the ownership marker on the object as the only thing that
+// can authorize a drop (FR-PLAN-7, NFR-REL-3).
+func claimsFor(c planner.ClaimLookup) createindex.ClaimReader {
+	if c == nil {
+		return createindex.NoClaims()
 	}
-	return provenanceAdapter{p}
+	return claimAdapter{c}
 }
 
-type provenanceAdapter struct{ inner planner.ProvenanceLookup }
+type claimAdapter struct{ inner planner.ClaimLookup }
 
-func (a provenanceAdapter) HasProvenance(ctx context.Context, object protocol.ObjectName) (bool, error) {
-	return a.inner.HasProvenance(ctx, object)
+func (a claimAdapter) ClaimsObject(ctx context.Context, object protocol.ObjectName) (string, bool, error) {
+	return a.inner.ClaimsObject(ctx, object)
 }
 
 // createIndexNotes are the operator-facing lines `plan` prints for anything the
@@ -110,9 +110,13 @@ func createIndexNotes(req planner.Request, plan *protocol.Plan) []string {
 	}
 	if drops > 0 {
 		notes = append(notes, fmt.Sprintf(
-			"%d INVALID index(es) will be dropped first, each authorized by a committed provenance record "+
-				"re-checked at dispatch (FR-PLAN-6, FR-AUTH-5, AC-5)", drops))
+			"%d INVALID index(es) will be dropped first, each authorized by the PartitionCTL ownership "+
+				"marker on the object itself, re-read at dispatch (FR-PLAN-6, FR-AUTH-5, AC-5)", drops))
 	}
+	notes = append(notes,
+		"every index this run creates is stamped with a PartitionCTL ownership marker "+
+			"(COMMENT ON INDEX, ShareUpdateExclusiveLock, ~1ms), which is what lets a later run prove "+
+			"the object is its own to clean up (AC-6)")
 	if !createindex.HasWork(plan) {
 		notes = append(notes,
 			"no DDL remains: this plan is a checked no-op that re-proves the end state and exits zero (AC-7)")

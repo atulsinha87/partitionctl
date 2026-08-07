@@ -80,33 +80,46 @@ type IndexState struct {
 	// index can be dropped concurrently; an attached one cannot be dropped
 	// individually at all (TRD §7.2.10).
 	AttachedTo *protocol.ObjectName
+
+	// Comment is obj_description(index, 'pg_class'): where PartitionCTL records
+	// that it created the object ([protocol.Marker]). It is read in the same
+	// pass as the rest of the index state, because ownership is a per-index
+	// question and asking it one index at a time would cost a round trip per
+	// leaf (NFR-PERF-1).
+	Comment string
+}
+
+// Marker classifies whatever comment the index carries.
+func (s IndexState) Marker() (protocol.Marker, protocol.MarkerStatus) {
+	return protocol.ParseMarker(s.Comment)
 }
 
 // Healthy reports whether the index is valid, ready and live (FR-VER-1).
 func (s IndexState) Healthy() bool { return s.Valid && s.Ready && s.Live }
 
-// ProvenanceReader answers the only question that can authorize a destructive
-// node in this operation: did PartitionCTL create this object?
+// ClaimReader answers the second, narrower half of "is this object ours?".
 //
-// Provenance is recorded by the state store, not by the catalog (FR-STATE-6),
-// which is why it is a separate interface from [CatalogReader]. A record exists
-// only if it was committed before the DDL that created the object (INV-1), so a
-// positive answer is proof and not an inference.
-type ProvenanceReader interface {
-	// HasProvenance reports whether a committed provenance record proves
-	// PartitionCTL created object (FR-AUTH-2).
-	HasProvenance(ctx context.Context, object protocol.ObjectName) (bool, error)
+// The first half is the ownership marker on the object itself, which arrives
+// through [IndexState.Comment] and is a catalog fact. This covers the one
+// window the marker cannot: the object exists because a statement ran, and the
+// process died before the marker could be written onto it. The claim is the
+// node checkpoint the state store already holds, and it expires when the node
+// reaches a complete state.
+type ClaimReader interface {
+	// ClaimsObject reports the run holding a live claim on object, if any.
+	ClaimsObject(ctx context.Context, object protocol.ObjectName) (string, bool, error)
 }
 
-// NoProvenance returns a [ProvenanceReader] that proves nothing.
+// NoClaims returns a [ClaimReader] that holds none.
 //
-// It is the planner's default, and the default is the safe one: with no
-// provenance source the planner can authorize no drop, so it halts on any
-// INVALID index instead of planning its destruction (FR-PLAN-7, NFR-REL-3).
-func NoProvenance() ProvenanceReader { return noProvenance{} }
+// It is the planner's default, and the default is the safe one: with no claim
+// source the only thing that can authorize a drop is the marker on the object,
+// which is exactly the property that makes ownership survive a PITR restore
+// (FR-PLAN-7, NFR-REL-3).
+func NoClaims() ClaimReader { return noClaims{} }
 
-type noProvenance struct{}
+type noClaims struct{}
 
-func (noProvenance) HasProvenance(context.Context, protocol.ObjectName) (bool, error) {
-	return false, nil
+func (noClaims) ClaimsObject(context.Context, protocol.ObjectName) (string, bool, error) {
+	return "", false, nil
 }

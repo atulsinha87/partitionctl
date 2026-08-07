@@ -2,9 +2,10 @@
 // FR-LOCK-1…4).
 //
 // The store owns everything the executor must remember across a process death:
-// run identity, per-node lifecycle state, provenance, destructive-action
-// authorization, the lease that makes an abandoned run detectable, an
-// append-only audit trail, and the cancellation flag a live executor polls.
+// run identity, per-node lifecycle state including the object each node claims,
+// destructive-action authorization, the lease that makes an abandoned run
+// detectable, an append-only audit trail, and the cancellation flag a live
+// executor polls.
 //
 // # Two implementations
 //
@@ -22,12 +23,17 @@
 //
 // # Invariants enforced here, in code
 //
-// INV-1: a provenance row is committed before the DDL that creates the object
-// it describes. [StateStore.WriteProvenance] takes the DDL as a callback and
-// runs it only after the record is durably committed, so the wrong order is
-// not expressible. The record is never rolled back when the DDL fails: an
-// INVALID index left behind by a failed CREATE INDEX CONCURRENTLY is exactly
-// the object resume must be able to prove it owns (FR-PLAN-6, AC-5).
+// INV-1 (amended): a durable record naming the object and the run is committed
+// before the DDL that creates the object. That record is the node checkpoint.
+// [StateStore.CreateRun] seeds [NodeRecord.Object] from the plan before any
+// node runs, and the executor checkpoints READY -> RUNNING before dispatch, so
+// a crash can leave an object with a live claim and no ownership marker but
+// never the reverse. [ClaimsObject] is what reads that claim back.
+//
+// The permanent ownership record is a [protocol.Marker] written onto the object
+// itself as a COMMENT, which is why this package no longer has a provenance
+// table. A record keyed on a name authorizes whatever later occupies that name;
+// a record read off the object authorizes only that object (AC-6).
 //
 // INV-2: [StateStore.RecordAuthorization] has the same shape. The destructive
 // statement is a callback that runs only after the justification is committed
@@ -35,10 +41,10 @@
 // before it is written, so an authorization that cites nothing cannot be
 // recorded.
 //
-// INV-3: the audit trail is append-only. There is no update or delete path on
-// [AuditEvent] in this package's API, the file implementation opens the trail
-// O_APPEND and never rewrites it, and the SQL schema installs a BEFORE UPDATE
-// OR DELETE trigger that raises.
+// INV-3: the audit trail is append-only. There is no update and no delete path
+// on [AuditEvent] anywhere in this package's API, and the file implementation
+// opens the trail O_APPEND and never rewrites it. Enforcement is the absence of
+// a path, not a rule the callers follow.
 //
 // INV-4: a run in RUNNING whose lease has expired and whose advisory lock is
 // unheld is ORPHANED and resumable. [FindOrphans] and [AdoptOrphan] implement
@@ -47,9 +53,9 @@
 // conventional.
 //
 // INV-6: a run is bound to exactly one plan digest for its lifetime. The
-// digest is taken from the [protocol.Plan] passed to
-// [StateStore.CreateRun] and there is no API that changes it. The SQL schema
-// additionally installs a trigger that raises if an UPDATE would change it.
+// digest is taken from the [protocol.Plan] passed to [StateStore.CreateRun],
+// and [RunStore.SetRunStatus], the only other writer of a run record, never
+// touches it. There is no other write path.
 //
 // # Concurrency
 //

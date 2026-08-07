@@ -50,12 +50,6 @@ var (
 	// ErrStoreIO wraps a failure of the underlying medium. Exit 1.
 	ErrStoreIO = &protocol.Error{Kind: KindStoreIO, Code: protocol.ExitFailure, Msg: "state store i/o"}
 
-	// ErrProvenanceNotRecorded means the provenance record could not be
-	// committed, so the guarded DDL was NOT executed (INV-1). Exit 1.
-	ErrProvenanceNotRecorded = &protocol.Error{
-		Kind: KindGuardNotRecorded, Code: protocol.ExitFailure,
-		Msg: "provenance not recorded, guarded statement was not executed (INV-1)"}
-
 	// ErrAuthorizationNotRecorded means the authorization record could not be
 	// committed, so the guarded destructive statement was NOT executed
 	// (INV-2). It carries exit 13, because a destructive action that could not

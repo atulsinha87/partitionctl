@@ -13,7 +13,6 @@ import (
 
 func runCols() []string  { return strings.Split(runColumns, ", ") }
 func nodeCols() []string { return strings.Split(nodeColumns, ", ") }
-func provCols() []string { return strings.Split(provenanceColumns, ", ") }
 func authCols() []string { return strings.Split(authorizationColumns, ", ") }
 func auditCols() []string {
 	return strings.Split(auditColumns, ", ")
@@ -25,7 +24,7 @@ func auditRow(runID string, seq int64) []driver.Value {
 }
 
 func nodeRow(runID, nodeID, state string, attempts int64) []driver.Value {
-	return []driver.Value{runID, nodeID, "wait", state, attempts, "", "", nil, baseTime}
+	return []driver.Value{runID, nodeID, "wait", state, "", "", attempts, "", "", nil, baseTime}
 }
 
 func TestSQLFindRuns(t *testing.T) {
@@ -145,9 +144,9 @@ func TestSQLNodeReads(t *testing.T) {
 	t.Run("get", func(t *testing.T) {
 		s, fake := newSQLStoreForTest(t, SQLOptions{})
 		row := nodeRow("run-1", "n1", "RUNNING", 2)
-		row[7] = baseTime // started_at
-		row[5] = "lock timeout"
-		row[6] = string(protocol.KindLockHeld)
+		row[9] = baseTime // started_at
+		row[7] = "lock timeout"
+		row[8] = string(protocol.KindLockHeld)
 		fake.Reply("node_state WHERE run_id = $1 AND node_id", nodeCols(), row)
 
 		got, err := s.GetNode(ctx, "run-1", "n1")
@@ -210,71 +209,24 @@ func TestSQLNodeReads(t *testing.T) {
 	})
 }
 
-func TestSQLProvenanceReadWrite(t *testing.T) {
-	ctx := context.Background()
-	s, fake := newSQLStoreForTest(t, SQLOptions{})
-	fake.Reply(".run WHERE run_id", runCols(), runRow("run-1"))
-	fake.Reply("audit_event", auditCols(), auditRow("run-1", 1))
-	fake.Reply("FROM \"partitionctl\".provenance", provCols(), []driver.Value{
-		"run-1:prov:1", "run-1", "cic", "sha256:deadbeef", "appdb",
-		"public", "idx", "index", "public", "orders_2026_03", true, "alice", baseTime,
-	})
-
-	rec, err := s.WriteProvenance(ctx, Provenance{
-		RunID: "run-1", NodeID: "cic",
-		Object:     protocol.NewObjectName("public", "idx"),
-		ObjectKind: ObjectIndex,
-		Relation:   ptrName("public", "orders_2026_03"),
-	}, nil)
-	if err != nil {
-		t.Fatalf("WriteProvenance: %v", err)
-	}
-	insert, ok := fake.Find(`INTO "partitionctl".provenance`)
-	if !ok {
-		t.Fatal("no provenance insert")
-	}
-	if insert.Args[0] != rec.ProvenanceID {
-		t.Errorf("id argument = %v, want %v", insert.Args[0], rec.ProvenanceID)
-	}
-	if insert.Args[3] != "sha256:deadbeef" {
-		t.Errorf("plan digest was not copied from the run: %v", insert.Args[3])
-	}
-	if insert.Args[10] != true {
-		t.Errorf("has_relation = %v, want true", insert.Args[10])
-	}
-
-	found, err := s.FindProvenance(ctx, ProvenanceQuery{Object: protocol.NewObjectName("public", "idx")})
-	if err != nil {
-		t.Fatalf("FindProvenance: %v", err)
-	}
-	if len(found) != 1 {
-		t.Fatalf("got %d records, want 1", len(found))
-	}
-	if found[0].Relation == nil || found[0].Relation.Name != "orders_2026_03" {
-		t.Errorf("relation = %+v", found[0].Relation)
-	}
-	if found[0].ObjectKind != ObjectIndex {
-		t.Errorf("object kind = %q", found[0].ObjectKind)
-	}
-}
-
 func TestSQLAuthorizationReadWrite(t *testing.T) {
 	ctx := context.Background()
 	s, fake := newSQLStoreForTest(t, SQLOptions{})
 	fake.Reply(".run WHERE run_id", runCols(), runRow("run-1"))
 	fake.Reply("audit_event", auditCols(), auditRow("run-1", 1))
+	leftover := protocol.NewObjectName("public", "orders_idx_ccnew1")
+	evidence := leftoverEvidence(leftover, "public.orders_idx")
 	fake.Reply("FROM \"partitionctl\".authorization", authCols(), []driver.Value{
 		"run-1:auth:1", "run-1", "drop", "leftover", "appdb",
 		"public", "orders_idx_ccnew1", "public", "orders_2026_03", true,
-		"", "run-reindex-9", "", []byte(`{"note":"cleanup"}`), baseTime,
+		"", []byte(`{"base_index":"public.orders_idx"}`), baseTime,
 	})
 
 	rec, err := s.RecordAuthorization(ctx, AuthorizationRecord{
 		RunID: "run-1", NodeID: "drop", Mode: protocol.AuthLeftover,
-		Object:       protocol.NewObjectName("public", "orders_idx_ccnew1"),
-		Relation:     ptrName("public", "orders_2026_03"),
-		ReindexRunID: "run-reindex-9",
-		Evidence:     map[string]string{"note": "cleanup"},
+		Object:   leftover,
+		Relation: ptrName("public", "orders_2026_03"),
+		Evidence: evidence,
 	}, nil)
 	if err != nil {
 		t.Fatalf("RecordAuthorization: %v", err)
@@ -289,8 +241,8 @@ func TestSQLAuthorizationReadWrite(t *testing.T) {
 	if insert.Args[3] != string(protocol.AuthLeftover) {
 		t.Errorf("mode argument = %v", insert.Args[3])
 	}
-	if !strings.Contains(insert.Args[13].(string), "cleanup") {
-		t.Errorf("evidence was not encoded: %v", insert.Args[13])
+	if !strings.Contains(insert.Args[11].(string), "base_index") {
+		t.Errorf("evidence was not encoded: %v", insert.Args[11])
 	}
 
 	got, err := s.ListAuthorizations(ctx, "run-1")
@@ -300,10 +252,10 @@ func TestSQLAuthorizationReadWrite(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d records, want 1", len(got))
 	}
-	if got[0].Mode != protocol.AuthLeftover || got[0].ReindexRunID != "run-reindex-9" {
+	if got[0].Mode != protocol.AuthLeftover {
 		t.Errorf("got %+v", got[0])
 	}
-	if got[0].Evidence["note"] != "cleanup" {
+	if got[0].Evidence["base_index"] != "public.orders_idx" {
 		t.Errorf("evidence = %v", got[0].Evidence)
 	}
 }

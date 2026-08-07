@@ -205,8 +205,8 @@ func TestRenderQuotesHostileIdentifiers(t *testing.T) {
 func TestPlanNodesCarryRenderedSQL(t *testing.T) {
 	cat := newCatalog("p1")
 	cat.indexes[child("p1")] = invalidIndex("p1")
-	prov := &fakeProvenance{created: map[protocol.ObjectName]bool{child("p1"): true}}
-	p := mustPlan(t, testPlannerWith(prov), newSpec(), cat)
+	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
+	p := mustPlan(t, testPlannerWith(claims), newSpec(), cat)
 
 	for i := range p.Nodes {
 		n := &p.Nodes[i]

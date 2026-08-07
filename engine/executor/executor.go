@@ -37,8 +37,8 @@ const DefaultBuildLockTimeout = 15 * time.Minute
 // [Config.HeartbeatInterval] is not (FR-LOCK-3).
 const DefaultHeartbeatInterval = 10 * time.Second
 
-// supportedKinds is what this build can dispatch: the seven kinds
-// CreatePartitionedIndex emits (TRD §7.2.2, "Introduced by" = Create).
+// supportedKinds is what this build can dispatch: the whole vocabulary
+// (TRD §7.2.2).
 var supportedKinds = []protocol.NodeKind{
 	protocol.KindCatalogAssert,
 	protocol.KindIndexCreateParentInvalid,
@@ -47,14 +47,18 @@ var supportedKinds = []protocol.NodeKind{
 	protocol.KindIndexVerify,
 	protocol.KindWait,
 	protocol.KindIndexDropConcurrently,
+	protocol.KindIndexReindexConcurrently,
+	protocol.KindIndexDropPartitioned,
 }
 
 // SupportedKinds returns the node kinds this executor build implements, in
 // vocabulary order. The returned slice is a copy.
 //
-// The two absent kinds, index.reindex_concurrently and index.drop_partitioned,
-// are in the protocol vocabulary and arrive with M3 and M2. A plan containing
-// one fails with [ErrUnsupportedNodeKind] before any statement runs.
+// It is the whole vocabulary. The list stays as an explicit value rather than
+// deferring to [protocol.AllNodeKinds] because the executor's claim is "this
+// build dispatches these", which is not the same statement as "these kinds
+// exist", and a future kind must fail loudly here rather than fall through
+// dispatch's default.
 func SupportedKinds() []protocol.NodeKind {
 	out := make([]protocol.NodeKind, len(supportedKinds))
 	copy(out, supportedKinds)
@@ -135,6 +139,19 @@ type Config struct {
 	// DryRun prints the dispatch sequence and issues no DDL and no state
 	// writes (FR-CLI-5).
 	DryRun bool
+
+	// AllowAdoption permits the one authorization path that is reserved to
+	// `resume` (FR-CLI-9): dropping an object that carries no ownership marker
+	// but is still named by a live claim ([AuthorizationDecision.Adopt]).
+	//
+	// It is a configuration flag rather than a plan property on purpose. The
+	// old rule refused any plan containing a provenance-authorized destructive
+	// node, which was both too broad — a marked object is a catalog fact and
+	// `execute` may act on it — and defeated by any re-plan, because the guard
+	// was keyed on the digest of a prior run. Deciding it here means the rule is
+	// evaluated against the same live state the authorization is, at the moment
+	// the statement would run.
+	AllowAdoption bool
 }
 
 // Executor walks a plan. It holds no per-run state: everything durable lives in
@@ -375,8 +392,17 @@ func (e *Executor) preflight(plan *protocol.Plan) error {
 		if !supportedKind(n.Kind) {
 			return unsupportedKind(n)
 		}
-		switch n.Kind {
-		case protocol.KindCatalogAssert, protocol.KindIndexVerify:
+		switch {
+		case n.Kind == protocol.KindCatalogAssert, n.Kind == protocol.KindIndexVerify:
+			needsCatalog = true
+		case n.Kind.IsDestructive():
+			// Authorization reads the ownership marker off the object it is
+			// about to destroy (FR-AUTH-2, FR-AUTH-3 as amended), so the
+			// catalog port is as load-bearing here as it is for an assertion.
+			needsCatalog = true
+		case n.Kind == protocol.KindIndexReindexConcurrently:
+			// The reindex marker rewrite preserves the creation facts already
+			// on the object, which means reading them first.
 			needsCatalog = true
 		}
 		if n.Kind.IssuesDDL() {
@@ -396,8 +422,8 @@ func (e *Executor) preflight(plan *protocol.Plan) error {
 	// produce, since create-index always emits catalog.assert and index.verify.
 	if needsCatalog && !e.cfg.DryRun && e.cfg.Catalog == nil {
 		return ErrMissingPort.Detailf(
-			"the plan contains %s or %s nodes but no CatalogEvaluator is configured",
-			protocol.KindCatalogAssert, protocol.KindIndexVerify)
+			"the plan contains nodes that read the catalog (assertions, verification, " +
+				"destructive authorization or a reindex marker rewrite) but no CatalogEvaluator is configured")
 	}
 	return nil
 }
@@ -556,23 +582,26 @@ func (e *Executor) runNode(ctx, bg context.Context, run RunID, plan *protocol.Pl
 
 		// INV-2 / FR-AUTH-5: re-evaluate against live state immediately before
 		// dispatch, and record the satisfied mode before the statement runs.
+		var decision AuthorizationDecision
 		if n.Kind.IsDestructive() {
-			if err := e.authorizeNode(bg, run, plan, n); err != nil {
+			d, err := e.authorizeNode(bg, run, plan, n)
+			if err != nil {
 				return err
 			}
-		}
-		// INV-1: the provenance row is committed before the DDL that creates
-		// the object it describes.
-		if err := e.recordProvenance(bg, run, n); err != nil {
-			return err
+			decision = d
 		}
 
+		// INV-1 as amended: the durable record naming the object and this run
+		// was committed by CreateRun and became a live claim at READY, above.
+		// Nothing further is written before the statement; the permanent
+		// ownership record is the marker execDDL writes onto the object itself
+		// once the statement returns.
 		if err := e.transition(bg, run, n, st, protocol.NodeRunning, protocol.ReasonNormal, transitionInfo{}); err != nil {
 			return err
 		}
 
 		start := e.cfg.Clock.Now()
-		dispatchErr := e.dispatch(bg, run, n)
+		dispatchErr := e.dispatch(bg, run, plan, n, decision)
 		elapsed := e.cfg.Clock.Now().Sub(start)
 
 		if dispatchErr == nil {
@@ -651,8 +680,9 @@ func (e *Executor) verifyPhase(bg context.Context, run RunID, n *protocol.Node, 
 
 // dispatch is the whole of FR-EXEC-1: one switch, on kind, and nothing else.
 // No branch reads the plan's operation, the node's id, or anything about why
-// the node exists.
-func (e *Executor) dispatch(ctx context.Context, run RunID, n *protocol.Node) error {
+// the node exists. The plan and the decision are passed through to execDDL for
+// the ownership marker, which is content, not control flow.
+func (e *Executor) dispatch(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node, d AuthorizationDecision) error {
 	switch n.Kind {
 	case protocol.KindCatalogAssert:
 		return e.runAssertions(ctx, n)
@@ -660,8 +690,10 @@ func (e *Executor) dispatch(ctx context.Context, run RunID, n *protocol.Node) er
 	case protocol.KindIndexCreateParentInvalid,
 		protocol.KindIndexCreateConcurrently,
 		protocol.KindIndexAttach,
-		protocol.KindIndexDropConcurrently:
-		return e.execDDL(ctx, run, n)
+		protocol.KindIndexDropConcurrently,
+		protocol.KindIndexReindexConcurrently,
+		protocol.KindIndexDropPartitioned:
+		return e.execDDL(ctx, run, plan, n, d)
 
 	case protocol.KindWait:
 		p, err := paramsOf[*protocol.WaitParams](n)
@@ -675,9 +707,6 @@ func (e *Executor) dispatch(ctx context.Context, run RunID, n *protocol.Node) er
 	case protocol.KindIndexVerify:
 		// The work is the verification, which runs in verifyPhase.
 		return nil
-
-	case protocol.KindIndexReindexConcurrently, protocol.KindIndexDropPartitioned:
-		return unsupportedKind(n)
 	}
 	return protocol.ErrUnknownNodeKind.Detailf("node %q: %q", n.ID, n.Kind)
 }
@@ -748,8 +777,29 @@ func (e *Executor) runAssertions(ctx context.Context, n *protocol.Node) error {
 }
 
 // execDDL renders the statement from structured params and sends it under the
-// session contract its kind requires.
-func (e *Executor) execDDL(ctx context.Context, run RunID, n *protocol.Node) error {
+// session contract its kind requires, then writes the ownership marker onto the
+// object the node acted on.
+//
+// # Ordering
+//
+// The marker is written *after* the primary statement returns, and that is the
+// only order INV-1 permits: an object cannot be marked before it exists. The
+// window between the two is covered by the node checkpoint, which is already
+// durable ([protocol.Node.Object], state.ClaimsObject). A crash there leaves an
+// object with a live claim and no marker, which `resume` adopts; the reverse
+// can never occur.
+//
+// # Cost
+//
+// One extra catalog-only statement per created leaf and one per attach, each
+// taking ShareUpdateExclusiveLock for about a millisecond (spike question 2).
+// At 400 partitions that is roughly 800 statements against a build measured in
+// hours. The plan Notes say so.
+//
+// A failed COMMENT fails the node. That is correct and convergent: the object
+// exists but reads as unowned, so the next plan halts on it rather than
+// destroying it, and `resume` adopts it under the claim this run still holds.
+func (e *Executor) execDDL(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node, d AuthorizationDecision) error {
 	sql, err := Render(n)
 	if err != nil {
 		return err
@@ -757,13 +807,102 @@ func (e *Executor) execDDL(ctx context.Context, run RunID, n *protocol.Node) err
 	if sql == "" {
 		return protocol.ErrInvalidPlan.Detailf("node %q of kind %q rendered an empty statement", n.ID, n.Kind)
 	}
-	return e.cfg.SQL.Exec(ctx, Statement{
+
+	// The adopt-then-drop row of the decision table: the object is ours by a
+	// live claim alone, so it is marked before it is destroyed. The marker is
+	// what makes the drop auditable after the fact, when the claim is gone.
+	if d.Adopt {
+		if err := e.adoptObject(ctx, run, plan, n, d.Object); err != nil {
+			return err
+		}
+	}
+
+	if err := e.cfg.SQL.Exec(ctx, Statement{
 		RunID:                     run,
 		NodeID:                    n.ID,
 		Kind:                      n.Kind,
 		SQL:                       sql,
 		Settings:                  e.settingsFor(n.Kind),
 		MustRunOutsideTransaction: n.Kind.MustRunOutsideTransaction(),
+	}); err != nil {
+		return err
+	}
+	return e.markObject(ctx, run, plan, n)
+}
+
+// markObject writes the node's ownership marker, if its kind writes one.
+func (e *Executor) markObject(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node) error {
+	target, ok, err := protocol.MarkerTargetFor(n)
+	if err != nil || !ok {
+		return err
+	}
+
+	// A rewrite preserves the creation facts already on the object, so they
+	// have to be read first. This is also what stops a reindex from
+	// overwriting a comment a human wrote.
+	var (
+		prior  protocol.Marker
+		status protocol.MarkerStatus
+	)
+	if target.Rewrite {
+		if e.cfg.Catalog == nil {
+			return ErrMissingPort.Detailf(
+				"node %q rewrites the ownership marker on %s but no CatalogEvaluator is configured",
+				n.ID, target.Index)
+		}
+		prior, status, err = e.cfg.Catalog.Marker(ctx, target.Index)
+		if err != nil {
+			return err
+		}
+	}
+
+	stmt, ok, err := protocol.RenderMarkerStatement(n, e.markerBase(run, plan), prior, status)
+	if err != nil || !ok {
+		return err
+	}
+	return e.execMarker(ctx, run, n, stmt)
+}
+
+// adoptObject writes the ownership marker onto an object PartitionCTL is about
+// to drop under a live claim, before the drop.
+func (e *Executor) adoptObject(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node, object protocol.ObjectName) error {
+	m := e.markerBase(run, plan)
+	// index.drop_concurrently is only ever emitted for an unattached ordinary
+	// index on a leaf (TRD §7.2.10), so the role is not in doubt.
+	m.Role = protocol.MarkerRoleLeaf
+	text, err := protocol.FormatMarker(m)
+	if err != nil {
+		return err
+	}
+	return e.execMarker(ctx, run, n, protocol.RenderComment(object, text))
+}
+
+// markerBase is the run-level half of every marker this run writes.
+func (e *Executor) markerBase(run RunID, plan *protocol.Plan) protocol.Marker {
+	m := protocol.Marker{Run: string(run), At: protocol.MarkerTime(e.cfg.Clock.Now())}
+	if plan != nil {
+		m.Plan = plan.Digest
+		m.Op = string(plan.Operation)
+	}
+	return m
+}
+
+// execMarker sends a COMMENT ON INDEX.
+//
+// It is not a CONCURRENTLY form and does not wait on application transactions,
+// so it takes the short lock_timeout rather than the build one, and it accepts
+// the configured statement_timeout. It is transactional, so it carries no
+// out-of-transaction requirement.
+func (e *Executor) execMarker(ctx context.Context, run RunID, n *protocol.Node, sql string) error {
+	return e.cfg.SQL.Exec(ctx, Statement{
+		RunID:  run,
+		NodeID: n.ID,
+		Kind:   n.Kind,
+		SQL:    sql,
+		Settings: SessionSettings{
+			LockTimeout:      e.cfg.LockTimeout,
+			StatementTimeout: e.cfg.StatementTimeout,
+		},
 	})
 }
 
@@ -790,10 +929,10 @@ func (e *Executor) settingsFor(k protocol.NodeKind) SessionSettings {
 // authorizeNode re-evaluates a destructive node and records the verdict. Both
 // the authorization record and its audit event are written before the statement
 // runs (FR-AUTH-6, INV-2, AC-20).
-func (e *Executor) authorizeNode(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node) error {
-	d, err := Authorize(ctx, e.cfg.Store, plan, n)
+func (e *Executor) authorizeNode(ctx context.Context, run RunID, plan *protocol.Plan, n *protocol.Node) (AuthorizationDecision, error) {
+	d, err := Authorize(ctx, e.cfg.Store, e.cfg.Catalog, plan, n)
 	if err != nil {
-		return ErrCheckpointFailed.Detailf("evaluating authorization for node %q", n.ID).Wrap(err)
+		return d, ErrCheckpointFailed.Detailf("evaluating authorization for node %q", n.ID).Wrap(err)
 	}
 	if !d.Satisfied {
 		_ = e.audit(ctx, AuditEvent{
@@ -807,9 +946,30 @@ func (e *Executor) authorizeNode(ctx context.Context, run RunID, plan *protocol.
 				"reason": d.Reason,
 			},
 		})
-		return protocol.ErrAuthorizationUnsatisfied.Detailf(
+		return d, protocol.ErrAuthorizationUnsatisfied.Detailf(
 			"node %q (%s) would destroy %s under mode %q: %s",
 			n.ID, n.Kind, d.Object, d.Mode, d.Reason)
+	}
+	// FR-CLI-9: adoption is `resume`'s alone. The object exists, carries no
+	// ownership marker, and is ours only because a run that died still names
+	// it. That is a recovery decision, not an ordinary one.
+	if d.Adopt && !e.cfg.AllowAdoption {
+		_ = e.audit(ctx, AuditEvent{
+			RunID:  run,
+			NodeID: n.ID,
+			Type:   AuditAuthorizationDenied,
+			Detail: map[string]string{
+				"kind":   string(n.Kind),
+				"mode":   string(d.Mode),
+				"object": d.Object.String(),
+				"reason": "adoption is reserved to resume (FR-CLI-9)",
+			},
+		})
+		return d, protocol.ErrAuthorizationUnsatisfied.Detailf(
+			"node %q would drop %s, which carries no PartitionCTL ownership marker and is claimed only "+
+				"by the in-flight run %q. Cleaning up after an interrupted run is `resume`'s job, not "+
+				"`execute`'s: run `partitionctl resume` against this target (FR-CLI-9)",
+			n.ID, d.Object, d.Evidence["claim_run"])
 	}
 	if err := e.cfg.Store.RecordAuthorization(ctx, AuthorizationRecord{
 		RunID:     run,
@@ -819,57 +979,13 @@ func (e *Executor) authorizeNode(ctx context.Context, run RunID, plan *protocol.
 		Evidence:  d.Evidence,
 		GrantedAt: e.cfg.Clock.Now(),
 	}); err != nil {
-		return ErrCheckpointFailed.Detailf("recording authorization for node %q", n.ID).Wrap(err)
+		return d, ErrCheckpointFailed.Detailf("recording authorization for node %q", n.ID).Wrap(err)
 	}
 	detail := map[string]string{"kind": string(n.Kind)}
 	for k, v := range d.Evidence {
 		detail[k] = v
 	}
-	return e.audit(ctx, AuditEvent{RunID: run, NodeID: n.ID, Type: AuditAuthorizationGranted, Detail: detail})
-}
-
-// recordProvenance commits proof that PartitionCTL is about to create an
-// object, before the statement that creates it (INV-1, FR-STATE-6). A crash
-// between the two leaves a record with no object, which the planner treats as
-// nothing to clean up. The reverse order would leave an object nobody can prove
-// is ours, which halts every future run (FR-PLAN-7).
-func (e *Executor) recordProvenance(ctx context.Context, run RunID, n *protocol.Node) error {
-	p, ok, err := e.provenanceFor(run, n)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-	if err := e.cfg.Store.RecordProvenance(ctx, p); err != nil {
-		return ErrCheckpointFailed.Detailf("recording provenance for %s (node %q)", p.Object, n.ID).Wrap(err)
-	}
-	return nil
-}
-
-// provenanceFor reports what a node is about to create. Like dispatch, it
-// switches on kind alone.
-func (e *Executor) provenanceFor(run RunID, n *protocol.Node) (Provenance, bool, error) {
-	p := Provenance{RunID: run, NodeID: n.ID, ObjectKind: ObjectKindIndex, CreatedAt: e.cfg.Clock.Now()}
-	switch n.Kind {
-	case protocol.KindIndexCreateParentInvalid:
-		params, err := paramsOf[*protocol.CreateParentInvalidParams](n)
-		if err != nil {
-			return Provenance{}, false, err
-		}
-		rel := params.Parent
-		p.Object, p.Relation = params.Index, &rel
-		return p, true, nil
-	case protocol.KindIndexCreateConcurrently:
-		params, err := paramsOf[*protocol.CreateConcurrentlyParams](n)
-		if err != nil {
-			return Provenance{}, false, err
-		}
-		rel := params.Partition
-		p.Object, p.Relation = params.Index, &rel
-		return p, true, nil
-	}
-	return Provenance{}, false, nil
+	return d, e.audit(ctx, AuditEvent{RunID: run, NodeID: n.ID, Type: AuditAuthorizationGranted, Detail: detail})
 }
 
 // transitionInfo carries the optional detail of one checkpoint.

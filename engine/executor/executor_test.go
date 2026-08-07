@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -166,37 +167,109 @@ func TestCheckpointFailureHaltsBeforeTheStatement(t *testing.T) {
 	}
 }
 
-func TestProvenanceIsCommittedBeforeTheCreatingDDL(t *testing.T) {
+// INV-1 as amended: the ownership marker is written onto the object, and it can
+// only be written after the object exists. The record that covers the window is
+// the node checkpoint, which is durable before dispatch.
+func TestTheOwnershipMarkerIsWrittenRightAfterTheCreatingDDL(t *testing.T) {
 	h := newHarness()
 	plan := createChainPlan(t)
 
 	if _, err := h.run(t, plan); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// INV-1, for both kinds that create an object.
-	h.rec.mustPrecede(t, "provenance:public.orders_created_at_idx", "exec:n2")
-	h.rec.mustPrecede(t, "provenance:public.orders_created_at_idx_orders_2026_03", "exec:n3")
 
-	if _, ok := h.store.provenance["public.orders_created_at_idx_orders_2026_03"]; !ok {
-		t.Fatal("no provenance recorded for the leaf index")
+	// Both create kinds and the attach mark their object; nothing else does.
+	marked := map[protocol.NodeID]protocol.ObjectName{
+		"n2": obj(t, "public.orders_created_at_idx"),
+		"n3": obj(t, "public.orders_created_at_idx_orders_2026_03"),
+		"n5": obj(t, "public.orders_created_at_idx_orders_2026_03"),
 	}
-	// A node that creates nothing records nothing.
-	if len(h.rec.withPrefix("provenance:")) != 2 {
-		t.Fatalf("provenance events = %v, want exactly the two create nodes", h.rec.withPrefix("provenance:"))
+	for id, object := range marked {
+		stmts := h.sql.statementsFor(id)
+		if len(stmts) != 2 {
+			t.Fatalf("node %q issued %d statements, want the DDL and its COMMENT", id, len(stmts))
+		}
+		if !strings.HasPrefix(stmts[1].SQL, "COMMENT ON INDEX "+object.Quoted()+" IS ") {
+			t.Fatalf("node %q second statement is not the marker:\n%s", id, stmts[1].SQL)
+		}
+		if _, status := parseMarkerLiteral(t, stmts[1].SQL); status != protocol.MarkerOurs {
+			t.Fatalf("node %q wrote a marker this binary cannot read back:\n%s", id, stmts[1].SQL)
+		}
+	}
+	for _, id := range []protocol.NodeID{"n1", "n4", "n6"} {
+		for _, st := range h.sql.statementsFor(id) {
+			if strings.HasPrefix(st.SQL, "COMMENT") {
+				t.Fatalf("node %q wrote a marker; only the create and attach kinds do", id)
+			}
+		}
 	}
 }
 
-func TestProvenanceFailureHaltsBeforeTheDDL(t *testing.T) {
+// The marker records who built the object, under which plan, and when.
+func TestTheMarkerNamesTheRunThePlanAndTheRole(t *testing.T) {
 	h := newHarness()
-	h.store.failProvenance = errors.New("cannot commit provenance")
 	plan := createChainPlan(t)
-
-	_, err := h.run(t, plan)
-	if !errors.Is(err, ErrCheckpointFailed) {
-		t.Fatalf("error = %v, want ErrCheckpointFailed", err)
+	if _, err := h.run(t, plan); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if h.sql.execCount() != 0 {
-		t.Fatalf("DDL ran without committed provenance; INV-1 forbids it")
+
+	stmts := h.sql.statementsFor("n3")
+	m, status := parseMarkerLiteral(t, stmts[1].SQL)
+	if status != protocol.MarkerOurs {
+		t.Fatalf("status = %v", status)
+	}
+	if m.Run != "run-1" {
+		t.Errorf("marker run = %q, want the executing run", m.Run)
+	}
+	if m.Plan != plan.Digest {
+		t.Errorf("marker plan = %q, want the plan digest %q", m.Plan, plan.Digest)
+	}
+	if m.Op != string(plan.Operation) {
+		t.Errorf("marker op = %q", m.Op)
+	}
+	if m.Role != protocol.MarkerRoleLeaf {
+		t.Errorf("marker role = %q, want leaf", m.Role)
+	}
+	if m.At == "" {
+		t.Error("marker carries no creation timestamp")
+	}
+}
+
+// FR-EXEC-5: the COMMENT is not a CONCURRENTLY form and does not wait on
+// application transactions, so it takes the short lock_timeout, not the build
+// one, and it runs inside a transaction like any other catalog statement.
+func TestTheMarkerStatementUsesTheShortLockTimeout(t *testing.T) {
+	h := newHarness()
+	h.cfg.BuildLockTimeout = 20 * time.Minute
+	if _, err := h.run(t, createChainPlan(t)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	stmts := h.sql.statementsFor("n3")
+	if stmts[0].Settings.LockTimeout != 20*time.Minute {
+		t.Fatalf("the CREATE INDEX CONCURRENTLY lost its build lock_timeout: %v", stmts[0].Settings.LockTimeout)
+	}
+	if got := stmts[1].Settings.LockTimeout; got != h.cfg.LockTimeout {
+		t.Fatalf("marker lock_timeout = %v, want the short bound %v", got, h.cfg.LockTimeout)
+	}
+	if stmts[1].MustRunOutsideTransaction {
+		t.Fatal("the marker was sent outside a transaction; COMMENT is transactional")
+	}
+}
+
+// A failed COMMENT fails the node. The object exists but reads as unowned, so
+// the next plan halts on it rather than destroying it, and `resume` adopts it
+// under the claim this run still holds. Wasteful, safe, convergent.
+func TestAFailedMarkerFailsTheNode(t *testing.T) {
+	h := newHarness()
+	boom := errors.New("canceling statement due to lock timeout")
+	h.sql.hook = func(_ context.Context, stmt Statement) error {
+		if strings.HasPrefix(stmt.SQL, "COMMENT") {
+			return boom
+		}
+		return nil
+	}
+	if _, err := h.run(t, createChainPlan(t)); err == nil {
+		t.Fatal("a failed ownership marker did not fail the node")
 	}
 }
 
@@ -412,10 +485,10 @@ func provenanceAuth(t *testing.T, index string) *protocol.Authorization {
 	}
 }
 
-func TestDestructiveNodeHaltsWhenProvenanceIsAbsent(t *testing.T) {
+func TestDestructiveNodeHaltsWhenTheObjectIsUnowned(t *testing.T) {
 	h := newHarness()
 	plan := cleanupPlan(t, provenanceAuth(t, "public.orders_created_at_idx_orders_2026_03"))
-	// No provenance seeded: the INVALID index is somebody else's (AC-6).
+	// No marker and no claim: the INVALID index is somebody else's (AC-6).
 
 	res, err := h.run(t, plan)
 	if !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
@@ -447,9 +520,7 @@ func TestDestructiveNodeHaltsWhenProvenanceIsAbsent(t *testing.T) {
 func TestDestructiveNodeRecordsAuthorizationBeforeTheStatement(t *testing.T) {
 	h := newHarness()
 	index := "public.orders_created_at_idx_orders_2026_03"
-	h.store.provenance[index] = Provenance{
-		RunID: "run-0", NodeID: "n3", Object: obj(t, index), ObjectKind: ObjectKindIndex,
-	}
+	h.catalog.mark(t, obj(t, index), "run-0")
 	plan := cleanupPlan(t, provenanceAuth(t, index))
 
 	if _, err := h.run(t, plan); err != nil {
@@ -466,17 +537,17 @@ func TestDestructiveNodeRecordsAuthorizationBeforeTheStatement(t *testing.T) {
 	if got.Mode != protocol.AuthProvenance {
 		t.Fatalf("recorded mode = %q, want provenance", got.Mode)
 	}
-	if got.Evidence["provenance_run_id"] != "run-0" {
-		t.Fatalf("evidence = %v, want the run that created the object", got.Evidence)
+	if got.Evidence["source"] != "marker" || got.Evidence["marker_run"] != "run-0" {
+		t.Fatalf("evidence = %v, want the run that created the object, read off it", got.Evidence)
 	}
 }
 
 func TestDestructiveNodeHaltsWhenAuthorizationNamesAnotherObject(t *testing.T) {
 	h := newHarness()
-	// Provenance exists for the *other* index, and the authorization points at
-	// it, but the node would drop something else.
+	// The *other* index is marked, and the authorization points at it, but the
+	// node would drop something else.
 	other := "public.some_other_idx"
-	h.store.provenance[other] = Provenance{RunID: "run-0", Object: obj(t, other)}
+	h.catalog.mark(t, obj(t, other), "run-0")
 	plan := cleanupPlan(t, provenanceAuth(t, other))
 
 	_, err := h.run(t, plan)
@@ -563,73 +634,125 @@ func TestEveryDDLStatementCarriesALockTimeout(t *testing.T) {
 // Node vocabulary: FR-EXEC-1
 // ---------------------------------------------------------------------------
 
-func TestUnsupportedKindsAreRefusedBeforeAnyStatement(t *testing.T) {
-	tests := []struct {
-		name string
-		plan func(*testing.T) *protocol.Plan
-	}{
-		{
-			name: "reindex_concurrently",
-			plan: func(t *testing.T) *protocol.Plan {
-				return newPlan(t,
-					node("n1", protocol.KindIndexAttach, &protocol.AttachParams{
-						ParentIndex: obj(t, "public.parent_idx"),
-						ChildIndex:  obj(t, "public.child_a"),
-					}),
-					node("n2", protocol.KindIndexReindexConcurrently, &protocol.ReindexConcurrentlyParams{
-						Index:    obj(t, "public.child_a"),
-						Relation: objPtr(t, "public.orders_2026_03"),
-					}, "n1"),
-				)
-			},
-		},
-		{
-			name: "drop_partitioned",
-			plan: func(t *testing.T) *protocol.Plan { return dropPartitionedPlan(t) },
-		},
+// M2 and M3 wired their kinds into dispatch. The proof that the wiring is real
+// is that a plan containing each one executes, with the exact session contract
+// its kind declares.
+func TestTheTwoLateKindsDispatch(t *testing.T) {
+	t.Run("reindex_concurrently", func(t *testing.T) {
+		h := newHarness()
+		h.cfg.BuildLockTimeout = 20 * time.Minute
+		h.cfg.StatementTimeout = 30 * time.Second
+		leaf := obj(t, "public.orders_idx_2026_03")
+		h.catalog.mark(t, leaf, "run-0")
+
+		plan := newPlan(t,
+			node("n1", protocol.KindIndexReindexConcurrently, &protocol.ReindexConcurrentlyParams{
+				Index:       leaf,
+				Relation:    objPtr(t, "public.orders_2026_03"),
+				ParentIndex: objPtr(t, "public.orders_idx"),
+			}),
+		)
+		if _, err := h.run(t, plan); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		stmts := h.sql.statementsFor("n1")
+		if len(stmts) != 2 {
+			t.Fatalf("issued %d statements, want the REINDEX and its marker rewrite", len(stmts))
+		}
+		if stmts[0].SQL != `REINDEX INDEX CONCURRENTLY "public"."orders_idx_2026_03"` {
+			t.Fatalf("statement = %q", stmts[0].SQL)
+		}
+		// FR-EXEC-6: never inside a transaction block.
+		if !stmts[0].MustRunOutsideTransaction {
+			t.Error("REINDEX CONCURRENTLY was sent inside a transaction block")
+		}
+		// A leaf may be 10 TB, so no finite statement_timeout, whatever the
+		// configuration says.
+		if stmts[0].Settings.StatementTimeout != 0 {
+			t.Errorf("statement_timeout = %v, want none", stmts[0].Settings.StatementTimeout)
+		}
+		// It waits for concurrent transactions exactly as CIC does, so it gets
+		// the build bound, not the short one.
+		if stmts[0].Settings.LockTimeout != 20*time.Minute {
+			t.Errorf("lock_timeout = %v, want the build bound", stmts[0].Settings.LockTimeout)
+		}
+	})
+
+	t.Run("drop_partitioned", func(t *testing.T) {
+		h := newHarness()
+		h.cfg.BuildLockTimeout = 20 * time.Minute
+		plan := dropPartitionedPlan(t)
+		if _, err := h.run(t, plan); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		stmts := h.sql.statementsFor("n1")
+		if len(stmts) != 1 {
+			t.Fatalf("issued %d statements, want just the DROP; a dropped index has nothing to mark", len(stmts))
+		}
+		if stmts[0].SQL != `DROP INDEX "public"."orders_created_at_idx"` {
+			t.Fatalf("statement = %q", stmts[0].SQL)
+		}
+		// It is not a CONCURRENTLY form: it takes AccessExclusiveLock outright,
+		// so it gets the short lock_timeout and a bounded retry rather than the
+		// build bound that exists for statements which wait on the application.
+		if stmts[0].Settings.LockTimeout != h.cfg.LockTimeout {
+			t.Errorf("lock_timeout = %v, want the short bound %v",
+				stmts[0].Settings.LockTimeout, h.cfg.LockTimeout)
+		}
+		if stmts[0].Settings.LockTimeout == 0 {
+			t.Error("the one AccessExclusiveLock statement ran with no lock_timeout")
+		}
+		if stmts[0].MustRunOutsideTransaction {
+			t.Error("DROP INDEX is transactional and must not be forced outside one")
+		}
+	})
+}
+
+// FR-DROP-6 and AC-15: the failure that matters is 55P03 lock_not_available,
+// which commits nothing. The executor backs off and retries within its budget,
+// and on exhaustion abandons cleanly with the index intact.
+func TestDropPartitionedRetriesOnLockNotAvailableAndAbandonsCleanly(t *testing.T) {
+	h := newHarness()
+	lockNotAvailable := &pgErr{code: "55P03", msg: "canceling statement due to lock timeout"}
+	h.sql.errs["n1"] = []error{lockNotAvailable, lockNotAvailable}
+
+	plan := dropPartitionedPlan(t)
+	if _, err := h.run(t, plan); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := len(h.rec.withPrefix("exec:n1")); got != 3 {
+		t.Fatalf("DROP INDEX was issued %d times, want 3 (two lock timeouts then success)", got)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarness()
-			_, err := h.run(t, tc.plan(t))
-			if !errors.Is(err, ErrUnsupportedNodeKind) {
-				t.Fatalf("error = %v, want ErrUnsupportedNodeKind", err)
-			}
-			if h.sql.execCount() != 0 {
-				t.Fatalf("%d statements ran before the unsupported kind was reached; "+
-					"the check must be a pre-flight", h.sql.execCount())
-			}
-			if len(h.store.transitions) != 0 {
-				t.Fatalf("%d checkpoints were written for a plan that cannot run", len(h.store.transitions))
-			}
-		})
+	// Budget exhaustion leaves the index intact and the run failed, not a
+	// half-dropped tree: the statement is atomic.
+	h2 := newHarness()
+	h2.sql.errs["n1"] = []error{lockNotAvailable, lockNotAvailable, lockNotAvailable, lockNotAvailable}
+	res, err := h2.run(t, dropPartitionedPlan(t))
+	if err == nil {
+		t.Fatal("the run did not fail after the retry budget was exhausted")
+	}
+	if res.HaltedAt != "n1" {
+		t.Fatalf("HaltedAt = %q", res.HaltedAt)
 	}
 }
 
-func TestSupportedKindsIsTheCreateVocabulary(t *testing.T) {
+func TestEveryVocabularyKindIsDispatchable(t *testing.T) {
 	got := SupportedKinds()
-	want := []protocol.NodeKind{
-		protocol.KindCatalogAssert,
-		protocol.KindIndexCreateParentInvalid,
-		protocol.KindIndexCreateConcurrently,
-		protocol.KindIndexAttach,
-		protocol.KindIndexVerify,
-		protocol.KindWait,
-		protocol.KindIndexDropConcurrently,
-	}
+	want := protocol.AllNodeKinds()
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("SupportedKinds() = %v, want %v", got, want)
+		t.Fatalf("SupportedKinds() = %v, want the whole vocabulary %v", got, want)
 	}
-	// And the two absent kinds are genuinely in the protocol vocabulary, so
-	// this is a build limit rather than an unknown kind.
-	for _, k := range []protocol.NodeKind{protocol.KindIndexReindexConcurrently, protocol.KindIndexDropPartitioned} {
+	for _, k := range want {
 		if !k.Valid() {
 			t.Fatalf("%q is not a protocol node kind", k)
 		}
-		if supportedKind(k) {
-			t.Fatalf("%q should not be supported by this build", k)
+		if !supportedKind(k) {
+			t.Fatalf("%q is in the vocabulary but this build cannot dispatch it", k)
 		}
+	}
+	if supportedKind(protocol.NodeKind("index.teleport")) {
+		t.Fatal("a kind outside the vocabulary reported itself supported")
 	}
 }
 
@@ -993,8 +1116,10 @@ func TestRetrySafetyIsDeclaredPerKind(t *testing.T) {
 		protocol.KindIndexCreateParentInvalid,
 		protocol.KindIndexCreateConcurrently,
 		protocol.KindIndexDropConcurrently,
+		// A failed REINDEX CONCURRENTLY leaves a _ccnew behind, so re-issuing
+		// it in process either collides or rebuilds needlessly. Recovery is
+		// `resume`, which re-plans and finds the leftover.
 		protocol.KindIndexReindexConcurrently,
-		protocol.KindIndexDropPartitioned,
 	}
 	for _, k := range unsafe {
 		if k.RetrySafe() {
@@ -1004,6 +1129,13 @@ func TestRetrySafetyIsDeclaredPerKind(t *testing.T) {
 	}
 	if !protocol.KindIndexAttach.RetrySafe() {
 		t.Error("index.attach is idempotent and should stay retryable in process")
+	}
+	// DROP INDEX on a partitioned parent is a single atomic statement that
+	// commits nothing before it can fail. The failure FR-DROP-6 is about is
+	// 55P03, where the lock was never taken and the index is untouched;
+	// re-issuing after a backoff is exactly right (AC-15).
+	if !protocol.KindIndexDropPartitioned.RetrySafe() {
+		t.Error("index.drop_partitioned is atomic and must be retryable within its budget (FR-DROP-6)")
 	}
 }
 

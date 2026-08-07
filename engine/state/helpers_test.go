@@ -95,6 +95,54 @@ func testPlanWithID(t *testing.T, id protocol.PlanID, table string) *protocol.Pl
 	return p
 }
 
+// testClaimPlan builds a sealed create-index plan whose nodes name real
+// objects, so [NodeRecord.Object] is seeded and [ClaimsObject] has something to
+// find. testPlan's nodes are all `wait`, which claim nothing by design.
+func testClaimPlan(t *testing.T, leafIndexes ...string) *protocol.Plan {
+	t.Helper()
+	parent := protocol.NewObjectName("public", "orders")
+	def := protocol.IndexDefinition{Columns: []protocol.IndexColumn{{Name: "created_at"}}}
+	nodes := []protocol.Node{{
+		ID:   "parent",
+		Kind: protocol.KindIndexCreateParentInvalid,
+		Params: &protocol.CreateParentInvalidParams{
+			Parent: parent, Index: protocol.NewObjectName("public", "orders_idx"), Definition: def,
+		},
+	}}
+	for _, name := range leafIndexes {
+		nodes = append(nodes, protocol.Node{
+			ID:        protocol.NodeID("cic:" + name),
+			Kind:      protocol.KindIndexCreateConcurrently,
+			DependsOn: []protocol.NodeID{"parent"},
+			Params: &protocol.CreateConcurrentlyParams{
+				Partition:  protocol.NewObjectName("public", "orders_p"),
+				Index:      protocol.NewObjectName("public", name),
+				Definition: def,
+			},
+		})
+	}
+	p := &protocol.Plan{
+		FormatVersion: protocol.PlanFormatVersion,
+		PlanID:        "plan-claim-1",
+		Operation:     protocol.OpCreateIndex,
+		Target: protocol.Target{
+			Database: "appdb",
+			Table:    parent,
+		},
+		CreatedAt: protocol.NewTimestamp(baseTime),
+		Nodes:     nodes,
+		TopologyFingerprint: protocol.FingerprintPrefix +
+			"0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("test plan is invalid: %v", err)
+	}
+	if err := p.Seal(); err != nil {
+		t.Fatalf("seal test plan: %v", err)
+	}
+	return p
+}
+
 // newFileStore opens a store in a temp dir with a controlled clock.
 func newFileStore(t *testing.T) (*FileStore, *fakeClock) {
 	t.Helper()

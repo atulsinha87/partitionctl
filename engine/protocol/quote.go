@@ -25,6 +25,16 @@ func QuoteIdentifier(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+// QuoteLiteral renders s as a single-quoted PostgreSQL string literal.
+//
+// Doubling the quote is the whole escape: PostgreSQL processes no backslash
+// escapes inside a standard string literal when standard_conforming_strings is
+// on, which it is by default on every version NFR-COMPAT-1 covers. It is used
+// for index storage-parameter values and for the ownership marker text.
+func QuoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 // QuoteQualifiedName renders a dotted, fully quoted name from its parts, for
 // example ("public", "orders") -> "public"."orders". Empty parts are skipped,
 // so an unqualified name is rendered bare-schema-less rather than as

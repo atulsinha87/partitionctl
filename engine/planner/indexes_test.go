@@ -251,8 +251,12 @@ func TestInspectChildrenPropagatesCatalogErrors(t *testing.T) {
 	}
 }
 
-// TestDecideCleanup is FR-PLAN-6 versus FR-PLAN-7: provenance decides whether
-// an unusable index is dropped or the run halts (AC-5, AC-6, NFR-REL-3).
+// TestDecideCleanup is FR-PLAN-6 versus FR-PLAN-7: ownership decides whether an
+// unusable index is dropped or the run halts (AC-5, AC-6, NFR-REL-3).
+//
+// Ownership is read off the object, as a marker in its comment. The live claim
+// is consulted only where the marker is missing, which is the crash window
+// between the creating statement and the COMMENT that follows it.
 func TestDecideCleanup(t *testing.T) {
 	f := standardTree()
 	topo := mustDiscover(t, f)
@@ -269,59 +273,76 @@ func TestDecideCleanup(t *testing.T) {
 		return c
 	}
 
+	// marked/unmarked/foreign describe what the catalog says about the object.
+	marked := func() *FakeCatalog { return standardTree().Mark(childName, "run-0") }
+	unmarked := func() *FakeCatalog { return standardTree() }
+	foreign := func() *FakeCatalog {
+		return standardTree().Comment(childName, "built by the DBA team, do not touch")
+	}
+
 	tests := []struct {
 		name     string
 		cond     IndexCondition
-		prov     ProvenanceLookup
+		catalog  func() *FakeCatalog
+		claims   ClaimLookup
 		want     CleanupDecision
 		wantHalt bool
 	}{
 		{
 			name: "absent needs nothing",
-			cond: IndexAbsent, prov: NewFakeProvenance(childName), want: CleanupNone,
+			cond: IndexAbsent, catalog: marked, want: CleanupNone,
 		},
 		{
 			name: "valid needs nothing",
-			cond: IndexValid, prov: NewFakeProvenance(childName), want: CleanupNone,
+			cond: IndexValid, catalog: marked, want: CleanupNone,
 		},
 		{
-			name: "invalid with provenance is dropped (FR-PLAN-6, AC-5)",
-			cond: IndexInvalid, prov: NewFakeProvenance(childName), want: CleanupDropWithProvenance,
+			name: "invalid and marked is dropped (FR-PLAN-6, AC-5)",
+			cond: IndexInvalid, catalog: marked, want: CleanupDropWithProvenance,
 		},
 		{
-			name: "not ready with provenance is dropped",
-			cond: IndexNotReady, prov: NewFakeProvenance(childName), want: CleanupDropWithProvenance,
+			name: "not ready and marked is dropped",
+			cond: IndexNotReady, catalog: marked, want: CleanupDropWithProvenance,
 		},
 		{
-			name: "invalid without provenance halts (FR-PLAN-7, AC-6)",
-			cond: IndexInvalid, prov: NewFakeProvenance(), want: CleanupHalt, wantHalt: true,
+			name: "invalid, unmarked, with a live claim is adopted then dropped",
+			cond: IndexInvalid, catalog: unmarked, claims: NewFakeClaims(childName),
+			want: CleanupAdoptThenDrop,
 		},
 		{
-			name: "invalid with no provenance source at all halts",
-			cond: IndexInvalid, prov: nil, want: CleanupHalt, wantHalt: true,
+			name: "invalid, unmarked, with no claim halts (FR-PLAN-7, AC-6)",
+			cond: IndexInvalid, catalog: unmarked, want: CleanupHalt, wantHalt: true,
+		},
+		{
+			name: "invalid with no claim source at all halts",
+			cond: IndexInvalid, catalog: unmarked, claims: nil, want: CleanupHalt, wantHalt: true,
+		},
+		{
+			// Never overwrite a human's comment, never drop the object under
+			// it, and a live claim does not change that.
+			name: "invalid under somebody else's comment halts even with a claim",
+			cond: IndexInvalid, catalog: foreign, claims: NewFakeClaims(childName),
+			want: CleanupHalt, wantHalt: true,
 		},
 		{
 			// A killed DROP INDEX CONCURRENTLY leaves exactly indislive = false
 			// with nothing in flight, and PostgreSQL's documented recovery is
-			// to reissue the drop. operations/create-index already does that:
-			// leafChain's default branch checks provenance and emits a drop.
-			// Halting here instead meant `plan` + `execute` could recover from
-			// this state and `resume` could not, so every resume attempt failed
-			// the run again and the operator's only route was a re-plan.
-			name: "not live with provenance is re-dropped (FR-PLAN-6)",
-			cond: IndexNotLive, prov: NewFakeProvenance(childName), want: CleanupDropWithProvenance,
+			// to reissue the drop. Halting here instead meant `plan` plus
+			// `execute` could recover from this state and `resume` could not.
+			name: "not live and marked is re-dropped (FR-PLAN-6)",
+			cond: IndexNotLive, catalog: marked, want: CleanupDropWithProvenance,
 		},
 		{
-			name: "not live without provenance halts (FR-PLAN-7, AC-6)",
-			cond: IndexNotLive, prov: NewFakeProvenance(), want: CleanupHalt, wantHalt: true,
+			name: "not live and unmarked halts (FR-PLAN-7, AC-6)",
+			cond: IndexNotLive, catalog: unmarked, want: CleanupHalt, wantHalt: true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := DecideCleanup(ctx(), tc.prov, plan(tc.cond))
+			got, verdict, err := DecideCleanup(ctx(), tc.catalog(), tc.claims, plan(tc.cond))
 			if got != tc.want {
-				t.Errorf("decision = %q, want %q", got, tc.want)
+				t.Errorf("decision = %q, want %q (reason: %s)", got, tc.want, verdict.Reason)
 			}
 			if !tc.wantHalt {
 				if err != nil {
@@ -344,24 +365,33 @@ func TestDecideCleanup(t *testing.T) {
 	}
 }
 
-func TestDecideCleanupPropagatesProvenanceErrors(t *testing.T) {
+// A marked object costs no state-store read at all: the marker is the answer,
+// and the claim exists only to cover the window in which there is no marker.
+func TestDecideCleanupOnlyReadsTheClaimWhenTheMarkerIsMissing(t *testing.T) {
 	f := standardTree()
 	topo := mustDiscover(t, f)
 	leaf := topo.Leaves[0]
 	childName := childIndex(t, parentIndexName, leaf.Name.Name)
 	existing := idx(indexBase+1, childName.Schema, childName.Name, leaf.OID, leaf.Name.Name, false, true, true)
+	child := ChildIndexPlan{Leaf: leaf, ChildIndex: childName, Condition: IndexInvalid, Existing: &existing}
 
-	prov := NewFakeProvenance()
-	prov.Err = errors.New("state store unreachable")
+	claims := NewFakeClaims()
+	claims.Err = errors.New("state store unreachable")
 
-	got, err := DecideCleanup(ctx(), prov, ChildIndexPlan{
-		Leaf: leaf, ChildIndex: childName, Condition: IndexInvalid, Existing: &existing,
-	})
+	// Marked: the claim is never consulted, so the outage is invisible.
+	if got, _, err := DecideCleanup(ctx(), standardTree().Mark(childName, "run-0"), claims, child); err != nil ||
+		got != CleanupDropWithProvenance {
+		t.Fatalf("decision = %q, err = %v; a marked object must not need the state store", got, err)
+	}
+
+	// Unmarked: the claim is the only remaining witness, so an outage is
+	// "cannot decide" and halts rather than denying quietly.
+	got, _, err := DecideCleanup(ctx(), standardTree(), claims, child)
 	if got != CleanupHalt {
 		t.Errorf("decision = %q, want %q", got, CleanupHalt)
 	}
 	if err == nil || !strings.Contains(err.Error(), "state store unreachable") {
-		t.Fatalf("err = %v, want the provenance error propagated", err)
+		t.Fatalf("err = %v, want the claim error propagated", err)
 	}
 }
 

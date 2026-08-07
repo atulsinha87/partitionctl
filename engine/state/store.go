@@ -23,7 +23,6 @@ func SystemClock() time.Time { return time.Now() }
 type StateStore interface {
 	RunStore
 	NodeStore
-	ProvenanceStore
 	AuthorizationStore
 	LeaseStore
 	AuditStore
@@ -42,7 +41,13 @@ type RunStore interface {
 
 	// CreateRun opens a run bound to exactly one plan digest (INV-6) and seeds
 	// a [NodeRecord] in [protocol.InitialNodeState] for every node in the
-	// plan. It appends an [EventRunOpened] audit event.
+	// plan, each carrying the object that node acts on ([protocol.Node.Object]).
+	// It appends an [EventRunOpened] audit event.
+	//
+	// Seeding the object is what makes the node record a claim, and it is why
+	// CreateRun takes the whole plan rather than a node count: the claim has to
+	// exist before the first statement runs, and the only moment at which every
+	// object is known is when the plan is read (INV-1 as amended).
 	CreateRun(ctx context.Context, req NewRun) (Run, error)
 
 	// GetRun returns one run, or an error matching [ErrNotFound].
@@ -68,27 +73,6 @@ type NodeStore interface {
 	// orphan-recovery restriction. It appends an [EventNodeTransition] audit
 	// event.
 	TransitionNode(ctx context.Context, t NodeTransition) (NodeRecord, error)
-}
-
-// ProvenanceStore owns provenance records (FR-STATE-6) and enforces INV-1.
-type ProvenanceStore interface {
-	ProvenanceReader
-
-	// WriteProvenance commits rec and only then runs create (INV-1).
-	//
-	// The ordering is not a documented contract the caller must honour: the
-	// DDL is an argument, so issuing it first is not expressible. If the
-	// record cannot be committed, create is not called and the returned error
-	// matches [ErrProvenanceNotRecorded]. If create fails, the record is
-	// deliberately retained, because an INVALID index left behind by a failed
-	// CREATE INDEX CONCURRENTLY is exactly what `resume` must be able to prove
-	// it owns (FR-PLAN-6, AC-5); the committed record is returned alongside
-	// create's error, unmodified.
-	//
-	// create may be nil, which records provenance for an object created by
-	// some other means. That is a deliberate escape hatch and it is not what
-	// the executor uses.
-	WriteProvenance(ctx context.Context, rec Provenance, create GuardedAction) (Provenance, error)
 }
 
 // AuthorizationStore owns destructive-action authorization records and enforces

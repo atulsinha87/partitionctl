@@ -13,6 +13,18 @@ type NodeRecord struct {
 	Kind   protocol.NodeKind  `json:"kind"`
 	State  protocol.NodeState `json:"state"`
 
+	// Object is the catalog object this node acts on, seeded from the plan when
+	// the run is created and never changed (FR-STATE-6 as amended). It is what
+	// makes a node record a *claim*: the durable record that exists before the
+	// DDL runs, and that stops authorizing anything the moment the node reaches
+	// a complete state.
+	//
+	// This is what replaced the provenance table. A provenance row keyed on a
+	// name outlived the run that wrote it and therefore authorized destroying
+	// whatever later occupied that name, which is precisely the hole AC-6
+	// describes. A claim cannot: see [ClaimsObject].
+	Object protocol.ObjectName `json:"object,omitempty"`
+
 	// Attempts counts dispatches, not transitions. It is what FR-EXEC-4's
 	// bounded attempt budget is measured against.
 	Attempts int `json:"attempts"`

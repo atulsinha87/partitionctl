@@ -14,45 +14,27 @@ import (
 // [executor.StateStore] the dispatch loop declares.
 //
 // The two are deliberately different. engine/state owns runs, leases, locks,
-// orphan recovery and the audit trail; engine/executor asks only for the six
+// orphan recovery and the audit trail; engine/executor asks only for the five
 // operations a dispatch loop performs, so that a fake is a few lines. Joining
-// them is this type's whole job, and there are four places where the join is
-// not mechanical:
+// them is this type's whole job, and there are two places where the join is not
+// mechanical:
 //
-//  1. Provenance and authorization are recorded through
-//     [state.ProvenanceStore.WriteProvenance] and
-//     [state.AuthorizationStore.RecordAuthorization], both of which take the
-//     guarded statement as a callback so that INV-1 and INV-2 are structural.
-//     The executor's port splits the two: it records, then dispatches. Passing
-//     a nil callback is therefore correct and is the only shape that fits — the
-//     ordering guarantee still holds, because the executor's record call
-//     returns only once the record is committed, and the statement is issued
-//     after it returns. The callback form remains the stronger contract, and it
-//     is what the resume-time cleanup in cleanup.go uses, where this package
-//     does own both halves.
+//  1. [state.AuthorizationStore.RecordAuthorization] takes the destructive
+//     statement as a callback, so that INV-2 is structural rather than a rule
+//     the caller follows. The executor's port splits the two: it records, then
+//     dispatches. Passing a nil callback is therefore correct and is the only
+//     shape that fits — the ordering guarantee still holds, because the
+//     executor's record call returns only once the record is committed, and the
+//     statement is issued after it returns.
 //
-//  2. [state.AuthorizationRecord] requires typed evidence per mode: a
-//     provenance id for AuthProvenance, a reindex run id for AuthLeftover.
-//     [executor.Authorize] produces evidence as a string map and does not carry
-//     the provenance record's id at all. So this type resolves the id from the
-//     store itself before writing the record. That is not a workaround: it means
-//     the id written to the audit trail is one this process read, rather than
-//     one it was handed.
-//
-//  3. [state.NodeStore.TransitionNode] is a compare-and-set that also owns the
+//  2. [state.NodeStore.TransitionNode] is a compare-and-set that also owns the
 //     attempt counter, while [executor.Transition] reports the cumulative count.
 //     The counter is incremented here exactly on READY -> RUNNING, which is the
 //     one edge that represents a dispatch.
-//
-//  4. Provenance is written once per object rather than once per attempt. The
-//     executor's port permits either; writing once keeps a node that retries
-//     four hundred times from leaving four hundred identical records, and the
-//     invariant INV-1 protects is "a committed record existed before the
-//     statement ran", which an earlier attempt already satisfies.
 type executorStore struct {
 	store state.StateStore
-	// database narrows provenance and authorization records to one target,
-	// because a file store can hold state for more than one.
+	// database narrows claim and authorization records to one target, because a
+	// file store can hold state for more than one.
 	database string
 }
 
@@ -63,53 +45,18 @@ func newExecutorStore(s state.StateStore, database string) *executorStore {
 
 var _ executor.StateStore = (*executorStore)(nil)
 
-// LookupProvenance implements [executor.AuthorityReader] (FR-AUTH-2).
-func (b *executorStore) LookupProvenance(ctx context.Context, object protocol.ObjectName) (executor.Provenance, bool, error) {
-	if b.database == "" {
-		// Fail closed, for the same reason provenanceLookup does: an empty
-		// Database makes ProvenanceQuery match *any* database, and a file store
-		// deliberately holds state for several targets, so an unscoped answer
-		// could authorize dropping a production index using a staging record.
-		// This is the dispatch-time re-check that FR-AUTH-5 makes the last line
-		// of defence, so it must not be weaker than the plan-time check it
-		// backstops.
-		return executor.Provenance{}, false, nil
-	}
-	recs, err := b.store.FindProvenance(ctx, state.ProvenanceQuery{
-		Object:   object,
-		Database: b.database,
-	})
-	if err != nil {
-		return executor.Provenance{}, false, err
-	}
-	if len(recs) == 0 {
-		return executor.Provenance{}, false, nil
-	}
-	r := recs[0]
-	return executor.Provenance{
-		RunID:      executor.RunID(r.RunID),
-		NodeID:     r.NodeID,
-		Object:     r.Object,
-		ObjectKind: string(r.ObjectKind),
-		Relation:   r.Relation,
-		CreatedAt:  r.RecordedAt.Time,
-	}, true, nil
-}
-
-// HasReindexRun implements [executor.AuthorityReader], the second and
-// non-forgeable half of AuthLeftover (FR-AUTH-3, INV-7, AC-19).
+// ClaimsObject implements [executor.AuthorityReader] (FR-AUTH-2 as amended).
 //
-// The query names the relation and, when it is a partition, would also name its
-// parent; the executor's port carries only the relation, so the store is asked
-// about that one. A reindex run recorded against the partitioned parent is
-// found through the same query when the caller passes the parent, which is what
-// the reindex planner will do in M3.
-func (b *executorStore) HasReindexRun(ctx context.Context, relation protocol.ObjectName) (bool, error) {
-	_, found, err := state.ReindexRunFor(ctx, b.store, state.ReindexHistoryQuery{
-		Database:  b.database,
-		Relations: []protocol.ObjectName{relation},
-	})
-	return found, err
+// It is scoped to the target database. A [state.FileStore] deliberately holds
+// state for several targets, so an unscoped answer could adopt an index in one
+// database on the strength of a run against another. An unscoped store fails
+// closed, which is the direction that halts rather than drops.
+func (b *executorStore) ClaimsObject(ctx context.Context, object protocol.ObjectName) (executor.RunID, bool, error) {
+	if b.database == "" {
+		return "", false, nil
+	}
+	run, found, err := state.ClaimsObjectIn(ctx, b.store, b.database, object)
+	return executor.RunID(run), found, err
 }
 
 // NodeStates implements [executor.StateStore].
@@ -183,47 +130,8 @@ func (b *executorStore) CancelRequested(ctx context.Context, run executor.RunID)
 	return b.store.CancellationRequested(ctx, state.RunID(run))
 }
 
-// RecordProvenance implements [executor.StateStore] and INV-1.
-//
-// The guarded-action callback is nil because the executor's port records and
-// dispatches separately; see the type doc. A record that already exists is left
-// alone: it was committed before an earlier attempt's statement, which is the
-// same guarantee, and re-writing it would grow the trail without adding
-// information.
-func (b *executorStore) RecordProvenance(ctx context.Context, p executor.Provenance) error {
-	has, _, err := state.HasProvenance(ctx, b.store, state.ProvenanceQuery{
-		Object:   p.Object,
-		Database: b.database,
-	})
-	if err != nil {
-		return err
-	}
-	if has {
-		return nil
-	}
-	rec := state.Provenance{
-		RunID:      state.RunID(p.RunID),
-		NodeID:     p.NodeID,
-		Database:   b.database,
-		Object:     p.Object,
-		ObjectKind: state.ObjectKind(p.ObjectKind),
-		Relation:   p.Relation,
-	}
-	if rec.ObjectKind == "" {
-		rec.ObjectKind = state.ObjectIndex
-	}
-	if !p.CreatedAt.IsZero() {
-		rec.RecordedAt = protocol.NewTimestamp(p.CreatedAt)
-	}
-	_, err = b.store.WriteProvenance(ctx, rec, nil)
-	return err
-}
-
 // RecordAuthorization implements [executor.StateStore] and INV-2 (FR-AUTH-6,
 // AC-20).
-//
-// The typed evidence the state store demands is resolved here rather than taken
-// on trust from the decision's evidence map: see the type doc, point 2.
 func (b *executorStore) RecordAuthorization(ctx context.Context, a executor.AuthorizationRecord) error {
 	rec := state.AuthorizationRecord{
 		RunID:    state.RunID(a.RunID),
@@ -242,61 +150,12 @@ func (b *executorStore) RecordAuthorization(ctx context.Context, a executor.Auth
 		}
 	}
 
-	switch a.Mode {
-	case protocol.AuthProvenance:
-		id, err := b.provenanceID(ctx, a.Object)
-		if err != nil {
-			return err
-		}
-		rec.ProvenanceID = id
-	case protocol.AuthLeftover:
-		if rec.Relation == nil {
-			return protocol.ErrAuthorizationUnsatisfied.Detailf(
-				"leftover authorization for %s carries no relation, so reindex-run history cannot be cited "+
-					"(FR-AUTH-3, INV-7)", a.Object)
-		}
-		run, found, err := state.ReindexRunFor(ctx, b.store, state.ReindexHistoryQuery{
-			Database:  b.database,
-			Relations: []protocol.ObjectName{*rec.Relation},
-		})
-		if err != nil {
-			return err
-		}
-		if !found {
-			return protocol.ErrAuthorizationUnsatisfied.Detailf(
-				"no PartitionCTL reindex run is recorded for %s, so %s is not ours to drop "+
-					"(FR-AUTH-3, INV-7, AC-19)", rec.Relation, a.Object)
-		}
-		rec.ReindexRunID = run.RunID
-	case protocol.AuthExplicit:
+	if a.Mode == protocol.AuthExplicit {
 		rec.Confirmation = a.Evidence["confirmation"]
 	}
 
 	_, err := b.store.RecordAuthorization(ctx, rec, nil)
 	return err
-}
-
-// provenanceID reads back the id of the committed record that satisfies
-// AuthProvenance. Its absence here is a halt, not a warning: an authorization
-// that cites nothing is not an authorization (INV-2).
-func (b *executorStore) provenanceID(ctx context.Context, object protocol.ObjectName) (string, error) {
-	if b.database == "" {
-		return "", protocol.ErrAuthorizationUnsatisfied.Detailf(
-			"no target database is scoped for the provenance lookup on %s, so ownership cannot be "+
-				"proven for this database rather than some other one (FR-AUTH-2)", object)
-	}
-	has, id, err := state.HasProvenance(ctx, b.store, state.ProvenanceQuery{
-		Object:   object,
-		Database: b.database,
-	})
-	if err != nil {
-		return "", err
-	}
-	if !has {
-		return "", protocol.ErrAuthorizationUnsatisfied.Detailf(
-			"no committed provenance record proves PartitionCTL created %s (FR-AUTH-2, AC-6)", object)
-	}
-	return id, nil
 }
 
 // AppendAudit implements [executor.StateStore] (INV-3).
@@ -369,47 +228,36 @@ func fenceIfLost(err error) error {
 }
 
 // ---------------------------------------------------------------------------
-// Provenance, for the planner
+// Claims, for the planner
 // ---------------------------------------------------------------------------
 
-// provenanceLookup adapts the state store to the one-method view the planner
-// and the create-index operation depend on (FR-PLAN-6, FR-PLAN-7).
+// claimLookup adapts the state store to the one-method view the planner and the
+// create-index operation depend on (FR-PLAN-6, FR-PLAN-7).
 //
 // Both declare the same method under different interface names, so one type
 // satisfies both. That is the point of a one-method port: it needs a two-line
 // adapter, not a shared dependency.
-type provenanceLookup struct {
-	store    state.ProvenanceReader
+type claimLookup struct {
+	store    state.ClaimReader
 	database string
 }
 
-// HasProvenance reports whether a committed record proves PartitionCTL created
-// object (FR-AUTH-2).
+// ClaimsObject reports the run holding a live claim on object.
 //
-// Both ways of having no answer fail closed, because this is the decision that
-// authorizes a DROP (FR-PLAN-6, FR-PLAN-7, AC-5, AC-6, NFR-REL-3).
-func (p provenanceLookup) HasProvenance(ctx context.Context, object protocol.ObjectName) (bool, error) {
-	if p.store == nil {
-		// No provenance source is not "no provenance record is required": with
-		// nothing to prove ownership, the planner must halt on an INVALID index
-		// rather than plan its destruction (FR-PLAN-7, NFR-REL-3).
-		return false, nil
+// Both ways of having no answer report "no claim", which is the safe direction:
+// it leaves the ownership marker on the object as the only thing that can
+// authorize a drop (FR-PLAN-6, FR-PLAN-7, AC-5, AC-6, NFR-REL-3).
+//
+// An unscoped store is one of those ways. [state.ClaimsObjectIn] treats an empty
+// database as "match any", and a file state store deliberately holds state for
+// several targets, so an unscoped lookup could report a claim held by a run
+// against a *different* database.
+func (c claimLookup) ClaimsObject(ctx context.Context, object protocol.ObjectName) (string, bool, error) {
+	if c.store == nil || c.database == "" {
+		return "", false, nil
 	}
-	if p.database == "" {
-		// An unscoped query is not a broad question, it is the wrong one.
-		// [state.ProvenanceQuery] treats an empty Database as "match any", and a
-		// file state store deliberately holds state for several targets, so an
-		// unscoped lookup can return a record proving PartitionCTL built an index
-		// of this name in a *different* database. Answering "yes" from that
-		// record would authorize dropping an index in this one that this tool
-		// never created. Ownership that cannot be scoped has not been proven.
-		return false, nil
-	}
-	has, _, err := state.HasProvenance(ctx, p.store, state.ProvenanceQuery{
-		Object:   object,
-		Database: p.database,
-	})
-	return has, err
+	run, found, err := state.ClaimsObjectIn(ctx, c.store, c.database, object)
+	return string(run), found, err
 }
 
 // ---------------------------------------------------------------------------

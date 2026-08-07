@@ -83,47 +83,44 @@ func (a *App) cmdPlan(ctx context.Context, args []string) error {
 	}
 	defer func() { _ = release() }()
 
-	// Provenance is scoped by the database the *catalog* reports, never by the
-	// connection configuration.
+	// The claim lookup is scoped by the database the *catalog* reports, never by
+	// the connection configuration.
 	//
 	// Config.Dbname is a connection parameter: it is empty whenever the operator
 	// connects through PARTITIONCTL_DSN, and it can differ from the real name
-	// behind a pooler or an alias. The state store, meanwhile, stamps every
-	// provenance record with run.Target.Database, which the planner host takes
-	// from current_database(). Scoping the lookup by anything else makes `plan`
-	// ask a different question than `execute` and `resume` answer.
-	//
-	// Both directions of that mismatch are bugs, and one of them is dangerous.
-	// An empty scope matches a record from *any* database, because
-	// ProvenanceQuery treats an empty Database as "unfiltered", and a file state
-	// store deliberately holds state for more than one target. That is how a
-	// record proving PartitionCTL built an index in staging could authorize
-	// dropping a same-named index in production, which is precisely the
-	// destruction NFR-REL-3, FR-PLAN-7 and AC-6 exist to forbid.
+	// behind a pooler or an alias. The state store, meanwhile, stamps every run
+	// with run.Target.Database, which the planner host takes from
+	// current_database(). Scoping by anything else makes `plan` ask a different
+	// question than `execute` and `resume` answer, and an empty scope matches a
+	// run against *any* database, because a file state store deliberately holds
+	// state for more than one target.
 	database, err := read.CurrentDatabase(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Provenance is optional at plan time and its absence is not neutral: with
-	// no record to prove ownership the planner halts on an INVALID index rather
-	// than planning its destruction (FR-PLAN-7, NFR-REL-3). Opening the state
-	// store therefore makes `plan` *less* restrictive, never more, which is why
-	// a store that cannot be opened is a warning rather than a failure.
-	var prov planner.ProvenanceLookup
+	// The claim source is optional at plan time and its absence is not neutral:
+	// with no claim, the only thing that can authorize dropping an INVALID index
+	// is the PartitionCTL ownership marker on the object itself, which is read
+	// from the catalog and needs no state store at all (FR-PLAN-7, NFR-REL-3).
+	// Opening the store therefore makes `plan` *less* restrictive, never more,
+	// which is why a store that cannot be opened is a warning rather than a
+	// failure.
+	var claims planner.ClaimLookup
 	if store, serr := a.openReadOnlyStore(ctx, cfg, db); serr == nil {
 		defer func() { _ = store.Close() }()
-		prov = provenanceLookup{store: store, database: database}
+		claims = claimLookup{store: store, database: database}
 	} else {
 		fmt.Fprintf(a.Stderr,
-			"warning: no state store (%v); planning without provenance, so any INVALID index halts the plan (FR-PLAN-7)\n",
+			"warning: no state store (%v); planning without claims, so an INVALID index is adoptable only "+
+				"if it carries a PartitionCTL ownership marker (FR-PLAN-7)\n",
 			serr)
 	}
 
 	host := &planner.Host{
-		Catalog:    read,
-		Provenance: prov,
-		Now:        a.Now,
+		Catalog: read,
+		Claims:  claims,
+		Now:     a.Now,
 	}
 	outcome, err := host.Run(ctx, &createIndexOperation{}, spec)
 	if err != nil {

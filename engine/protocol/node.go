@@ -137,6 +137,32 @@ func (n *Node) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Object reports the catalog object this node acts on, if it acts on one. Like
+// dispatch, it switches on kind alone.
+//
+// It is what the state store records per node (FR-STATE-6 as amended), which is
+// what makes a node checkpoint a *claim* on an object: the durable record that
+// exists before the DDL runs, and that expires when the node reaches a complete
+// state rather than after some interval. See [DecideProvenanceDrop] for what
+// the claim authorizes and what it deliberately does not.
+func (n *Node) Object() (ObjectName, bool) {
+	switch p := n.Params.(type) {
+	case *CreateParentInvalidParams:
+		return p.Index, true
+	case *CreateConcurrentlyParams:
+		return p.Index, true
+	case *AttachParams:
+		return p.ChildIndex, true
+	case *DropConcurrentlyParams:
+		return p.Index, true
+	case *ReindexConcurrentlyParams:
+		return p.Index, true
+	case *DropPartitionedParams:
+		return p.Index, true
+	}
+	return ObjectName{}, false
+}
+
 // Validate checks the node in isolation: kind, params, and the
 // destructive-kind/authorization correspondence. Cross-node checks such as
 // dependency resolution and acyclicity live in [Plan.Validate].

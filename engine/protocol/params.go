@@ -625,9 +625,18 @@ func (p *DropConcurrentlyParams) Validate() error {
 // ReindexConcurrentlyParams renders REINDEX INDEX CONCURRENTLY <index> against
 // one leaf partition's index. It runs outside any transaction block.
 //
-// The planner never emits a reindex of the partitioned parent: PostgreSQL
-// rejects REINDEX CONCURRENTLY on partitioned relations, and the non-concurrent
-// form takes AccessExclusiveLock per partition (FR-REIDX-2).
+// # Why per leaf, when the parent form works
+//
+// FR-REIDX-2 said PostgreSQL rejects REINDEX CONCURRENTLY on a partitioned
+// relation. That is wrong, and the v0.0 spike measured it wrong on both 14.23
+// and 17.10: the parent form succeeds and PostgreSQL loops the partitions
+// itself, one per transaction, at ShareUpdateExclusiveLock.
+//
+// The planner declines to use it anyway, for one reason worth stating plainly:
+// the parent form has no "already fresh" concept, so a re-run after an
+// interruption rebuilds all 400 partitions again. That destroys resume, the
+// ETA, pacing, and FR-PLAN-5. Per-leaf buys exactly those four things, and the
+// tool's whole value for reindex is those four things.
 type ReindexConcurrentlyParams struct {
 	// Index is the leaf index to rebuild.
 	Index ObjectName `json:"index"`

@@ -392,6 +392,36 @@ func (c *SQLCatalog) LookupIndex(ctx context.Context, name protocol.ObjectName) 
 	}
 }
 
+// qIndexComment reads the ownership marker PartitionCTL writes onto an object
+// it created. obj_description is the supported reader for pg_description on a
+// pg_class entry; it returns NULL for an index with no comment, which the
+// caller treats exactly as it treats an index that does not exist.
+const qIndexComment = `
+SELECT pg_catalog.obj_description(ic.oid, 'pg_class')
+FROM pg_catalog.pg_class ic
+JOIN pg_catalog.pg_namespace n ON n.oid = ic.relnamespace
+WHERE ic.relname = $1
+  AND (($2 = '' AND pg_catalog.pg_table_is_visible(ic.oid)) OR n.nspname = $2)
+  AND ic.relkind IN ('i', 'I')
+ORDER BY n.nspname, ic.oid
+LIMIT 1`
+
+// IndexComment implements [CatalogReader].
+func (c *SQLCatalog) IndexComment(ctx context.Context, index protocol.ObjectName) (string, bool, error) {
+	var comment sql.NullString
+	err := c.q.QueryRowContext(ctx, qIndexComment, index.Name, index.Schema).Scan(&comment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, ErrCatalogUnavailable.Wrap(err)
+	}
+	if !comment.Valid || comment.String == "" {
+		return "", false, nil
+	}
+	return comment.String, true, nil
+}
+
 func scanIndex(s scanner) (Index, error) {
 	var (
 		oid, ownerOID, relPages, tableOID, parentIndexOID int64

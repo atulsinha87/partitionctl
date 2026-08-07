@@ -403,7 +403,7 @@ func TestHostRunRejectsAnInvalidGraph(t *testing.T) {
 func TestHostRunPassesAPreparedRequest(t *testing.T) {
 	f := standardTree()
 	h := testHost(f)
-	h.Provenance = NewFakeProvenance()
+	h.Claims = NewFakeClaims()
 	op := &stubPlanner{op: protocol.OpCreateIndex}
 
 	out, err := h.Run(ctx(), op, createSpec())
@@ -432,8 +432,8 @@ func TestHostRunPassesAPreparedRequest(t *testing.T) {
 	if !req.Now.Time.Equal(out.Plan.CreatedAt.Time) {
 		t.Errorf("Request.Now = %v, plan CreatedAt = %v", req.Now, out.Plan.CreatedAt)
 	}
-	if req.Provenance == nil {
-		t.Error("Request.Provenance was not passed through")
+	if req.Claims == nil {
+		t.Error("Request.Claims was not passed through")
 	}
 	// A zero Estimator would silently make every estimate 0.
 	if req.Estimator.BuildBytesPerSecond != DefaultBuildBytesPerSecond {

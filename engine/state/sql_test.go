@@ -74,12 +74,11 @@ func TestSQLStatementsAreWellFormed(t *testing.T) {
 		{name: "update_run_status", args: 7},
 		{name: "update_run_cancel", args: 4},
 		{name: "select_running_for", args: 3},
-		{name: "insert_node", args: 9},
+		{name: "insert_node", args: 11},
 		{name: "select_node", args: 2},
 		{name: "select_nodes", args: 1},
 		{name: "transition_node", args: 9},
-		{name: "insert_provenance", args: 13},
-		{name: "insert_authorization", args: 15},
+		{name: "insert_authorization", args: 13},
 		{name: "select_authorizations", args: 1},
 		{name: "upsert_lease", args: 4},
 		{name: "heartbeat", args: 3},
@@ -205,51 +204,6 @@ func TestSQLRunQueryBuilder(t *testing.T) {
 				if args[i] != tc.wantArgs[i] {
 					t.Errorf("arg %d = %v, want %v", i, args[i], tc.wantArgs[i])
 				}
-			}
-			assertPlaceholdersDense(t, tc.name, stmt, len(args))
-		})
-	}
-}
-
-func TestSQLProvenanceQueryBuilder(t *testing.T) {
-	text, err := newSQLText("pctl")
-	if err != nil {
-		t.Fatalf("newSQLText: %v", err)
-	}
-	rel := protocol.NewObjectName("public", "orders_2026_03")
-
-	tests := []struct {
-		name     string
-		q        ProvenanceQuery
-		wantSQL  []string
-		wantArgs []any
-	}{
-		{
-			name:     "object only",
-			q:        ProvenanceQuery{Object: protocol.NewObjectName("public", "idx")},
-			wantSQL:  []string{"object_schema = $1", "object_name = $2"},
-			wantArgs: []any{"public", "idx"},
-		},
-		{
-			name: "narrowed by relation",
-			q: ProvenanceQuery{
-				Object: protocol.NewObjectName("public", "idx"), Database: "appdb", Relation: &rel,
-			},
-			wantSQL:  []string{"has_relation", "relation_schema = $4", "relation_name = $5"},
-			wantArgs: []any{"public", "idx", "appdb", "public", "orders_2026_03"},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, args := text.provenanceQuery(tc.q)
-			for _, want := range tc.wantSQL {
-				if !strings.Contains(stmt, want) {
-					t.Errorf("statement does not contain %q:\n%s", want, stmt)
-				}
-			}
-			if len(args) != len(tc.wantArgs) {
-				t.Fatalf("got %d args %v, want %d", len(args), args, len(tc.wantArgs))
 			}
 			assertPlaceholdersDense(t, tc.name, stmt, len(args))
 		})
@@ -401,7 +355,7 @@ func TestSQLTransitionNodeArguments(t *testing.T) {
 	s, fake := newSQLStoreForTest(t, SQLOptions{Clock: clock.Clock()})
 
 	fake.Reply("node_state SET", strings.Split(nodeColumns, ", "),
-		[]driver.Value{"run-1", "n1", "wait", "RUNNING", int64(1), "", "", baseTime, baseTime})
+		[]driver.Value{"run-1", "n1", "wait", "RUNNING", "", "", int64(1), "", "", baseTime, baseTime})
 	fake.Reply("audit_event", strings.Split(auditColumns, ", "),
 		[]driver.Value{"evt-1", "run-1", int64(1), "n1", "node.transition", []byte(`{}`), baseTime})
 
@@ -454,29 +408,30 @@ func TestSQLSetRunStatusRejectsInvalidEdgesBeforeSQL(t *testing.T) {
 	}
 }
 
-// INV-1 from the SQL side: the record's transaction commits before the guarded
-// DDL is invoked.
-func TestSQLWriteProvenanceCommitsBeforeTheDDL(t *testing.T) {
+// INV-2 from the SQL side: the record's transaction commits before the guarded
+// destructive statement is invoked.
+func TestSQLRecordAuthorizationCommitsBeforeTheStatement(t *testing.T) {
 	ctx := context.Background()
 	s, fake := newSQLStoreForTest(t, SQLOptions{})
 	fake.Reply("run WHERE run_id", strings.Split(runColumns, ", "), runRow("run-1"))
 	fake.Reply("audit_event", strings.Split(auditColumns, ", "),
-		[]driver.Value{"evt-1", "run-1", int64(1), "", "provenance.recorded", []byte(`{}`), baseTime})
+		[]driver.Value{"evt-1", "run-1", int64(1), "", "authorization.recorded", []byte(`{}`), baseTime})
 
+	object := protocol.NewObjectName("public", "idx")
 	var callsAtDDL []call
-	if _, err := s.WriteProvenance(ctx, Provenance{
-		RunID: "run-1", NodeID: "cic",
-		Object: protocol.NewObjectName("public", "idx"), ObjectKind: ObjectIndex,
+	if _, err := s.RecordAuthorization(ctx, AuthorizationRecord{
+		RunID: "run-1", NodeID: "drop", Mode: protocol.AuthProvenance,
+		Object: object, Evidence: markerEvidence(object),
 	}, func(ctx context.Context) error {
 		callsAtDDL = fake.Calls()
 		return nil
 	}); err != nil {
-		t.Fatalf("WriteProvenance: %v", err)
+		t.Fatalf("RecordAuthorization: %v", err)
 	}
 
 	sawInsert, sawCommit := false, false
 	for _, c := range callsAtDDL {
-		if strings.Contains(c.Query, "provenance") && c.Kind == "exec" {
+		if strings.Contains(c.Query, "authorization") && c.Kind == "exec" {
 			sawInsert = true
 		}
 		if c.Kind == "commit" {
@@ -484,30 +439,32 @@ func TestSQLWriteProvenanceCommitsBeforeTheDDL(t *testing.T) {
 		}
 	}
 	if !sawInsert {
-		t.Error("the DDL ran before the provenance insert (INV-1)")
+		t.Error("the destructive statement ran before the authorization insert (INV-2)")
 	}
 	if !sawCommit {
-		t.Error("the DDL ran before the provenance transaction committed (INV-1)")
+		t.Error("the destructive statement ran before the authorization committed (INV-2)")
 	}
 }
 
-// If the insert fails, the transaction rolls back and the DDL never runs.
-func TestSQLWriteProvenanceRollsBackAndSkipsTheDDL(t *testing.T) {
+// If the insert fails, the transaction rolls back and the statement never runs.
+func TestSQLRecordAuthorizationRollsBackAndSkipsTheStatement(t *testing.T) {
 	ctx := context.Background()
 	s, fake := newSQLStoreForTest(t, SQLOptions{})
 	fake.Reply("run WHERE run_id", strings.Split(runColumns, ", "), runRow("run-1"))
-	fake.Fail("INTO \"partitionctl\".provenance", errors.New("disk full"))
+	fake.Fail("INTO \"partitionctl\".authorization", errors.New("disk full"))
 
+	object := protocol.NewObjectName("public", "idx")
 	called := false
-	_, err := s.WriteProvenance(ctx, Provenance{
-		RunID: "run-1", Object: protocol.NewObjectName("public", "idx"), ObjectKind: ObjectIndex,
+	_, err := s.RecordAuthorization(ctx, AuthorizationRecord{
+		RunID: "run-1", NodeID: "drop", Mode: protocol.AuthProvenance,
+		Object: object, Evidence: markerEvidence(object),
 	}, func(ctx context.Context) error { called = true; return nil })
 
-	if !errors.Is(err, ErrProvenanceNotRecorded) {
-		t.Fatalf("err = %v, want ErrProvenanceNotRecorded", err)
+	if !errors.Is(err, ErrAuthorizationNotRecorded) {
+		t.Fatalf("err = %v, want ErrAuthorizationNotRecorded", err)
 	}
 	if called {
-		t.Fatal("the guarded DDL ran after the insert failed (INV-1)")
+		t.Fatal("the guarded destructive statement ran after the insert failed (INV-2)")
 	}
 	if _, ok := fake.Find("ROLLBACK"); !ok {
 		t.Error("the transaction was not rolled back")

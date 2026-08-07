@@ -20,10 +20,10 @@ import (
 // where Liquibase keeps DATABASECHANGELOG and needs no second connection. The
 // hazard is documented rather than hidden: a PITR restore or a failover rewinds
 // execution state alongside the data (TRD §7.2.5). Because the planner
-// reconstructs remaining work from the live catalog, a rewind degrades to loss
-// of provenance and audit history, not to incorrect execution, and losing
-// provenance makes FR-PLAN-7 halt on a pre-existing INVALID index, which is the
-// safe direction.
+// reconstructs remaining work from the live catalog and ownership is read off
+// the objects themselves ([protocol.Marker]), a rewind degrades to loss of run
+// and audit history, not to incorrect execution: the markers restore with the
+// catalog they are written on.
 //
 // # No driver
 //
@@ -117,7 +117,6 @@ func (s *SQLStore) Statements() map[string]string {
 		"select_node":           s.text.selectNode,
 		"select_nodes":          s.text.selectNodes,
 		"transition_node":       s.text.transitionNode,
-		"insert_provenance":     s.text.insertProvenance,
 		"insert_authorization":  s.text.insertAuthorization,
 		"select_authorizations": s.text.selectAuthorizations,
 		"upsert_lease":          s.text.upsertLease,
@@ -213,8 +212,12 @@ func (s *SQLStore) CreateRun(ctx context.Context, req NewRun) (Run, error) {
 
 	for i := range req.Plan.Nodes {
 		n := &req.Plan.Nodes[i]
+		// INV-1 as amended: the durable record naming the object and the run is
+		// committed before the DDL that creates it, and this is that record.
+		obj, _ := n.Object()
 		if _, err := tx.ExecContext(ctx, s.text.insertNode,
 			string(run.RunID), string(n.ID), string(n.Kind), string(protocol.InitialNodeState()),
+			obj.Schema, obj.Name,
 			0, "", "", nil, now,
 		); err != nil {
 			return Run{}, ioErr("insert node state", err)
@@ -466,84 +469,6 @@ func (s *SQLStore) TransitionNode(ctx context.Context, t NodeTransition) (NodeRe
 	return rec, nil
 }
 
-// ---------------------------------------------------------------- provenance
-
-// WriteProvenance implements [ProvenanceStore] and enforces INV-1.
-func (s *SQLStore) WriteProvenance(ctx context.Context, rec Provenance, create GuardedAction) (Provenance, error) {
-	if err := rec.Validate(); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	if err := s.ready(ctx); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	run, err := s.GetRun(ctx, rec.RunID)
-	if err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	now := s.now(time.Time{})
-	if rec.RecordedAt.Time.IsZero() {
-		rec.RecordedAt = protocol.NewTimestamp(now)
-	}
-	if rec.PlanDigest == "" {
-		rec.PlanDigest = run.PlanDigest
-	}
-	if rec.Database == "" {
-		rec.Database = run.Target.Database
-	}
-	if rec.Actor == "" {
-		rec.Actor = run.Actor
-	}
-	if rec.ProvenanceID == "" {
-		rec.ProvenanceID = newRecordID(rec.RunID, "prov", now)
-	}
-
-	relSchema, relName, hasRel := "", "", false
-	if rec.Relation != nil {
-		relSchema, relName, hasRel = rec.Relation.Schema, rec.Relation.Name, true
-	}
-
-	// The commit. create is an argument, so it cannot have run yet (INV-1).
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(ioErr("begin transaction", err))
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback()
-		}
-	}()
-
-	if _, err := tx.ExecContext(ctx, s.text.insertProvenance,
-		rec.ProvenanceID, string(rec.RunID), string(rec.NodeID), rec.PlanDigest, rec.Database,
-		rec.Object.Schema, rec.Object.Name, string(rec.ObjectKind),
-		relSchema, relName, hasRel, rec.Actor, rec.RecordedAt.Time.UTC(),
-	); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(ioErr("insert provenance", err))
-	}
-	if _, err := s.appendAuditTx(ctx, tx, AuditEvent{
-		RunID:  rec.RunID,
-		NodeID: rec.NodeID,
-		Type:   EventProvenanceRecorded,
-		At:     now,
-		Detail: auditDetail(
-			"provenance_id", rec.ProvenanceID,
-			"object", rec.Object.String(),
-			"object_kind", string(rec.ObjectKind),
-			"database", rec.Database,
-		),
-	}); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(ioErr("commit provenance", err))
-	}
-	rollback = false
-
-	return rec, s.runGuarded(ctx, rec.RunID, rec.NodeID, rec.Object, create,
-		EventObjectCreated, EventObjectCreateFailed)
-}
-
 func (s *SQLStore) runGuarded(ctx context.Context, runID RunID, nodeID protocol.NodeID,
 	object protocol.ObjectName, action GuardedAction, okEvent, failEvent AuditEventType) error {
 	if action == nil {
@@ -570,34 +495,6 @@ func (s *SQLStore) runGuarded(ctx context.Context, runID RunID, nodeID protocol.
 		return err
 	}
 	return actionErr
-}
-
-// FindProvenance implements [ProvenanceReader].
-func (s *SQLStore) FindProvenance(ctx context.Context, q ProvenanceQuery) ([]Provenance, error) {
-	if err := q.validate(); err != nil {
-		return nil, err
-	}
-	if err := s.ready(ctx); err != nil {
-		return nil, err
-	}
-	stmt, args := s.text.provenanceQuery(q)
-	rows, err := s.db.QueryContext(ctx, stmt, args...)
-	if err != nil {
-		return nil, ioErr("select provenance", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Provenance
-	for rows.Next() {
-		p, err := scanProvenance(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, ioErr("scan provenance", err)
-	}
-	return out, nil
 }
 
 // ---------------------------------------------------------------- authorization
@@ -647,8 +544,7 @@ func (s *SQLStore) RecordAuthorization(ctx context.Context, rec AuthorizationRec
 	if _, err := tx.ExecContext(ctx, s.text.insertAuthorization,
 		rec.AuthorizationID, string(rec.RunID), string(rec.NodeID), string(rec.Mode), rec.Database,
 		rec.Object.Schema, rec.Object.Name, relSchema, relName, hasRel,
-		rec.ProvenanceID, string(rec.ReindexRunID), rec.Confirmation,
-		string(evidence), rec.GrantedAt.Time.UTC(),
+		rec.Confirmation, string(evidence), rec.GrantedAt.Time.UTC(),
 	); err != nil {
 		return AuthorizationRecord{}, ErrAuthorizationNotRecorded.Wrap(ioErr("insert authorization", err))
 	}
@@ -1159,7 +1055,8 @@ func scanNode(rows *sql.Rows) (NodeRecord, error) {
 		startedAt sql.NullTime
 		updatedAt time.Time
 	)
-	if err := rows.Scan(&runID, &nodeID, &kind, &state, &rec.Attempts,
+	if err := rows.Scan(&runID, &nodeID, &kind, &state,
+		&rec.Object.Schema, &rec.Object.Name, &rec.Attempts,
 		&rec.LastError, &errorKind, &startedAt, &updatedAt); err != nil {
 		return NodeRecord{}, ioErr("scan node state", err)
 	}
@@ -1176,33 +1073,6 @@ func scanNode(rows *sql.Rows) (NodeRecord, error) {
 	return rec, nil
 }
 
-func scanProvenance(rows *sql.Rows) (Provenance, error) {
-	var (
-		p          Provenance
-		runID      string
-		nodeID     string
-		objectKind string
-		relSchema  string
-		relName    string
-		hasRel     bool
-		recordedAt time.Time
-	)
-	if err := rows.Scan(&p.ProvenanceID, &runID, &nodeID, &p.PlanDigest, &p.Database,
-		&p.Object.Schema, &p.Object.Name, &objectKind,
-		&relSchema, &relName, &hasRel, &p.Actor, &recordedAt); err != nil {
-		return Provenance{}, ioErr("scan provenance", err)
-	}
-	p.RunID = RunID(runID)
-	p.NodeID = protocol.NodeID(nodeID)
-	p.ObjectKind = ObjectKind(objectKind)
-	if hasRel {
-		rel := protocol.NewObjectName(relSchema, relName)
-		p.Relation = &rel
-	}
-	p.RecordedAt = protocol.NewTimestamp(recordedAt)
-	return p, nil
-}
-
 func scanAuthorization(rows *sql.Rows) (AuthorizationRecord, error) {
 	var (
 		rec       AuthorizationRecord
@@ -1212,19 +1082,17 @@ func scanAuthorization(rows *sql.Rows) (AuthorizationRecord, error) {
 		relSchema string
 		relName   string
 		hasRel    bool
-		reindexID string
 		evidence  []byte
 		grantedAt time.Time
 	)
 	if err := rows.Scan(&rec.AuthorizationID, &runID, &nodeID, &mode, &rec.Database,
 		&rec.Object.Schema, &rec.Object.Name, &relSchema, &relName, &hasRel,
-		&rec.ProvenanceID, &reindexID, &rec.Confirmation, &evidence, &grantedAt); err != nil {
+		&rec.Confirmation, &evidence, &grantedAt); err != nil {
 		return AuthorizationRecord{}, ioErr("scan authorization", err)
 	}
 	rec.RunID = RunID(runID)
 	rec.NodeID = protocol.NodeID(nodeID)
 	rec.Mode = protocol.AuthorizationMode(mode)
-	rec.ReindexRunID = RunID(reindexID)
 	if hasRel {
 		rel := protocol.NewObjectName(relSchema, relName)
 		rec.Relation = &rel

@@ -28,21 +28,21 @@ func nodeID(step string, leaf protocol.ObjectName) protocol.NodeID {
 // Planner compiles a [Specification] into a [protocol.Plan].
 //
 // The zero value is usable and is deliberately the strictest configuration: it
-// has no provenance source, so it halts on any INVALID index rather than
-// planning a drop it cannot justify (FR-PLAN-7).
+// has no claim source, so the only thing that can authorize a drop is the
+// ownership marker on the object itself (FR-PLAN-7).
 type Planner struct {
 	// Now supplies the plan's CreatedAt. Nil means [time.Now]. Injecting it is
 	// what lets a test assert a byte-exact plan digest.
 	Now func() time.Time
 
-	// Provenance answers whether PartitionCTL created a given index
-	// (FR-PLAN-6, FR-PLAN-7). Nil means [NoProvenance].
-	Provenance ProvenanceReader
+	// Claims reports whether a run still holds a live claim on an object
+	// (FR-PLAN-6, FR-PLAN-7). Nil means [NoClaims].
+	Claims ClaimReader
 }
 
 // Plan is the package-level convenience form of [Planner.Plan], using the
-// default planner. Because the default has no provenance source, it halts on
-// any INVALID index; a caller that can resume must supply one.
+// default planner. Because the default has no claim source, it halts on an
+// unmarked INVALID index; a caller that can resume must supply one.
 func Plan(ctx context.Context, spec Specification, cat CatalogReader) (*protocol.Plan, error) {
 	return Planner{}.Plan(ctx, spec, cat)
 }
@@ -126,9 +126,9 @@ func (pl Planner) Plan(ctx context.Context, spec Specification, cat CatalogReade
 		return nil, fmt.Errorf("create-index: read relation sizes: %w", err)
 	}
 
-	prov := pl.provenance()
+	claims := pl.claims()
 
-	needParent, err := classifyParentIndex(ctx, prov, states, parent, parentIndex)
+	needParent, err := classifyParentIndex(ctx, claims, states, parent, parentIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func (pl Planner) Plan(ctx context.Context, spec Specification, cat CatalogReade
 
 	var tails []protocol.NodeID
 	for i, leaf := range leaves {
-		chain, err := pl.leafChain(ctx, prov, spec, leaf, children[i], parentIndex, states, pages[leaf], chainRoot)
+		chain, err := pl.leafChain(ctx, claims, spec, leaf, children[i], parentIndex, states, pages[leaf], chainRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -200,11 +200,29 @@ func (pl Planner) now() time.Time {
 	return time.Now()
 }
 
-func (pl Planner) provenance() ProvenanceReader {
-	if pl.Provenance != nil {
-		return pl.Provenance
+func (pl Planner) claims() ClaimReader {
+	if pl.Claims != nil {
+		return pl.Claims
 	}
-	return NoProvenance()
+	return NoClaims()
+}
+
+// ownership evaluates the shared destructive-action decision table for one
+// object: the marker on it, and the live claim consulted only where the marker
+// is missing ([protocol.DecideProvenanceDrop]).
+func ownership(ctx context.Context, claims ClaimReader, object protocol.ObjectName, st IndexState) (protocol.DropVerdict, error) {
+	marker, status := st.Marker()
+	in := protocol.ProvenanceDropInput{Object: object, Status: status, Marker: marker}
+	if status == protocol.MarkerAbsent {
+		run, found, err := claims.ClaimsObject(ctx, object)
+		if err != nil {
+			return protocol.DropVerdict{}, fmt.Errorf("create-index: read the claim on %s: %w", object, err)
+		}
+		if found {
+			in.ClaimRun = run
+		}
+	}
+	return protocol.DecideProvenanceDrop(in), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +369,7 @@ func checkRoleMembership(ctx context.Context, cat CatalogReader, role string, re
 // index name is free *or* matches an in-progress build with provenance.
 func classifyParentIndex(
 	ctx context.Context,
-	prov ProvenanceReader,
+	claims ClaimReader,
 	states map[protocol.ObjectName]IndexState,
 	parent, parentIndex protocol.ObjectName,
 ) (needCreate bool, err error) {
@@ -371,15 +389,15 @@ func classifyParentIndex(
 	if st.Healthy() {
 		return false, nil
 	}
-	ok, err := prov.HasProvenance(ctx, parentIndex)
+	v, err := ownership(ctx, claims, parentIndex, st)
 	if err != nil {
-		return false, fmt.Errorf("create-index: read provenance for %s: %w", parentIndex, err)
+		return false, err
 	}
-	if !ok {
+	if !v.Satisfied() {
 		return false, protocol.ErrAuthorizationUnsatisfied.Detailf(
-			"%s already exists and is INVALID, and PartitionCTL has no provenance record proving it "+
-				"created it. This is an in-progress build belonging to something else. Halting with no plan: "+
-				"resolve it by hand, then re-plan (FR-PLAN-7, AC-6)", parentIndex)
+			"%s already exists and is INVALID: %s. This is an in-progress build belonging to something "+
+				"else. Halting with no plan: resolve it by hand, then re-plan (FR-PLAN-7, AC-6)",
+			parentIndex, v.Reason)
 	}
 	return false, nil
 }
@@ -392,12 +410,12 @@ func classifyParentIndex(
 //   - already built, valid and attached: no nodes at all;
 //   - built and valid but unattached: verify → attach → wait;
 //   - absent: create → verify → attach → wait;
-//   - INVALID with provenance: drop → create → verify → attach → wait
+//   - INVALID and ours: drop → create → verify → attach → wait
 //     (FR-PLAN-6, AC-5);
-//   - INVALID without provenance: no plan at all (FR-PLAN-7, AC-6).
+//   - INVALID and not provably ours: no plan at all (FR-PLAN-7, AC-6).
 func (pl Planner) leafChain(
 	ctx context.Context,
-	prov ProvenanceReader,
+	claims ClaimReader,
 	spec Specification,
 	leaf, child, parentIndex protocol.ObjectName,
 	states map[protocol.ObjectName]IndexState,
@@ -450,15 +468,14 @@ func (pl Planner) leafChain(
 			// INVALID and unattached: the wreckage of an interrupted CREATE
 			// INDEX CONCURRENTLY. Droppable online, but only with proof we
 			// created it.
-			ok, err := prov.HasProvenance(ctx, child)
+			v, err := ownership(ctx, claims, child, st)
 			if err != nil {
-				return nil, fmt.Errorf("create-index: read provenance for %s: %w", child, err)
+				return nil, err
 			}
-			if !ok {
+			if !v.Satisfied() {
 				return nil, protocol.ErrAuthorizationUnsatisfied.Detailf(
-					"%s on %s is INVALID and PartitionCTL has no provenance record proving it created it. "+
-						"Halting with no plan: an INVALID index this tool did not create is never dropped "+
-						"(FR-PLAN-7, AC-6, NFR-REL-3)", child, leaf)
+					"%s on %s is INVALID: %s. Halting with no plan: an INVALID index this tool cannot "+
+						"prove it created is never dropped (FR-PLAN-7, AC-6, NFR-REL-3)", child, leaf, v.Reason)
 			}
 			needDrop = true
 		}

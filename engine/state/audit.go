@@ -26,7 +26,6 @@ const (
 
 	EventNodeTransition AuditEventType = "node.transition"
 
-	EventProvenanceRecorded AuditEventType = "provenance.recorded"
 	EventObjectCreated      AuditEventType = "object.created"
 	EventObjectCreateFailed AuditEventType = "object.create_failed"
 
@@ -40,8 +39,7 @@ const (
 // There is no update and no delete path for an audit event anywhere in this
 // package. That is the enforcement: not a convention the callers follow, but an
 // API that has no such method to call. The file implementation opens the trail
-// O_APPEND and never rewrites it; the SQL schema installs a BEFORE UPDATE OR
-// DELETE trigger that raises.
+// O_APPEND and never rewrites it; the SQL implementation only ever INSERTs.
 type AuditEvent struct {
 	// EventID is assigned by the store and is stable and unique.
 	EventID string `json:"event_id"`

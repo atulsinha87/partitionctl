@@ -78,6 +78,28 @@ type Catalog interface {
 	// which must look at the whole tree because a failed REINDEX CONCURRENTLY
 	// leaves its transient index on the leaf, not on the parent.
 	TreeIndexes(ctx context.Context, table protocol.ObjectName) ([]IndexState, error)
+
+	// IndexComment returns obj_description(index, 'pg_class'), which is where
+	// PartitionCTL records ownership of an object it created
+	// ([protocol.Marker]). found is false when the index does not exist or
+	// carries no comment; the two are deliberately not distinguished, because
+	// every destructive decision treats them identically.
+	IndexComment(ctx context.Context, index protocol.ObjectName) (comment string, found bool, err error)
+}
+
+// IndexMarker reads the ownership marker on an index and classifies it. It is
+// the one place the comment is turned into a [protocol.MarkerStatus], so no
+// consumer can invent its own idea of what counts as ours.
+func IndexMarker(ctx context.Context, c Catalog, index protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error) {
+	comment, found, err := c.IndexComment(ctx, index)
+	if err != nil {
+		return protocol.Marker{}, protocol.MarkerAbsent, err
+	}
+	if !found {
+		return protocol.Marker{}, protocol.MarkerAbsent, nil
+	}
+	m, status := protocol.ParseMarker(comment)
+	return m, status, nil
 }
 
 // sameObject compares an expected name against one the catalog returned.

@@ -80,8 +80,7 @@ type fakeStore struct {
 	mu          sync.Mutex
 	states      map[protocol.NodeID]NodeRecord
 	transitions []Transition
-	provenance  map[string]Provenance
-	reindexRuns map[string]bool
+	claims      map[string]RunID
 	authz       []AuthorizationRecord
 	audits      []AuditEvent
 
@@ -91,11 +90,11 @@ type fakeStore struct {
 	cancelCalls int
 
 	// Failure injection.
-	failStates     error
-	failCancel     error
-	failProvenance error
-	failAuthz      error
-	failAudit      error
+	failStates error
+	failCancel error
+	failClaims error
+	failAuthz  error
+	failAudit  error
 	// failTransition returns an error for a specific edge, so a test can prove
 	// the executor stops rather than proceeding on an unrecorded checkpoint.
 	failTransition func(Transition) error
@@ -103,10 +102,9 @@ type fakeStore struct {
 
 func newFakeStore(rec *recorder) *fakeStore {
 	return &fakeStore{
-		rec:         rec,
-		states:      map[protocol.NodeID]NodeRecord{},
-		provenance:  map[string]Provenance{},
-		reindexRuns: map[string]bool{},
+		rec:    rec,
+		states: map[protocol.NodeID]NodeRecord{},
+		claims: map[string]RunID{},
 	}
 }
 
@@ -155,28 +153,23 @@ func (s *fakeStore) CancelRequested(_ context.Context, run RunID) (bool, error) 
 	return s.cancelAfter > 0 && s.cancelCalls >= s.cancelAfter, nil
 }
 
-func (s *fakeStore) RecordProvenance(_ context.Context, p Provenance) error {
-	if s.failProvenance != nil {
-		return s.failProvenance
+func (s *fakeStore) ClaimsObject(_ context.Context, object protocol.ObjectName) (RunID, bool, error) {
+	if s.failClaims != nil {
+		return "", false, s.failClaims
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.provenance[p.Object.String()] = p
-	s.rec.add("provenance:%s", p.Object)
-	return nil
+	s.rec.add("claim_check:%s", object)
+	run, ok := s.claims[object.String()]
+	return run, ok, nil
 }
 
-func (s *fakeStore) LookupProvenance(_ context.Context, object protocol.ObjectName) (Provenance, bool, error) {
+// claim records that some run holds a live claim on object, standing in for a
+// node checkpoint left behind by a process that died mid-statement.
+func (s *fakeStore) claim(object protocol.ObjectName, run RunID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.provenance[object.String()]
-	return p, ok, nil
-}
-
-func (s *fakeStore) HasReindexRun(_ context.Context, relation protocol.ObjectName) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.reindexRuns[relation.String()], nil
+	s.claims[object.String()] = run
 }
 
 func (s *fakeStore) RecordAuthorization(_ context.Context, a AuthorizationRecord) error {
@@ -255,7 +248,15 @@ func (x *fakeSQL) Exec(ctx context.Context, stmt Statement) error {
 	x.mu.Lock()
 	x.stmts = append(x.stmts, stmt)
 	x.mu.Unlock()
-	x.rec.add("exec:%s", stmt.NodeID)
+	// The ownership marker is a second statement inside the same node, so it
+	// gets its own event name: every ordering assertion in this package is
+	// about the primary statement, and conflating the two would make "exec"
+	// mean two different things.
+	if strings.HasPrefix(stmt.SQL, "COMMENT ON INDEX ") {
+		x.rec.add("mark:%s", stmt.NodeID)
+	} else {
+		x.rec.add("exec:%s", stmt.NodeID)
+	}
 
 	if x.hook != nil {
 		if err := x.hook(ctx, stmt); err != nil {
@@ -274,10 +275,43 @@ func (x *fakeSQL) Exec(ctx context.Context, stmt Statement) error {
 	return err
 }
 
+// execCount counts primary statements. Ownership markers are counted by
+// markCount, because every "did any DDL run?" assertion in this package is
+// about the statement that changes the catalog's shape.
 func (x *fakeSQL) execCount() int {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	return len(x.stmts)
+	return x.execCountLocked()
+}
+
+func (x *fakeSQL) markCount() int {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return len(x.stmts) - x.execCountLocked()
+}
+
+func (x *fakeSQL) execCountLocked() int {
+	n := 0
+	for _, s := range x.stmts {
+		if !strings.HasPrefix(s.SQL, "COMMENT ON INDEX ") {
+			n++
+		}
+	}
+	return n
+}
+
+// statementsFor returns every statement a node issued, in order. A node that
+// creates an object issues two: its DDL and then the ownership marker.
+func (x *fakeSQL) statementsFor(id protocol.NodeID) []Statement {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	var out []Statement
+	for _, s := range x.stmts {
+		if s.NodeID == id {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (x *fakeSQL) statementFor(id protocol.NodeID) (Statement, bool) {
@@ -300,9 +334,49 @@ type fakeCatalog struct {
 
 	assertFn func([]protocol.Assertion) ([]CheckResult, error)
 	verifyFn func([]protocol.VerifyCheck) ([]CheckResult, error)
+
+	mu       sync.Mutex
+	comments map[string]string
+	markerFn func(protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error)
 }
 
-func newFakeCatalog(rec *recorder) *fakeCatalog { return &fakeCatalog{rec: rec} }
+func newFakeCatalog(rec *recorder) *fakeCatalog {
+	return &fakeCatalog{rec: rec, comments: map[string]string{}}
+}
+
+// Marker implements [CatalogEvaluator]. The fake stores raw comment text and
+// classifies it through the real parser, so a test cannot accidentally assert
+// against a status the parser would never produce.
+func (c *fakeCatalog) Marker(_ context.Context, object protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error) {
+	c.rec.add("marker_read:%s", object)
+	if c.markerFn != nil {
+		return c.markerFn(object)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, status := protocol.ParseMarker(c.comments[object.String()])
+	return m, status, nil
+}
+
+// setComment gives an object a comment, ours or otherwise.
+func (c *fakeCatalog) setComment(object protocol.ObjectName, comment string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.comments[object.String()] = comment
+}
+
+// mark gives an object a well-formed PartitionCTL marker.
+func (c *fakeCatalog) mark(t *testing.T, object protocol.ObjectName, run string) {
+	t.Helper()
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run: run, Plan: "sha256:test", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("FormatMarker: %v", err)
+	}
+	c.setComment(object, text)
+}
 
 func (c *fakeCatalog) Assert(_ context.Context, as []protocol.Assertion) ([]CheckResult, error) {
 	c.rec.add("assert:%d", len(as))
@@ -326,6 +400,19 @@ func (c *fakeCatalog) Verify(_ context.Context, cs []protocol.VerifyCheck) ([]Ch
 		out[i] = CheckResult{Name: string(ck.Check), Passed: true}
 	}
 	return out, nil
+}
+
+// parseMarkerLiteral pulls the marker back out of a rendered COMMENT statement
+// and classifies it with the real parser, so a test asserts what a server would
+// have stored rather than what the renderer meant.
+func parseMarkerLiteral(t *testing.T, stmt string) (protocol.Marker, protocol.MarkerStatus) {
+	t.Helper()
+	i := strings.Index(stmt, " IS '")
+	if i < 0 || !strings.HasSuffix(stmt, "'") {
+		t.Fatalf("not a COMMENT statement: %s", stmt)
+	}
+	literal := stmt[i+len(" IS '") : len(stmt)-1]
+	return protocol.ParseMarker(strings.ReplaceAll(literal, "''", "'"))
 }
 
 // ---------------------------------------------------------------------------

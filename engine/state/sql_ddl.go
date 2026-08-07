@@ -23,6 +23,23 @@ const SchemaVersion = "1"
 // are separate strings rather than one script so that a driver which refuses
 // multi-statement Exec still works, and so that a failure names the statement
 // that failed.
+//
+// # Why there are no triggers here any more
+//
+// Earlier versions installed two plpgsql functions and three triggers: one
+// pair enforcing INV-6 (a run's plan digest is immutable) and one enforcing
+// INV-3 (the audit trail is append-only), plus a REVOKE. Both invariants are
+// enforced by this package's Go API, which has no path that rewrites a plan
+// digest ([RunStore.SetRunStatus] never touches it) and no update or delete
+// method for an audit event at all. What the triggers bought was defence
+// against an operator hand-editing PartitionCTL's own bookkeeping tables with
+// psql; what they cost was CREATE FUNCTION privilege and eighteen bootstrap
+// statements against the customer's production database.
+//
+// Bootstrap is now CREATE SCHEMA, CREATE TABLE and CREATE INDEX and nothing
+// else, which is a materially smaller adoption ask (G4, NFR-SEC-1) and is
+// something a DBA can read in one sitting and pre-create by hand under
+// SkipBootstrap. [SchemaDDL] stays exported for exactly that.
 var ddlTemplates = []string{
 	`CREATE SCHEMA IF NOT EXISTS %[1]s`,
 
@@ -63,33 +80,13 @@ var ddlTemplates = []string{
 
 	`CREATE INDEX IF NOT EXISTS run_plan_digest_idx ON %[1]s.run (plan_digest)`,
 
-	// INV-6: a run is bound to exactly one plan digest for its lifetime. The
-	// Go API has no path that changes it; this is the second lock on the same
-	// door, for anyone reaching the table with psql.
-	`CREATE OR REPLACE FUNCTION %[1]s.run_digest_immutable() RETURNS trigger
-	LANGUAGE plpgsql AS $fn$
-BEGIN
-	IF NEW.plan_digest IS DISTINCT FROM OLD.plan_digest THEN
-		RAISE EXCEPTION
-			'partitionctl: run % is bound to plan digest %, it cannot be rebound to % (INV-6)',
-			OLD.run_id, OLD.plan_digest, NEW.plan_digest;
-	END IF;
-	IF NEW.run_id IS DISTINCT FROM OLD.run_id THEN
-		RAISE EXCEPTION 'partitionctl: run_id is immutable';
-	END IF;
-	RETURN NEW;
-END;
-$fn$`,
-
-	`CREATE OR REPLACE TRIGGER run_digest_immutable
-	BEFORE UPDATE ON %[1]s.run
-	FOR EACH ROW EXECUTE FUNCTION %[1]s.run_digest_immutable()`,
-
 	`CREATE TABLE IF NOT EXISTS %[1]s.node_state (
 	run_id text NOT NULL REFERENCES %[1]s.run (run_id),
 	node_id text NOT NULL,
 	kind text NOT NULL,
 	state text NOT NULL,
+	object_schema text NOT NULL DEFAULT '',
+	object_name text NOT NULL DEFAULT '',
 	attempts integer NOT NULL DEFAULT 0,
 	last_error text NOT NULL DEFAULT '',
 	error_kind text NOT NULL DEFAULT '',
@@ -98,6 +95,11 @@ $fn$`,
 	PRIMARY KEY (run_id, node_id)
 )`,
 
+	// The claim lookup asks "does any live node record name this object?", so
+	// it reads across runs rather than within one (see ClaimsObject).
+	`CREATE INDEX IF NOT EXISTS node_state_object_idx
+	ON %[1]s.node_state (object_schema, object_name)`,
+
 	`CREATE TABLE IF NOT EXISTS %[1]s.lease (
 	run_id text PRIMARY KEY REFERENCES %[1]s.run (run_id),
 	holder text NOT NULL,
@@ -105,25 +107,6 @@ $fn$`,
 	heartbeat_at timestamptz NOT NULL,
 	ttl_seconds integer NOT NULL
 )`,
-
-	`CREATE TABLE IF NOT EXISTS %[1]s.provenance (
-	provenance_id text PRIMARY KEY,
-	run_id text NOT NULL REFERENCES %[1]s.run (run_id),
-	node_id text NOT NULL DEFAULT '',
-	plan_digest text NOT NULL DEFAULT '',
-	database_name text NOT NULL DEFAULT '',
-	object_schema text NOT NULL DEFAULT '',
-	object_name text NOT NULL,
-	object_kind text NOT NULL,
-	relation_schema text NOT NULL DEFAULT '',
-	relation_name text NOT NULL DEFAULT '',
-	has_relation boolean NOT NULL DEFAULT false,
-	actor text NOT NULL DEFAULT '',
-	recorded_at timestamptz NOT NULL
-)`,
-
-	`CREATE INDEX IF NOT EXISTS provenance_object_idx
-	ON %[1]s.provenance (database_name, object_schema, object_name)`,
 
 	`CREATE TABLE IF NOT EXISTS %[1]s.authorization (
 	authorization_id text PRIMARY KEY,
@@ -136,8 +119,6 @@ $fn$`,
 	relation_schema text NOT NULL DEFAULT '',
 	relation_name text NOT NULL DEFAULT '',
 	has_relation boolean NOT NULL DEFAULT false,
-	provenance_id text NOT NULL DEFAULT '',
-	reindex_run_id text NOT NULL DEFAULT '',
 	confirmation text NOT NULL DEFAULT '',
 	evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
 	granted_at timestamptz NOT NULL
@@ -155,34 +136,6 @@ $fn$`,
 	occurred_at timestamptz NOT NULL,
 	UNIQUE (run_id, seq)
 )`,
-
-	// INV-3: the audit trail is append-only. The Go API exposes no update or
-	// delete path; this makes the table refuse one even from psql.
-	`CREATE OR REPLACE FUNCTION %[1]s.audit_event_append_only() RETURNS trigger
-	LANGUAGE plpgsql AS $fn$
-BEGIN
-	RAISE EXCEPTION
-		'partitionctl: %[1]s.audit_event is append-only, % is not permitted (INV-3)', TG_OP;
-END;
-$fn$`,
-
-	`CREATE OR REPLACE TRIGGER audit_event_append_only
-	BEFORE UPDATE OR DELETE ON %[1]s.audit_event
-	FOR EACH ROW EXECUTE FUNCTION %[1]s.audit_event_append_only()`,
-
-	// TRUNCATE needs its own statement-level trigger: a FOR EACH ROW trigger
-	// never fires on it, so the trigger above leaves the fastest way to erase
-	// the whole trail wide open. The REVOKE below does not close it either,
-	// because a REVOKE ... FROM PUBLIC has no effect on the table's owner,
-	// which is the role that ran the bootstrap and is normally the same role
-	// PartitionCTL connects as. Without this, `TRUNCATE audit_event` from psql
-	// silently erases the trail while `DELETE FROM` is correctly refused
-	// (INV-3).
-	`CREATE OR REPLACE TRIGGER audit_event_no_truncate
-	BEFORE TRUNCATE ON %[1]s.audit_event
-	FOR EACH STATEMENT EXECUTE FUNCTION %[1]s.audit_event_append_only()`,
-
-	`REVOKE UPDATE, DELETE, TRUNCATE ON %[1]s.audit_event FROM PUBLIC`,
 }
 
 // SchemaDDL returns the bootstrap statements for a schema, in the order they
@@ -216,10 +169,9 @@ func quoteSchema(schema string) (string, error) {
 
 // expandSchema substitutes the quoted schema for %[1]s.
 //
-// fmt.Sprintf is deliberately not used: the DDL contains PostgreSQL format
-// specifiers of its own, the % placeholders inside RAISE EXCEPTION, and
-// Sprintf would mangle them into %!(NOVERB). A plain replace has no such
-// opinion about the rest of the string.
+// fmt.Sprintf is deliberately not used. Any % this DDL grows would be a
+// PostgreSQL format specifier rather than a Go one, and Sprintf would mangle it
+// into %!(NOVERB). A plain replace has no opinion about the rest of the string.
 func expandSchema(tmpl, quotedSchema string) string {
 	return strings.ReplaceAll(tmpl, "%[1]s", quotedSchema)
 }

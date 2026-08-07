@@ -14,17 +14,20 @@ type AuthorizationMode string
 
 // The three authorization modes.
 const (
-	// AuthProvenance is satisfied only by a committed provenance record
-	// proving PartitionCTL created the object (FR-AUTH-2). Used by
+	// AuthProvenance is satisfied by a [Marker] on the object proving
+	// PartitionCTL created it, or, only while a claim is live, by an in-flight
+	// node checkpoint naming it (FR-AUTH-2 as amended). Used by
 	// CreatePartitionedIndex to clean up an INVALID leaf index left by a
-	// failed CREATE INDEX CONCURRENTLY.
+	// failed CREATE INDEX CONCURRENTLY. See [DecideProvenanceDrop] for the
+	// decision table, which is the single implementation.
 	AuthProvenance AuthorizationMode = "provenance"
 
 	// AuthLeftover is satisfied only when the object matches PostgreSQL's
-	// _ccnew/_ccold naming convention AND the relation has a recorded
-	// PartitionCTL reindex run (FR-AUTH-3, INV-7). Both conditions are
+	// _ccnew/_ccold naming convention AND the *base* index carries a
+	// PartitionCTL [Marker] (FR-AUTH-3 as amended, INV-7). Both conditions are
 	// required: naming alone is forgeable, since an operator may have run
 	// REINDEX CONCURRENTLY by hand and left their own _ccnew behind (AC-19).
+	// See [DecideLeftoverDrop].
 	AuthLeftover AuthorizationMode = "leftover"
 
 	// AuthExplicit is satisfied only when the specification names the object
@@ -70,14 +73,15 @@ type Authorization struct {
 	// Mode is the single mode claimed for this node (FR-AUTH-1).
 	Mode AuthorizationMode `json:"mode"`
 
-	// Object identifies exactly what will be destroyed. It is the key the
-	// executor uses to look up provenance or reindex-run history, and the
-	// identity recorded in the audit trail.
+	// Object identifies exactly what will be destroyed. It is the object whose
+	// ownership marker the executor reads, and the identity recorded in the
+	// audit trail.
 	Object ObjectName `json:"object"`
 
-	// Relation is the table the object belongs to. AuthLeftover resolves
-	// reindex-run history per relation (FR-AUTH-3), so it is required there and
-	// optional elsewhere.
+	// Relation is the table the object belongs to. It is required for
+	// AuthLeftover and optional elsewhere: a leftover is always reported
+	// against the leaf it sits on, and the audit trail is unreadable without
+	// it.
 	Relation *ObjectName `json:"relation,omitempty"`
 
 	// RequiredConfirmation names the CLI flag whose acknowledgement authorizes
@@ -116,7 +120,7 @@ func (a *Authorization) Validate() error {
 		}
 	case AuthLeftover:
 		if a.Relation == nil {
-			return fmt.Errorf("authorization mode %q requires relation, because run history is recorded per relation (FR-AUTH-3)", a.Mode)
+			return fmt.Errorf("authorization mode %q requires relation, so the audit trail names the leaf the leftover sat on (FR-AUTH-3)", a.Mode)
 		}
 	}
 	return nil

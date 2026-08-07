@@ -16,69 +16,69 @@ import (
 // doing that under `execute` would mean a routine re-run can destroy catalog
 // objects".
 //
-// The guard that was in place keyed on the plan *digest*, which any re-plan
-// defeats: a fresh plan has a new CreatedAt and therefore a new digest, so no
-// prior run matches and execute proceeds straight into the drop.
+// The rule is now narrower and evaluated later, and both changes are
+// deliberate. The old guard scanned the artifact for any provenance-authorized
+// destructive node and refused, which a re-plan defeated anyway (a fresh
+// CreatedAt gives a new digest, so no prior run matched) and which was too
+// broad besides: an object carrying PartitionCTL's ownership marker is a
+// catalog fact, and dropping it is not a recovery decision. What is reserved to
+// `resume` is *adoption*: dropping an object that carries no marker and is ours
+// only because an interrupted run still claims it. That question can only be
+// answered against live state, so it is answered at dispatch (FR-AUTH-5).
 
-// TestExecuteRefusesProvenanceCleanup is the FR-CLI-9 refusal.
-func TestExecuteRefusesProvenanceCleanup(t *testing.T) {
+// TestExecuteRefusesToAdoptAnUnmarkedIndex is the FR-CLI-9 refusal.
+func TestExecuteRefusesToAdoptAnUnmarkedIndex(t *testing.T) {
 	h := newHarness(t)
 	p := h.dropPlan()
 	plan := h.WritePlan(p)
 
-	// Provenance exists, so the drop *would* be authorized. That is the
-	// dangerous case: the authorization check passes and only the command
-	// split stands between a routine re-run and a dropped index.
-	h.seedProvenance(h.LoadPlan(plan))
+	// A live claim exists, so the drop *would* be authorized under resume.
+	// That is the dangerous case: the authorization check passes and only the
+	// command split stands between a routine re-run and a dropped index.
+	h.seedClaim(h.LoadPlan(plan))
 
 	code := h.Run("execute", plan)
 	if code == int(protocol.ExitSuccess) {
-		t.Fatalf("execute completed a provenance-authorized drop; FR-CLI-9 reserves that to resume: %s", h.Out())
+		t.Fatalf("execute adopted and dropped an unmarked index; FR-CLI-9 reserves that to resume: %s", h.Out())
 	}
 	if h.SQL.Issued("DROP INDEX") {
-		t.Errorf("execute issued a provenance-authorized DROP INDEX CONCURRENTLY (FR-CLI-9):\n%v", h.SQL.SQLTexts())
+		t.Errorf("execute issued an adoption-authorized DROP INDEX CONCURRENTLY (FR-CLI-9):\n%v", h.SQL.SQLTexts())
 	}
 	if !strings.Contains(h.Out(), "resume") {
 		t.Errorf("the refusal does not name `resume`: %s", h.Out())
 	}
-	if h.SQL.DDLCount() != 0 {
-		t.Errorf("the refusal issued %d statement(s); it must issue none before the lock", h.SQL.DDLCount())
+	if h.SQL.Issued("COMMENT ON INDEX") {
+		t.Error("execute stamped its ownership marker onto an object it was not allowed to adopt")
 	}
 }
 
-// TestExecuteRefusesBeforeTakingTheLock proves the refusal is a pre-flight
-// check rather than a mid-run halt: a run that got as far as the executor would
-// already have created a run record and taken the advisory lock.
-func TestExecuteRefusesProvenanceCleanupWithoutCreatingARun(t *testing.T) {
+// The complement: an object carrying PartitionCTL's marker is provably ours
+// from the catalog alone, so `execute` may drop it. Refusing that was the
+// deadlock in the old design — a re-plan after a crash produced a node that
+// `execute` refused and `resume` could not reach, because the digest changed.
+func TestExecuteMayDropAnIndexThatCarriesOurMarker(t *testing.T) {
 	h := newHarness(t)
-	plan := h.WritePlan(h.dropPlan())
-	loaded := h.LoadPlan(plan)
-	h.seedProvenance(loaded)
+	p := h.dropPlan()
+	plan := h.WritePlan(p)
+	h.Verify.Mark(obj("public", protocol.ChildIndexName(testIndex, "orders_2026_01")), "run-earlier")
 
-	_ = h.Run("execute", plan)
-
-	// Only runs of *this* plan count: seedProvenance deliberately leaves a
-	// failed run of the older artifact behind.
-	var mine []state.Run
-	for _, r := range h.Runs() {
-		if r.PlanDigest == loaded.Digest {
-			mine = append(mine, r)
-		}
+	if code := h.Run("execute", plan); code != int(protocol.ExitSuccess) {
+		t.Fatalf("execute exited %d on a marker-authorized drop: %s", code, h.Out())
 	}
-	if len(mine) != 0 {
-		t.Errorf("execute created %d run(s) for a plan it must refuse: %+v", len(mine), mine)
+	if !h.SQL.Issued("DROP INDEX CONCURRENTLY") {
+		t.Errorf("execute did not issue the marker-authorized drop:\n%v", h.SQL.SQLTexts())
 	}
 }
 
-// TestResumePerformsProvenanceCleanup is the other half of FR-CLI-9: the
-// command that IS permitted must still do it, or the refusal above would just
-// be a dead end with no path forward.
-func TestResumePerformsProvenanceCleanup(t *testing.T) {
+// TestResumeAdoptsAndDrops is the other half of FR-CLI-9: the command that IS
+// permitted must still do it, or the refusal above would just be a dead end
+// with no path forward.
+func TestResumeAdoptsAndDrops(t *testing.T) {
 	h := newHarness(t)
 	p := h.dropPlan()
 	plan := h.WritePlan(p)
 	loaded := h.LoadPlan(plan)
-	h.seedProvenance(loaded)
+	h.seedClaim(loaded)
 	h.seedRun(loaded)
 
 	if code := h.Run("resume", plan); code != int(protocol.ExitSuccess) {
@@ -86,6 +86,11 @@ func TestResumePerformsProvenanceCleanup(t *testing.T) {
 	}
 	if !h.SQL.Issued("DROP INDEX CONCURRENTLY") {
 		t.Errorf("resume did not issue the authorized drop:\n%v", h.SQL.SQLTexts())
+	}
+	// The adoption is the marker written immediately before the drop, so the
+	// destruction stays auditable once the claim is gone.
+	if !h.SQL.Issued("COMMENT ON INDEX") {
+		t.Errorf("resume dropped an adopted object without first marking it:\n%v", h.SQL.SQLTexts())
 	}
 }
 
@@ -102,14 +107,14 @@ func TestExecuteAllowsAPlanWithNoDestructiveNode(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 
-// seedProvenance commits a provenance record for every object a plan's
-// destructive nodes name, which is what makes the drop authorizable.
+// seedClaim leaves behind the state a process killed mid-CREATE INDEX
+// CONCURRENTLY leaves: a run in FAILED whose node for the victim object is
+// still in flight, so the object is claimed but unmarked.
 //
-// The record is written under a run of a *different* plan, because that is the
+// The claim is held by a run of a *different* plan, because that is the
 // scenario FR-CLI-9 is about: a run crashed, the operator re-planned, and the
-// new artifact has a new digest. Writing it under this plan's own digest would
-// instead trip the prior-run guard and prove nothing about the drop.
-func (h *harness) seedProvenance(p *protocol.Plan) {
+// new artifact has a new digest.
+func (h *harness) seedClaim(p *protocol.Plan) {
 	h.t.Helper()
 
 	older := h.dropPlan()
@@ -121,6 +126,28 @@ func (h *harness) seedProvenance(p *protocol.Plan) {
 		h.t.Fatal("fixture error: the prior plan must have a different digest")
 	}
 	run := h.seedRun(older)
+
+	// The node has dispatched, so its record claims the object. Orphan recovery
+	// will have put it back in PENDING, which still claims.
+	for i := range older.Nodes {
+		n := &older.Nodes[i]
+		if _, ok := n.Object(); !ok {
+			continue
+		}
+		for _, to := range []protocol.NodeState{protocol.NodeReady, protocol.NodeRunning} {
+			from := protocol.NodePending
+			if to == protocol.NodeRunning {
+				from = protocol.NodeReady
+			}
+			if _, err := h.Store.TransitionNode(ctx(), state.NodeTransition{
+				RunID: run.RunID, NodeID: n.ID, From: from, To: to,
+				IncrementAttempt: to == protocol.NodeRunning,
+			}); err != nil {
+				h.t.Fatalf("TransitionNode: %v", err)
+			}
+		}
+	}
+
 	if _, err := h.Store.SetRunStatus(ctx(), state.RunStatusUpdate{
 		RunID: run.RunID,
 		From:  state.RunRunning,
@@ -129,26 +156,6 @@ func (h *harness) seedProvenance(p *protocol.Plan) {
 		At:    h.Now(),
 	}); err != nil {
 		h.t.Fatalf("SetRunStatus: %v", err)
-	}
-
-	for i := range p.Nodes {
-		n := &p.Nodes[i]
-		if n.Authorization == nil || n.Authorization.Mode != protocol.AuthProvenance {
-			continue
-		}
-		_, err := h.Store.WriteProvenance(ctx(), state.Provenance{
-			RunID:      run.RunID,
-			NodeID:     n.ID,
-			PlanDigest: p.Digest,
-			Database:   p.Target.Database,
-			Object:     n.Authorization.Object,
-			ObjectKind: state.ObjectKind("index"),
-			Relation:   n.Authorization.Relation,
-			RecordedAt: protocol.NewTimestamp(h.Now()),
-		}, nil)
-		if err != nil {
-			h.t.Fatalf("WriteProvenance: %v", err)
-		}
 	}
 }
 
@@ -203,7 +210,7 @@ func TestResumeRefusesADifferentDatabase(t *testing.T) {
 	p := h.dropPlan()
 	plan := h.WritePlan(p)
 	loaded := h.LoadPlan(plan)
-	h.seedProvenance(loaded)
+	h.seedClaim(loaded)
 	h.seedRun(loaded)
 
 	h.Cat.Database = "prod"
@@ -216,35 +223,35 @@ func TestResumeRefusesADifferentDatabase(t *testing.T) {
 	}
 }
 
-// TestUnscopedProvenanceLookupFailsClosed is FR-AUTH-2 at the bridge.
+// TestUnscopedClaimLookupFailsClosed is FR-AUTH-2 at the bridge.
 //
-// ProvenanceQuery treats an empty Database as "match any", and a file store
-// deliberately holds state for more than one target, so an unscoped lookup can
-// return a record proving PartitionCTL built an index of this name in a
-// *different* database. provenanceLookup already refused to answer from that;
-// the executor's dispatch-time re-check, which FR-AUTH-5 makes the last line of
-// defence, did not.
-func TestUnscopedProvenanceLookupFailsClosed(t *testing.T) {
+// A file store deliberately holds state for more than one target, so an
+// unscoped claim lookup can report a claim held by a run against a *different*
+// database. Adoption is the one path that destroys an object on the strength of
+// a claim alone, so answering it unscoped would let a crashed staging run
+// authorize dropping a production index.
+func TestUnscopedClaimLookupFailsClosed(t *testing.T) {
 	h := newHarness(t)
 
-	// A record exists, and it is the only record: an unscoped query matches it.
 	p := h.dropPlan()
 	plan := h.WritePlan(p)
-	h.seedProvenance(h.LoadPlan(plan))
+	h.seedClaim(h.LoadPlan(plan))
 
 	victim := obj("public", protocol.ChildIndexName(testIndex, "orders_2026_01"))
 
 	scoped := newExecutorStore(h.Store, testDBName)
-	if _, found, err := scoped.LookupProvenance(ctx(), victim); err != nil || !found {
-		t.Fatalf("scoped lookup found = %v, err = %v; want the record to be findable", found, err)
+	if _, found, err := scoped.ClaimsObject(ctx(), victim); err != nil || !found {
+		t.Fatalf("scoped lookup found = %v, err = %v; want the claim to be findable", found, err)
 	}
 
 	unscoped := newExecutorStore(h.Store, "")
-	if _, found, err := unscoped.LookupProvenance(ctx(), victim); err != nil || found {
-		t.Errorf("an unscoped LookupProvenance returned found = %v (err %v); ownership that "+
-			"cannot be scoped to a database has not been proven (FR-AUTH-2)", found, err)
+	if _, found, err := unscoped.ClaimsObject(ctx(), victim); err != nil || found {
+		t.Errorf("an unscoped ClaimsObject returned found = %v (err %v); a claim that cannot be "+
+			"scoped to a database has not been proven (FR-AUTH-2)", found, err)
 	}
-	if _, err := unscoped.provenanceID(ctx(), victim); err == nil {
-		t.Error("an unscoped provenanceID produced evidence for a destructive action (INV-2)")
+
+	// And the planner's side of the same port.
+	if _, found, err := (claimLookup{store: h.Store}).ClaimsObject(ctx(), victim); err != nil || found {
+		t.Errorf("an unscoped claimLookup returned found = %v (err %v)", found, err)
 	}
 }

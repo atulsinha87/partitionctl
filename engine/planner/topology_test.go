@@ -542,7 +542,9 @@ func TestRelationStringers(t *testing.T) {
 			t.Errorf("IndexCondition.String() = %q", c.String())
 		}
 	}
-	for _, d := range []CleanupDecision{CleanupNone, CleanupDropWithProvenance, CleanupHalt} {
+	for _, d := range []CleanupDecision{
+		CleanupNone, CleanupDropWithProvenance, CleanupAdoptThenDrop, CleanupHalt,
+	} {
 		if d.String() != string(d) {
 			t.Errorf("CleanupDecision.String() = %q", d.String())
 		}

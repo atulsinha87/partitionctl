@@ -41,6 +41,13 @@ const (
 
 	// KindIndexReindexConcurrently issues REINDEX INDEX CONCURRENTLY on one
 	// leaf index. ShareUpdateExclusive, non-transactional.
+	//
+	// The v0.0 spike measured that the statement works on an attached leaf index
+	// and that the attachment survives the internal swap, on 14.23 and 17.10
+	// (docs/spikes/v0.0-results.md, question 1). It also works on the
+	// partitioned parent, which the TRD denied; the planner declines to use the
+	// parent form for reasons of resumability, not legality. See
+	// [ReindexConcurrentlyParams].
 	KindIndexReindexConcurrently NodeKind = "index.reindex_concurrently"
 
 	// KindIndexDropPartitioned issues DROP INDEX on a partitioned parent and
@@ -190,6 +197,30 @@ func (k NodeKind) WaitsForConcurrentTransactions() bool {
 	return false
 }
 
+// ClaimsOwnership reports whether a node of this kind, by acting, makes the
+// object it names PartitionCTL's.
+//
+// It is exactly the set of kinds that write an ownership marker
+// ([MarkerTargetFor]), and the correspondence is the point: a claim is the
+// durable stand-in for a marker that could not be written yet, so a kind that
+// would never write one can never claim.
+//
+// The distinction is load-bearing and its absence is circular. A node record
+// names the object its node acts on, including for the two destructive kinds,
+// because the audit trail is unreadable without it. If that counted as a claim,
+// a plan node saying "drop X" would itself be the proof that X is ours to drop,
+// and AC-6 would be satisfied by asking the question.
+func (k NodeKind) ClaimsOwnership() bool {
+	switch k {
+	case KindIndexCreateParentInvalid,
+		KindIndexCreateConcurrently,
+		KindIndexAttach,
+		KindIndexReindexConcurrently:
+		return true
+	}
+	return false
+}
+
 // Retryable reports whether a failure of k may be retried at all. Errors are
 // still classified as retryable or terminal by the executor (FR-EXEC-3); this
 // only says the kind is not inherently single-shot.
@@ -214,17 +245,33 @@ func (k NodeKind) Retryable() bool { return k.IssuesDDL() }
 //     whenever the statement committed but its response was lost to a reset
 //     connection: the retry meets 42P07 or 42704 undefined_object.
 //
-// ALTER INDEX ... ATTACH PARTITION is the exception: PostgreSQL's
-// ATExecAttachPartitionIdx silently no-ops when the child is already attached
-// to that parent, so re-issuing it is genuinely idempotent.
+// Two kinds are exceptions:
+//
+//   - ALTER INDEX ... ATTACH PARTITION: PostgreSQL's ATExecAttachPartitionIdx
+//     silently no-ops when the child is already attached to that parent, so
+//     re-issuing it is genuinely idempotent.
+//
+//   - DROP INDEX on a partitioned parent: it is a single atomic statement that
+//     commits nothing before it can fail. The failure FR-DROP-6 and AC-15 are
+//     actually about is 55P03 lock_not_available, where the statement never got
+//     its AccessExclusiveLock and the index is untouched; re-issuing after a
+//     backoff is exactly right, and exhausting the budget abandons cleanly with
+//     the index intact. The one degraded case is a committed statement whose
+//     response was lost to a reset connection, where the retry meets 42704 on
+//     an index that is genuinely gone. That is a misleading error, not a
+//     destructive act.
 //
 // The recovery for an unsafe kind is `resume`, which drops the wreckage under
-// provenance and rebuilds (FR-PLAN-6, AC-5). The executor therefore leaves the
-// node resumable and stops the run rather than re-issuing. Deciding this per
-// kind, rather than by re-reading the catalog, is what keeps the executor
-// dispatching on node kind alone and knowing nothing about indexes.
+// the ownership marker and rebuilds (FR-PLAN-6, AC-5). The executor therefore
+// leaves the node resumable and stops the run rather than re-issuing. Deciding
+// this per kind, rather than by re-reading the catalog, is what keeps the
+// executor dispatching on node kind alone and knowing nothing about indexes.
 func (k NodeKind) RetrySafe() bool {
-	return k == KindIndexAttach
+	switch k {
+	case KindIndexAttach, KindIndexDropPartitioned:
+		return true
+	}
+	return false
 }
 
 // LockLevel returns the heaviest lock k takes on a user relation (TRD §7.2.2).

@@ -20,7 +20,7 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 	ctx := context.Background()
 	s, c := newFileStore(t)
 
-	plan := testPlan(t, "assert", "parent", "leaf-1", "leaf-2")
+	plan := testClaimPlan(t, "orders_idx_leaf_1", "orders_idx_leaf_2")
 	key := LockKey{Database: plan.Target.Database, Table: plan.Target.Table}
 
 	// --- first attempt -------------------------------------------------
@@ -44,20 +44,20 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 			from = to
 		}
 	}
-	drive("assert", protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
 	drive("parent", protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
 
-	// leaf-1: provenance is committed, then the DDL runs (INV-1).
+	// leaf-1 dispatches. INV-1 as amended: the claim on the object it is about
+	// to create was committed by CreateRun and became live at READY, so the
+	// object can never exist without a durable record naming it.
+	leaf1 := protocol.NodeID("cic:orders_idx_leaf_1")
+	leaf2 := protocol.NodeID("cic:orders_idx_leaf_2")
 	leafIdx := protocol.NewObjectName("public", "orders_idx_leaf_1")
-	drive("leaf-1", protocol.NodeReady, protocol.NodeRunning)
-	if _, err := s.WriteProvenance(ctx, Provenance{
-		RunID: run.RunID, NodeID: "leaf-1", Object: leafIdx, ObjectKind: ObjectIndex,
-		Relation: ptrName("public", "orders_2026_01"),
-	}, func(ctx context.Context) error {
-		return errors.New("connection reset by peer") // the process is about to die
-	}); err == nil {
-		t.Fatal("want the simulated failure")
+	drive(leaf1, protocol.NodeReady, protocol.NodeRunning)
+	if _, found, cerr := ClaimsObject(ctx, s, leafIdx); cerr != nil || !found {
+		t.Fatalf("ClaimsObject before the DDL: found=%t err=%v (INV-1)", found, cerr)
 	}
+	// The process now dies mid-CREATE INDEX CONCURRENTLY, leaving an INVALID
+	// index behind with no ownership marker on it.
 
 	// --- the process dies here -----------------------------------------
 	// No status change, no lease release: exactly what SIGKILL leaves behind.
@@ -85,7 +85,7 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 	}
 
 	// leaf-1 was in flight and is back to PENDING (INV-5).
-	rec, err := s.GetNode(ctx, run.RunID, "leaf-1")
+	rec, err := s.GetNode(ctx, run.RunID, leaf1)
 	if err != nil {
 		t.Fatalf("GetNode: %v", err)
 	}
@@ -96,14 +96,21 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 		t.Errorf("attempts = %d, want the previous dispatch to still count", rec.Attempts)
 	}
 
-	// The INVALID index it left behind has provenance, so cleanup is
-	// authorized (FR-PLAN-6, AC-5).
-	ok, provID, err := HasProvenance(ctx, s, ProvenanceQuery{Object: leafIdx})
+	// The unmarked INVALID index it left behind is still claimed, so `resume`
+	// may adopt it and clean it up (FR-PLAN-6, AC-5). The claim survived
+	// orphan recovery, which is the only reason this works.
+	claimRun, claimed, err := ClaimsObject(ctx, s, leafIdx)
 	if err != nil {
-		t.Fatalf("HasProvenance: %v", err)
+		t.Fatalf("ClaimsObject: %v", err)
 	}
-	if !ok {
-		t.Fatal("the interrupted build left no provenance; resume could not prove it owns the index")
+	if !claimed || claimRun != run.RunID {
+		t.Fatal("the interrupted build left no claim; resume could not prove it owns the index")
+	}
+	verdict := protocol.DecideProvenanceDrop(protocol.ProvenanceDropInput{
+		Object: leafIdx, Status: protocol.MarkerAbsent, ClaimRun: string(claimRun),
+	})
+	if verdict.Action != protocol.DropAdoptThenDrop {
+		t.Fatalf("verdict = %s, want adopt_then_drop (A.5.1)", verdict.Action)
 	}
 
 	if _, err := AdoptOrphan(ctx, s, lock2, run.RunID, "host-b/200", "bob", 30*time.Second, c.Now()); err != nil {
@@ -113,9 +120,8 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 	// The cleanup drop is justified before it runs (INV-2).
 	dropped := false
 	if _, err := s.RecordAuthorization(ctx, AuthorizationRecord{
-		RunID: run.RunID, NodeID: "leaf-1", Mode: protocol.AuthProvenance,
-		Object: leafIdx, ProvenanceID: provID,
-		Evidence: map[string]string{"indisvalid": "false"},
+		RunID: run.RunID, NodeID: leaf1, Mode: protocol.AuthProvenance,
+		Object: leafIdx, Evidence: verdict.Evidence,
 	}, func(ctx context.Context) error {
 		dropped = true
 		return nil
@@ -127,8 +133,13 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 	}
 
 	// Roll forward.
-	drive("leaf-1", protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
-	drive("leaf-2", protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
+	drive(leaf1, protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
+	drive(leaf2, protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone)
+
+	// And the run that finished claims nothing at all any more (AC-6).
+	if _, found, cerr := ClaimsObject(ctx, s, leafIdx); cerr != nil || found {
+		t.Fatalf("a run whose nodes are all DONE still claims %s: found=%t err=%v", leafIdx, found, cerr)
+	}
 
 	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
 		RunID: run.RunID, From: RunRunning, To: RunCompleted,
@@ -148,7 +159,7 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 		t.Fatalf("ListNodes: %v", err)
 	}
 	counts := CountNodes(nodes)
-	if counts.Complete != 4 || counts.Remaining != 0 {
+	if counts.Complete != 3 || counts.Remaining != 0 {
 		t.Errorf("counts = %+v, want everything complete", counts)
 	}
 
@@ -183,7 +194,6 @@ func TestFullRunLifecycleWithInterruptionAndResume(t *testing.T) {
 	}
 	wantTypes := []AuditEventType{
 		EventRunOpened, EventLeaseAcquired, EventNodeTransition,
-		EventProvenanceRecorded, EventObjectCreateFailed,
 		EventRunOrphaned, EventRunAdopted,
 		EventAuthorizationRecorded, EventDestructiveExecuted,
 		EventRunStatusChanged, EventLeaseReleased,

@@ -137,33 +137,34 @@ func TestAuditHasNoMutationPath(t *testing.T) {
 func TestAuditOrderingAroundGuardedWrites(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFileStore(t)
-	run := mustCreateRun(t, s, testPlan(t, "cic"), "run-order")
+	run := mustCreateRun(t, s, testPlan(t, "drop"), "run-order")
 
-	if _, err := s.WriteProvenance(ctx, Provenance{
-		RunID: run.RunID, NodeID: "cic",
-		Object: protocol.NewObjectName("public", "idx"), ObjectKind: ObjectIndex,
+	object := protocol.NewObjectName("public", "idx")
+	if _, err := s.RecordAuthorization(ctx, AuthorizationRecord{
+		RunID: run.RunID, NodeID: "drop", Mode: protocol.AuthProvenance,
+		Object: object, Evidence: markerEvidence(object),
 	}, func(ctx context.Context) error { return nil }); err != nil {
-		t.Fatalf("WriteProvenance: %v", err)
+		t.Fatalf("RecordAuthorization: %v", err)
 	}
 
 	trail, err := s.ListAudit(ctx, run.RunID, 0)
 	if err != nil {
 		t.Fatalf("ListAudit: %v", err)
 	}
-	provIdx, createIdx := -1, -1
+	authIdx, execIdx := -1, -1
 	for i, ev := range trail {
 		switch ev.Type {
-		case EventProvenanceRecorded:
-			provIdx = i
-		case EventObjectCreated:
-			createIdx = i
+		case EventAuthorizationRecorded:
+			authIdx = i
+		case EventDestructiveExecuted:
+			execIdx = i
 		}
 	}
-	if provIdx < 0 || createIdx < 0 {
+	if authIdx < 0 || execIdx < 0 {
 		t.Fatalf("trail is missing events: %v", trail)
 	}
-	if provIdx > createIdx {
-		t.Fatalf("provenance was recorded at %d, after the creation at %d (INV-1)", provIdx, createIdx)
+	if authIdx > execIdx {
+		t.Fatalf("the authorization landed at %d, after the statement at %d (INV-2)", authIdx, execIdx)
 	}
 }
 
@@ -261,7 +262,6 @@ func TestErrorsCarryTheContractExitCodes(t *testing.T) {
 		{name: "not found", err: ErrNotFound, want: protocol.ExitFailure},
 		{name: "conflict", err: ErrConflict, want: protocol.ExitFailure},
 		{name: "lease lost", err: ErrLeaseLost, want: protocol.ExitFailure},
-		{name: "provenance not recorded", err: ErrProvenanceNotRecorded, want: protocol.ExitFailure},
 		{name: "authorization not recorded", err: ErrAuthorizationNotRecorded, want: protocol.ExitAuthorizationUnsatisfied},
 	}
 	for _, tc := range tests {

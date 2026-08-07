@@ -239,14 +239,34 @@ func TestRenderRefusesAnIndexInAnotherSchema(t *testing.T) {
 	}
 }
 
-func TestRenderRefusesUnsupportedAndUnknownKinds(t *testing.T) {
+func TestRenderTheTwoLateKinds(t *testing.T) {
 	reindex := node("n", protocol.KindIndexReindexConcurrently, &protocol.ReindexConcurrentlyParams{
-		Index: obj(t, "public.i"),
+		Index: obj(t, "public.orders_idx_p1"),
 	})
-	if _, err := Render(&reindex); !errors.Is(err, ErrUnsupportedNodeKind) {
-		t.Fatalf("error = %v, want ErrUnsupportedNodeKind", err)
+	got, err := Render(&reindex)
+	if err != nil {
+		t.Fatalf("Render(reindex): %v", err)
+	}
+	if got != `REINDEX INDEX CONCURRENTLY "public"."orders_idx_p1"` {
+		t.Fatalf("Render(reindex) = %q", got)
 	}
 
+	drop := node("n", protocol.KindIndexDropPartitioned, &protocol.DropPartitionedParams{
+		Parent: obj(t, "public.orders"), Index: obj(t, "public.orders_idx"), LeafCount: 12,
+	})
+	got, err = Render(&drop)
+	if err != nil {
+		t.Fatalf("Render(drop_partitioned): %v", err)
+	}
+	// No CASCADE: the statement cascades to attached children on its own. No
+	// CONCURRENTLY: PostgreSQL rejects it on a partitioned index. No IF EXISTS:
+	// an index that is already gone is a question for the planner.
+	if got != `DROP INDEX "public"."orders_idx"` {
+		t.Fatalf("Render(drop_partitioned) = %q", got)
+	}
+}
+
+func TestRenderRefusesUnknownKinds(t *testing.T) {
 	unknown := protocol.Node{ID: "n", Kind: protocol.NodeKind("index.teleport")}
 	if _, err := Render(&unknown); !errors.Is(err, protocol.ErrUnknownNodeKind) {
 		t.Fatalf("error = %v, want ErrUnknownNodeKind", err)

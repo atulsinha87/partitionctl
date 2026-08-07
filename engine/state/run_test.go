@@ -210,18 +210,6 @@ func TestNodeTransitionValidate(t *testing.T) {
 	}
 }
 
-func TestObjectKind(t *testing.T) {
-	if !ObjectIndex.Valid() {
-		t.Error("ObjectIndex is not Valid")
-	}
-	if ObjectKind("table").Valid() {
-		t.Error("an unknown object kind is Valid")
-	}
-	if ObjectIndex.String() != "index" {
-		t.Errorf("String = %q", ObjectIndex.String())
-	}
-}
-
 func TestDefaultHolderIsStable(t *testing.T) {
 	a, b := DefaultHolder(), DefaultHolder()
 	if a != b {

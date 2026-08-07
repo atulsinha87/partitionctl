@@ -136,12 +136,27 @@ var (
 	JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
 	JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
 	ORDER BY n.nspname, c.relname`
+
+	// queryIndexComment reads the ownership marker PartitionCTL writes onto an
+	// object it created. obj_description is the supported reader for
+	// pg_description on a pg_class entry, and it returns NULL both for an index
+	// with no comment and for a comment that was never set, which the caller
+	// treats identically.
+	queryIndexComment = `SELECT pg_catalog.obj_description(c.oid, 'pg_class')
+	FROM pg_catalog.pg_class c
+	JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	WHERE ` + fmt.Sprintf(relationFilter, "c", "n") + `
+	  AND c.relkind IN ('i', 'I')
+	LIMIT 1`
 )
 
 // allQueries is every statement this catalog can issue. It exists so a test can
 // assert that the set is read-only (FR-VER-5).
 func allQueries() []string {
-	return []string{queryIndex, queryIndexParent, queryAttachedIndexes, queryLeafPartitions, queryTreeIndexes}
+	return []string{
+		queryIndex, queryIndexParent, queryAttachedIndexes,
+		queryLeafPartitions, queryTreeIndexes, queryIndexComment,
+	}
 }
 
 // Index implements [Catalog].
@@ -181,6 +196,35 @@ func (c *SQLCatalog) LeafPartitions(ctx context.Context, table protocol.ObjectNa
 // TreeIndexes implements [Catalog].
 func (c *SQLCatalog) TreeIndexes(ctx context.Context, table protocol.ObjectName) ([]IndexState, error) {
 	return c.queryIndexStates(ctx, queryTreeIndexes, table)
+}
+
+// IndexComment implements [Catalog].
+func (c *SQLCatalog) IndexComment(ctx context.Context, index protocol.ObjectName) (string, bool, error) {
+	if c == nil || c.q == nil {
+		return "", false, protocol.ErrFailure.Detailf("sql catalog has no query handle")
+	}
+	rows, err := c.q.QueryContext(ctx, queryIndexComment, index.Schema, index.Name)
+	if err != nil {
+		return "", false, fmt.Errorf("catalog read for %q: %w", index.String(), err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", false, fmt.Errorf("catalog read for %q: %w", index.String(), err)
+		}
+		return "", false, nil
+	}
+	var comment sql.NullString
+	if err := rows.Scan(&comment); err != nil {
+		return "", false, fmt.Errorf("catalog read for %q: %w", index.String(), err)
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("catalog read for %q: %w", index.String(), err)
+	}
+	if !comment.Valid || comment.String == "" {
+		return "", false, nil
+	}
+	return comment.String, true, nil
 }
 
 func (c *SQLCatalog) queryIndexStates(ctx context.Context, query string, name protocol.ObjectName) ([]IndexState, error) {

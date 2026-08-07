@@ -41,7 +41,6 @@ import (
 //	<root>/runs/<run>/run.json         the run record
 //	<root>/runs/<run>/lease.json       the lease (FR-STATE-7)
 //	<root>/runs/<run>/nodes/<node>.json per-node state
-//	<root>/runs/<run>/prov/<n>.json    provenance (FR-STATE-6, INV-1)
 //	<root>/runs/<run>/auth/<n>.json    authorization records (INV-2)
 //	<root>/runs/<run>/audit.log        append-only JSON Lines trail (INV-3)
 //
@@ -172,7 +171,6 @@ func (s *FileStore) nodesDir(id RunID) string { return filepath.Join(s.runDir(id
 func (s *FileStore) nodePath(id RunID, node protocol.NodeID) string {
 	return filepath.Join(s.nodesDir(id), encodeSegment(string(node))+".json")
 }
-func (s *FileStore) provDir(id RunID) string { return filepath.Join(s.runDir(id), "prov") }
 func (s *FileStore) authDir(id RunID) string { return filepath.Join(s.runDir(id), "auth") }
 func (s *FileStore) auditPath(id RunID) string {
 	return filepath.Join(s.runDir(id), "audit.log")
@@ -224,6 +222,11 @@ func (s *FileStore) CreateRun(ctx context.Context, req NewRun) (Run, error) {
 			Kind:      n.Kind,
 			State:     protocol.InitialNodeState(),
 			UpdatedAt: protocol.NewTimestamp(now),
+		}
+		// INV-1 as amended: the durable record naming the object and the run is
+		// committed before the DDL that creates it, and this is that record.
+		if obj, ok := n.Object(); ok {
+			rec.Object = obj
 		}
 		if err := s.w.writeJSON(s.nodePath(id, n.ID), rec); err != nil {
 			return Run{}, err
@@ -528,68 +531,6 @@ func nodeTransitionEvent(t NodeTransition, rec NodeRecord, now time.Time) AuditE
 	}
 }
 
-// ---------------------------------------------------------------- provenance
-
-// WriteProvenance implements [ProvenanceStore] and enforces INV-1.
-func (s *FileStore) WriteProvenance(ctx context.Context, rec Provenance, create GuardedAction) (Provenance, error) {
-	if err := rec.Validate(); err != nil {
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-
-	s.mu.Lock()
-	run, err := s.getRunLocked(rec.RunID)
-	if err != nil {
-		s.mu.Unlock()
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	now := s.now(time.Time{})
-	if rec.RecordedAt.Time.IsZero() {
-		rec.RecordedAt = protocol.NewTimestamp(now)
-	}
-	if rec.PlanDigest == "" {
-		rec.PlanDigest = run.PlanDigest
-	}
-	if rec.Database == "" {
-		rec.Database = run.Target.Database
-	}
-	if rec.Actor == "" {
-		rec.Actor = run.Actor
-	}
-
-	seq, err := s.nextSeqLocked(s.provDir(rec.RunID))
-	if err != nil {
-		s.mu.Unlock()
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	rec.ProvenanceID = fmt.Sprintf("%s:prov:%08d", rec.RunID, seq)
-
-	// The commit. Until this returns, create has not been called and cannot
-	// be: it is an argument, not the next statement (INV-1).
-	if err := s.w.writeJSON(filepath.Join(s.provDir(rec.RunID), fmt.Sprintf("%08d.json", seq)), rec); err != nil {
-		s.mu.Unlock()
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	if _, err := s.appendAuditLocked(AuditEvent{
-		RunID:  rec.RunID,
-		NodeID: rec.NodeID,
-		Type:   EventProvenanceRecorded,
-		At:     now,
-		Detail: auditDetail(
-			"provenance_id", rec.ProvenanceID,
-			"object", rec.Object.String(),
-			"object_kind", string(rec.ObjectKind),
-			"database", rec.Database,
-		),
-	}); err != nil {
-		s.mu.Unlock()
-		return Provenance{}, ErrProvenanceNotRecorded.Wrap(err)
-	}
-	s.mu.Unlock()
-
-	return rec, s.runGuarded(ctx, rec.RunID, rec.NodeID, rec.Object, create,
-		EventObjectCreated, EventObjectCreateFailed)
-}
-
 // runGuarded executes the guarded action outside the store mutex, then records
 // its outcome. The action can take hours: a CREATE INDEX CONCURRENTLY on a
 // 10 TB partition is the design centre. Holding the store lock across it would
@@ -623,97 +564,6 @@ func (s *FileStore) runGuarded(ctx context.Context, runID RunID, nodeID protocol
 		return err
 	}
 	return actionErr
-}
-
-// FindProvenance implements [ProvenanceReader].
-func (s *FileStore) FindProvenance(ctx context.Context, q ProvenanceQuery) ([]Provenance, error) {
-	if err := q.validate(); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var runIDs []RunID
-	if q.RunID != "" {
-		runIDs = []RunID{q.RunID}
-	} else {
-		ids, err := s.allRunIDsLocked()
-		if err != nil {
-			return nil, err
-		}
-		runIDs = ids
-	}
-
-	var out []Provenance
-	for _, id := range runIDs {
-		recs, err := s.readProvenanceLocked(id)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range recs {
-			if q.matches(r) {
-				out = append(out, r)
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].RecordedAt.Time.Equal(out[j].RecordedAt.Time) {
-			return out[i].ProvenanceID < out[j].ProvenanceID
-		}
-		return out[i].RecordedAt.Time.Before(out[j].RecordedAt.Time)
-	})
-	return out, nil
-}
-
-func (s *FileStore) readProvenanceLocked(id RunID) ([]Provenance, error) {
-	entries, err := os.ReadDir(s.provDir(id))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, ioErr("list provenance", err)
-	}
-	out := make([]Provenance, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		var p Provenance
-		if err := readJSON(filepath.Join(s.provDir(id), e.Name()), &p); err != nil {
-			if errors.Is(err, ErrNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, nil
-}
-
-func (s *FileStore) allRunIDsLocked() ([]RunID, error) {
-	entries, err := os.ReadDir(s.runsDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, ioErr("list runs", err)
-	}
-	var out []RunID
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		var r Run
-		if err := readJSON(filepath.Join(s.runsDir(), e.Name(), "run.json"), &r); err != nil {
-			if errors.Is(err, ErrNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		out = append(out, r.RunID)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, nil
 }
 
 // ---------------------------------------------------------------- authorization
@@ -765,8 +615,6 @@ func authorizationEvent(rec AuthorizationRecord, now time.Time) AuditEvent {
 		"authorization_id", rec.AuthorizationID,
 		"mode", string(rec.Mode),
 		"object", rec.Object.String(),
-		"provenance_id", rec.ProvenanceID,
-		"reindex_run_id", string(rec.ReindexRunID),
 		"confirmation", rec.Confirmation,
 	)
 	if rec.Relation != nil {
@@ -1472,6 +1320,35 @@ func (s *FileStore) TryLock(ctx context.Context, key LockKey) (Lock, error) {
 			"advisory lock for %s was taken by %q while reclaiming it from an expired holder", key, after.Holder)
 	}
 	return &fileLock{store: s, key: key, token: token}, nil
+}
+
+// allRunIDsLocked lists every run whose run record is readable, sorted. A run
+// directory with no run.json is a crash during CreateRun and is invisible by
+// design.
+func (s *FileStore) allRunIDsLocked() ([]RunID, error) {
+	entries, err := os.ReadDir(s.runsDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, ioErr("list runs", err)
+	}
+	var out []RunID
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		var r Run
+		if err := readJSON(filepath.Join(s.runsDir(), e.Name(), "run.json"), &r); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, r.RunID)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 // lockHeldErrorLocked builds the FR-LOCK-2 message, naming the holding run

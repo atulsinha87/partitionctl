@@ -210,7 +210,7 @@ func (p *Plan) Validate() error {
 	}
 
 	byID := make(map[NodeID]struct{}, len(p.Nodes))
-	destructive, dropPartitioned := 0, 0
+	dropPartitioned := 0
 	for i := range p.Nodes {
 		n := &p.Nodes[i]
 		if err := n.Validate(); err != nil {
@@ -220,24 +220,40 @@ func (p *Plan) Validate() error {
 			return ErrInvalidPlan.Detailf("duplicate node id %q", n.ID)
 		}
 		byID[n.ID] = struct{}{}
-		if n.Kind.IsDestructive() {
-			destructive++
-		}
 		if n.Kind == KindIndexDropPartitioned {
 			dropPartitioned++
 		}
 	}
 
-	// INV-8: at most one index.drop_partitioned, and a plan containing one
-	// contains no other destructive kind.
+	// INV-8 (amended). At most one index.drop_partitioned per plan. The only
+	// other destructive kind permitted alongside it is index.drop_concurrently,
+	// for the unattached orphan leaf indexes an abandoned create leaves behind.
+	//
+	// The original text forbade *any* other destructive node, which forbade the
+	// drop choreography TRD §7.2.13 specifies: an unattached orphan survives the
+	// parent's cascade, so a correct drop plan removes the orphans first and
+	// only then drops the parent. Under the original rule every such plan failed
+	// Validate, which is a refusal to plan the only correct sequence.
+	//
+	// What the invariant is actually protecting is unchanged: one plan never
+	// destroys two partitioned index families, and the AccessExclusiveLock
+	// statement is never one of several the operator did not separately weigh.
 	if dropPartitioned > 1 {
 		return ErrInvalidPlan.Detailf(
 			"INV-8: plan contains %d %s nodes; at most one is allowed", dropPartitioned, KindIndexDropPartitioned)
 	}
-	if dropPartitioned == 1 && destructive != 1 {
-		return ErrInvalidPlan.Detailf(
-			"INV-8: a plan containing %s must contain no other destructive node; found %d destructive nodes",
-			KindIndexDropPartitioned, destructive)
+	if dropPartitioned == 1 {
+		for i := range p.Nodes {
+			n := &p.Nodes[i]
+			if !n.Kind.IsDestructive() || n.Kind == KindIndexDropPartitioned {
+				continue
+			}
+			if n.Kind != KindIndexDropConcurrently {
+				return ErrInvalidPlan.Detailf(
+					"INV-8: a plan containing %s may contain no destructive kind other than %s; node %q is %s",
+					KindIndexDropPartitioned, KindIndexDropConcurrently, n.ID, n.Kind)
+			}
+		}
 	}
 	// FR-DROP-3 / AC-13: the acknowledgement must be recorded in the artifact.
 	if dropPartitioned == 1 && !p.Confirmed(ConfirmExclusiveLock) {

@@ -144,21 +144,24 @@ func (a *App) cmdResume(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return a.walk(ctx, cfg, tgt, store, lock, run, plan)
+	return a.walk(ctx, cfg, tgt, store, lock, run, plan, true)
 }
 
-// cleanup performs the provenance-authorized removal of half-built indexes,
+// cleanup performs the ownership-authorized removal of half-built indexes,
 // which is the step FR-CLI-9 reserves to `resume`.
 //
 // # What it removes, and what it refuses to
 //
 // An interrupted CREATE INDEX CONCURRENTLY leaves an index with
 // indisvalid = false. Rebuilding over it is impossible, because the name is
-// taken, so it must go first. Whether it may go is decided entirely by
-// provenance: a committed record proving PartitionCTL created it (FR-PLAN-6,
-// AC-5), or no drop at all and a halt (FR-PLAN-7, AC-6, NFR-REL-3). An INVALID
-// index this tool did not create belongs to somebody else's in-flight build, and
-// dropping it would be the single most destructive thing this program could do.
+// taken, so it must go first. Whether it may go is decided by the shared
+// destructive-action table ([protocol.DecideProvenanceDrop]): the PartitionCTL
+// ownership marker on the object (FR-PLAN-6, AC-5), or, where the process died
+// before the marker could be written, a live claim naming it — in which case the
+// marker is written first, and only then the drop. Anything else halts
+// (FR-PLAN-7, AC-6, NFR-REL-3). An INVALID index this tool did not create
+// belongs to somebody else's in-flight build, and dropping it would be the
+// single most destructive thing this program could do.
 //
 // # Why the cleanup is not a plan node
 //
@@ -200,36 +203,41 @@ func (a *App) cleanup(
 		return err
 	}
 
-	prov := provenanceLookup{store: store, database: plan.Target.Database}
+	claims := claimLookup{store: store, database: plan.Target.Database}
 	for _, child := range inspection.Children {
 		if !child.Exists() || child.Condition.Usable() {
 			continue
 		}
-		decision, err := planner.DecideCleanup(ctx, prov, child)
+		decision, verdict, err := planner.DecideCleanup(ctx, read, claims, child)
 		if err != nil {
+			if decision == planner.CleanupHalt {
+				return planner.ErrForeignInvalidIndex.Detailf(
+					"%s on %s is %s: %s. Halting rather than dropping it: an index this tool cannot "+
+						"prove it created is never destroyed (FR-PLAN-7, AC-6, NFR-REL-3). Resolve it "+
+						"by hand, then resume again",
+					child.ChildIndex, child.Leaf.Name, child.Condition, verdict.Reason)
+			}
 			return err
 		}
-		switch decision {
-		case planner.CleanupNone:
+		if !decision.Destructive() {
 			continue
-		case planner.CleanupHalt:
-			return planner.ErrForeignInvalidIndex.Detailf(
-				"%s on %s is %s and PartitionCTL has no provenance record proving it created it. "+
-					"Halting rather than dropping it: an index this tool did not create is never destroyed "+
-					"(FR-PLAN-7, AC-6, NFR-REL-3). Resolve it by hand, then resume again",
-				child.ChildIndex, child.Leaf.Name, child.Condition)
-		case planner.CleanupDropWithProvenance:
-			if err := a.dropWithProvenance(ctx, cfg, tgt, store, run, plan, child); err != nil {
-				return err
-			}
+		}
+		if err := a.dropOwnedIndex(ctx, cfg, tgt, store, run, plan, child, decision, verdict); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// dropWithProvenance records the justification and only then issues the drop
+// dropOwnedIndex records the justification and only then issues the drop
 // (INV-2, FR-AUTH-6, AC-20).
-func (a *App) dropWithProvenance(
+//
+// Under [planner.CleanupAdoptThenDrop] the object carries no ownership marker
+// and is ours only because a run that died still names it. The marker is
+// written onto it first, so the drop that follows is auditable after the claim
+// is gone. That write is the one adoption path in the tool, and this command is
+// the only place it happens (FR-CLI-9).
+func (a *App) dropOwnedIndex(
 	ctx context.Context,
 	cfg Config,
 	tgt *Target,
@@ -237,49 +245,47 @@ func (a *App) dropWithProvenance(
 	run state.Run,
 	plan *protocol.Plan,
 	child planner.ChildIndexPlan,
+	decision planner.CleanupDecision,
+	verdict protocol.DropVerdict,
 ) error {
 	object := child.ChildIndex
 	relation := child.Leaf.Name
 
-	has, provID, err := state.HasProvenance(ctx, store, state.ProvenanceQuery{
-		Object:   object,
-		Database: plan.Target.Database,
-	})
-	if err != nil {
-		return err
-	}
-	if !has {
-		// DecideCleanup already asked, so reaching here means the record
-		// vanished between the two reads. Halt: an authorization that cites
-		// nothing is not an authorization.
-		return protocol.ErrAuthorizationUnsatisfied.Detailf(
-			"no committed provenance record proves PartitionCTL created %s (FR-AUTH-2, AC-6)", object)
-	}
-
 	rel := relation
 	nodeID := protocol.NodeID("resume.cleanup:" + object.String())
+	evidence := map[string]string{"command": "resume"}
+	for k, v := range verdict.Evidence {
+		evidence[k] = v
+	}
+	evidence["reason"] = string(protocol.DropInvalidBuild)
+	evidence["condition"] = string(child.Condition)
+
 	rec := state.AuthorizationRecord{
-		RunID:        run.RunID,
-		NodeID:       nodeID,
-		Mode:         protocol.AuthProvenance,
-		Object:       object,
-		Relation:     &rel,
-		Database:     plan.Target.Database,
-		ProvenanceID: provID,
-		Evidence: map[string]string{
-			"reason":        string(protocol.DropInvalidBuild),
-			"condition":     string(child.Condition),
-			"provenance_id": provID,
-			"command":       "resume",
-		},
+		RunID:     run.RunID,
+		NodeID:    nodeID,
+		Mode:      protocol.AuthProvenance,
+		Object:    object,
+		Relation:  &rel,
+		Database:  plan.Target.Database,
+		Evidence:  evidence,
 		GrantedAt: protocol.NewTimestamp(a.Now()),
 	}
 
 	sqlText := "DROP INDEX CONCURRENTLY " + object.Quoted()
-	fmt.Fprintf(a.Stdout, "cleanup: %s is %s with PartitionCTL provenance; dropping it before the rebuild (AC-5)\n",
-		object, child.Condition)
+	source := "carries a PartitionCTL ownership marker"
+	if decision == planner.CleanupAdoptThenDrop {
+		source = "is claimed by the interrupted run " + evidence["claim_run"] +
+			" and is being adopted before it is dropped"
+	}
+	fmt.Fprintf(a.Stdout, "cleanup: %s is %s and %s; dropping it before the rebuild (AC-5)\n",
+		object, child.Condition, source)
 
-	_, err = store.RecordAuthorization(ctx, rec, func(ctx context.Context) error {
+	_, err := store.RecordAuthorization(ctx, rec, func(ctx context.Context) error {
+		if decision == planner.CleanupAdoptThenDrop {
+			if err := a.adopt(ctx, cfg, tgt, run, plan, nodeID, object); err != nil {
+				return err
+			}
+		}
 		return tgt.SQL.Exec(ctx, executor.Statement{
 			RunID:  executor.RunID(run.RunID),
 			NodeID: nodeID,
@@ -311,6 +317,7 @@ func (a *App) dropWithProvenance(
 			"object":   object.String(),
 			"relation": relation.String(),
 			"mode":     string(protocol.AuthProvenance),
+			"source":   evidence["source"],
 			"sql":      sqlText,
 		},
 		At: a.Now(),
@@ -318,4 +325,35 @@ func (a *App) dropWithProvenance(
 		return err
 	}
 	return nil
+}
+
+// adopt stamps the PartitionCTL ownership marker onto an object that has none,
+// immediately before it is dropped. It is a catalog-only statement taking
+// ShareUpdateExclusiveLock for about a millisecond (spike question 2).
+func (a *App) adopt(
+	ctx context.Context,
+	cfg Config,
+	tgt *Target,
+	run state.Run,
+	plan *protocol.Plan,
+	nodeID protocol.NodeID,
+	object protocol.ObjectName,
+) error {
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run:  string(run.RunID),
+		Plan: plan.Digest,
+		Op:   string(plan.Operation),
+		Role: protocol.MarkerRoleLeaf,
+		At:   protocol.MarkerTime(a.Now()),
+	})
+	if err != nil {
+		return err
+	}
+	return tgt.SQL.Exec(ctx, executor.Statement{
+		RunID:    executor.RunID(run.RunID),
+		NodeID:   nodeID,
+		Kind:     protocol.KindIndexDropConcurrently,
+		SQL:      protocol.RenderComment(object, text),
+		Settings: executor.SessionSettings{LockTimeout: cfg.LockTimeout},
+	})
 }

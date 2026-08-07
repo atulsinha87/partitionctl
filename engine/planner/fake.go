@@ -34,6 +34,10 @@ type FakeCatalog struct {
 	Strategies map[uint32]protocol.PartitionStrategy
 	// Indexes is every index in the fake catalog.
 	Indexes []Index
+	// Comments maps an index's identity form (schema.name) to the comment on
+	// it, which is where the ownership marker lives. Use [FakeCatalog.Mark] to
+	// set a well-formed one.
+	Comments map[string]string
 	// Roles maps a role OID to its name.
 	Roles map[uint32]string
 	// Members maps a role OID to whether [FakeCatalog.Role] holds its
@@ -346,34 +350,82 @@ func sortIndexes(is []Index) {
 	})
 }
 
-// FakeProvenance is an in-memory [ProvenanceLookup] keyed on object identity.
-type FakeProvenance struct {
-	// Objects holds the identity form (schema.name) of every object
-	// PartitionCTL is recorded as having created.
-	Objects map[string]bool
+// IndexComment implements [CatalogReader].
+func (f *FakeCatalog) IndexComment(ctx context.Context, index protocol.ObjectName) (string, bool, error) {
+	if err := f.call("IndexComment"); err != nil {
+		return "", false, err
+	}
+	comment, ok := f.Comments[index.String()]
+	if !ok || comment == "" {
+		// An unqualified name resolves the way the server would: by bare name,
+		// since the fake holds one search path.
+		if index.Schema == "" {
+			for name, c := range f.Comments {
+				if o, err := protocol.ParseObjectName(name); err == nil && o.Name == index.Name && c != "" {
+					return c, true, nil
+				}
+			}
+		}
+		return "", false, nil
+	}
+	return comment, true, nil
+}
+
+// Comment sets an arbitrary comment on an index, which is how a test builds the
+// "somebody else wrote this" case.
+func (f *FakeCatalog) Comment(index protocol.ObjectName, comment string) *FakeCatalog {
+	if f.Comments == nil {
+		f.Comments = map[string]string{}
+	}
+	f.Comments[index.String()] = comment
+	return f
+}
+
+// Mark writes a well-formed PartitionCTL ownership marker onto an index,
+// claiming it for the named run. It panics on a malformed marker, which is a
+// test-construction error rather than a condition to handle.
+func (f *FakeCatalog) Mark(index protocol.ObjectName, run string) *FakeCatalog {
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run: run, Plan: "sha256:fake", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		panic("planner: FakeCatalog.Mark: " + err.Error())
+	}
+	return f.Comment(index, text)
+}
+
+// FakeClaims is an in-memory [ClaimLookup] keyed on object identity. It stands
+// in for the node checkpoints a run that died mid-statement left behind.
+type FakeClaims struct {
+	// Runs maps an object's identity form (schema.name) to the run holding a
+	// live claim on it.
+	Runs map[string]string
 	// Err, when non-nil, is returned by every lookup.
 	Err error
 }
 
-// NewFakeProvenance returns an empty provenance source.
-func NewFakeProvenance(objects ...protocol.ObjectName) *FakeProvenance {
-	f := &FakeProvenance{Objects: map[string]bool{}}
+// NewFakeClaims returns a claim source holding a claim on each object, all from
+// one notional crashed run.
+func NewFakeClaims(objects ...protocol.ObjectName) *FakeClaims {
+	f := &FakeClaims{Runs: map[string]string{}}
 	for _, o := range objects {
-		f.Objects[o.String()] = true
+		f.Runs[o.String()] = "run-crashed"
 	}
 	return f
 }
 
-// HasProvenance implements [ProvenanceLookup].
-func (f *FakeProvenance) HasProvenance(ctx context.Context, object protocol.ObjectName) (bool, error) {
+// ClaimsObject implements [ClaimLookup].
+func (f *FakeClaims) ClaimsObject(ctx context.Context, object protocol.ObjectName) (string, bool, error) {
 	if f.Err != nil {
-		return false, f.Err
+		return "", false, f.Err
 	}
-	return f.Objects[object.String()], nil
+	run, ok := f.Runs[object.String()]
+	return run, ok, nil
 }
 
 var (
 	_ CatalogReader    = (*FakeCatalog)(nil)
 	_ ReadOnlyAsserter = (*FakeCatalog)(nil)
-	_ ProvenanceLookup = (*FakeProvenance)(nil)
+	_ ClaimLookup      = (*FakeClaims)(nil)
 )

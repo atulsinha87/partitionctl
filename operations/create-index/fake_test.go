@@ -81,20 +81,24 @@ func (f *fakeCatalog) OwnedByMemberRole(_ context.Context, _ string, names []pro
 	return out, nil
 }
 
-// fakeProvenance answers from a set of objects PartitionCTL is recorded as
-// having created.
-type fakeProvenance struct {
-	created map[protocol.ObjectName]bool
+// fakeClaims answers from a set of objects a notional crashed run still holds a
+// live claim on. It is the second, narrower half of ownership: the first is the
+// marker on the object, which arrives through IndexState.Comment.
+type fakeClaims struct {
+	claimed map[protocol.ObjectName]bool
 	err     error
 	asked   []protocol.ObjectName
 }
 
-func (f *fakeProvenance) HasProvenance(_ context.Context, o protocol.ObjectName) (bool, error) {
+func (f *fakeClaims) ClaimsObject(_ context.Context, o protocol.ObjectName) (string, bool, error) {
 	f.asked = append(f.asked, o)
 	if f.err != nil {
-		return false, f.err
+		return "", false, f.err
 	}
-	return f.created[o], nil
+	if !f.claimed[o] {
+		return "", false, nil
+	}
+	return "run-crashed", true, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +193,28 @@ func parentIndexState(valid bool) IndexState {
 		Index: obj(testIndex), Relation: obj(testTable),
 		IsPartitioned: true, Valid: valid, Ready: true, Live: true,
 	}
+}
+
+// marked stamps a well-formed PartitionCTL ownership marker onto an index
+// state, which is what proves the object is this tool's to clean up (AC-6).
+// The marker text is produced by the real formatter and read back by the real
+// parser, so a fake cannot claim ownership in a shape production would reject.
+func marked(st IndexState) IndexState {
+	text, err := protocol.FormatMarker(protocol.Marker{
+		Run: "run-0", Plan: "sha256:fake", Op: string(protocol.OpCreateIndex),
+		Role: protocol.MarkerRoleLeaf, At: "2026-08-07T12:00:00Z",
+	})
+	if err != nil {
+		panic("create-index: marked: " + err.Error())
+	}
+	st.Comment = text
+	return st
+}
+
+// commented puts somebody else's comment on an index state.
+func commented(st IndexState, text string) IndexState {
+	st.Comment = text
+	return st
 }
 
 // ---------------------------------------------------------------------------

@@ -14,10 +14,6 @@ type RunID string
 
 func (id RunID) String() string { return string(id) }
 
-// ObjectKindIndex is the object kind recorded in provenance for an index. It is
-// the only object kind v0.1 creates.
-const ObjectKindIndex = "index"
-
 // ---------------------------------------------------------------------------
 // SQL port
 // ---------------------------------------------------------------------------
@@ -95,13 +91,20 @@ type CheckResult struct {
 }
 
 // CatalogEvaluator answers the two read-only node kinds, catalog.assert and
-// index.verify. It issues no DDL.
+// index.verify, and reads the ownership marker off an object. It issues no DDL.
 //
-// Both methods MUST return exactly one [CheckResult] per input, in order: the
-// executor pairs them positionally to recover each predicate's failure code.
+// Assert and Verify MUST return exactly one [CheckResult] per input, in order:
+// the executor pairs them positionally to recover each predicate's failure code.
 type CatalogEvaluator interface {
 	Assert(ctx context.Context, assertions []protocol.Assertion) ([]CheckResult, error)
 	Verify(ctx context.Context, checks []protocol.VerifyCheck) ([]CheckResult, error)
+
+	// Marker reads the ownership marker on object (FR-AUTH-2 as amended). An
+	// object that does not exist, or that carries no comment, is
+	// [protocol.MarkerAbsent] and a nil error: absence is an answer, not a
+	// failure. An error means the catalog could not be read, which is "cannot
+	// decide" and halts rather than denying.
+	Marker(ctx context.Context, object protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -147,19 +150,6 @@ type Transition struct {
 	At time.Time
 }
 
-// Provenance is recorded proof that PartitionCTL created an object
-// (FR-STATE-6). The executor commits it *before* the DDL that creates the
-// object (INV-1), so a crash between the two leaves a provenance record with no
-// object, never an object with no provenance.
-type Provenance struct {
-	RunID      RunID
-	NodeID     protocol.NodeID
-	Object     protocol.ObjectName
-	ObjectKind string
-	Relation   *protocol.ObjectName
-	CreatedAt  time.Time
-}
-
 // AuthorizationRecord is the justification for one destructive statement,
 // written before the statement runs (FR-AUTH-6, INV-2, AC-20).
 type AuthorizationRecord struct {
@@ -195,20 +185,20 @@ type AuditEvent struct {
 	At     time.Time
 }
 
-// AuthorityReader is the slice of the state store that answers "is this
-// destructive action authorized?" against live state (FR-AUTH-2, FR-AUTH-3).
-// It is separated so [Authorize] can be tested without a whole store.
+// AuthorityReader is the slice of the state store that answers "does any run
+// still hold a live claim on this object?" (FR-AUTH-2 as amended). It is
+// separated so [Authorize] can be tested without a whole store.
+//
+// It replaced a provenance lookup, and the replacement is strictly stronger. A
+// provenance record keyed on a name outlived the run that wrote it, so a
+// completed build authorized destroying whatever later occupied that name. A
+// claim expires by state transition: when a run completes, every node is DONE
+// and no claim survives (AC-6, NFR-REL-3).
 type AuthorityReader interface {
-	// LookupProvenance finds the committed record proving PartitionCTL created
-	// object. It is deliberately not run-scoped: the record that proves a
-	// half-built index is ours is normally written by the run that died
-	// (TRD §7.3.2).
-	LookupProvenance(ctx context.Context, object protocol.ObjectName) (Provenance, bool, error)
-
-	// HasReindexRun reports whether a PartitionCTL reindex run is recorded for
-	// relation. It is the second, independent condition [protocol.AuthLeftover]
-	// requires; naming alone never suffices (FR-AUTH-3, FR-AUTH-7, INV-7, AC-19).
-	HasReindexRun(ctx context.Context, relation protocol.ObjectName) (bool, error)
+	// ClaimsObject reports the run holding a live claim on object, if any. It
+	// is deliberately not run-scoped: the claim that covers a half-built index
+	// is normally held by the run that died (TRD §7.3.2).
+	ClaimsObject(ctx context.Context, object protocol.ObjectName) (RunID, bool, error)
 }
 
 // StateStore is the executor's whole view of persisted execution state
@@ -231,14 +221,6 @@ type StateStore interface {
 	// CancelRequested reports whether `cancel` set the flag for this run. The
 	// executor polls it at node boundaries only (FR-CLI-10).
 	CancelRequested(ctx context.Context, run RunID) (bool, error)
-
-	// RecordProvenance commits proof that PartitionCTL is about to create the
-	// object. It must return only once committed (INV-1).
-	//
-	// It must be idempotent per object: a retried node records provenance again
-	// before each attempt, and a resumed run records it again for an object a
-	// dead process already claimed.
-	RecordProvenance(ctx context.Context, p Provenance) error
 
 	// RecordAuthorization commits the satisfied mode and its evidence. The
 	// executor calls it before the destructive statement (FR-AUTH-6).
