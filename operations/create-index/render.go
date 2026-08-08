@@ -3,6 +3,7 @@ package createindex
 import (
 	"fmt"
 
+	"github.com/atulsinha/partitionctl/engine/planner"
 	"github.com/atulsinha/partitionctl/engine/protocol"
 )
 
@@ -17,23 +18,11 @@ import (
 // (T2). The only thing added on top is the ownership marker, which the executor
 // issues after the statement and which the artifact would otherwise not show.
 
-// preview fills in a node's RenderedSQL from its own typed parameters,
-// including the ownership-marker statement the executor issues after it (G2,
-// FR-PLANFILE-7).
-//
-// The run and plan fields of the previewed marker read "pending" because
-// neither exists yet: a plan is not bound to a run until `execute` opens one,
-// and the digest cannot name itself. The executor substitutes the real values.
+// preview delegates to [planner.Preview], which every operation shares so that
+// no operation can assemble SQL of its own or forget the marker statement the
+// executor issues after the DDL (FR-PLANFILE-7, G2).
 func preview(n protocol.Node) protocol.Node {
-	n.RenderedSQL = protocol.Preview(&n)
-	stmt, ok, err := protocol.RenderMarkerStatement(&n, protocol.Marker{
-		Run: "pending", Plan: "pending", Op: string(protocol.OpCreateIndex), At: "pending",
-	}, protocol.Marker{}, protocol.MarkerAbsent)
-	if err != nil || !ok {
-		return n
-	}
-	n.RenderedSQL += "\n" + stmt + ";"
-	return n
+	return planner.Preview(n, protocol.OpCreateIndex)
 }
 
 // renderAssertComment previews the precondition node.

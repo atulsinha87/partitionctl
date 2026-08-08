@@ -1031,3 +1031,76 @@ func TestPlanDigestIsStableAcrossRepeatedPlanning(t *testing.T) {
 		}
 	}
 }
+
+// FR-PLAN-5 for the partition PostgreSQL indexed by itself.
+//
+// This is demo.sh's drift step, executed rather than merely planned. Adding a
+// partition to a table that already carries the partitioned index makes the
+// server build the child index immediately, under its own name, and attach it.
+// The partition is done.
+//
+// The planner used to look only under the name it generates, see nothing, and
+// emit create + verify + attach. The CREATE INDEX CONCURRENTLY is hours of
+// wasted work on a real partition; the ATTACH then fails terminally with
+// SQLSTATE 55000, because PostgreSQL permits one attached child index per
+// partition per partitioned index and the slot is already taken. `resume`
+// re-adopted the failed run and hit the same 55000; re-planning emitted a bare
+// attach that failed the same way for ever. Only a human running DROP INDEX
+// cleared the stray duplicate the run left behind.
+func TestPlanEmitsNothingForAPartitionPostgreSQLAlreadyIndexed(t *testing.T) {
+	cat := newCatalog("p1", "p2")
+	cat.indexes[obj(testIndex)] = parentIndexState(true)
+	cat.indexes[child("p1")] = attachedIndex("p1")
+
+	// p2 was added after the parent index existed, so the server named and
+	// attached its child index itself.
+	propagated := attachedIndex("p2")
+	propagated.Name = obj("p2_created_at_idx")
+	propagated.Table = obj("p2")
+	cat.indexes[obj("p2_created_at_idx")] = propagated
+
+	p := mustPlan(t, cat, newSpec())
+
+	for _, id := range []protocol.NodeID{
+		nodeID("create", obj("p2")),
+		nodeID("attach", obj("p2")),
+		nodeID("verify", obj("p2")),
+	} {
+		if hasNode(p, id) {
+			t.Errorf("plan emits %q for a partition PostgreSQL has already indexed and attached; "+
+				"the create is wasted and the attach fails 55000", id)
+		}
+	}
+	for _, n := range p.Nodes {
+		if n.Kind.IssuesDDL() {
+			t.Errorf("plan issues DDL (%s, %s) for a fully converged tree", n.ID, n.Kind)
+		}
+	}
+}
+
+// The same propagated index, but INVALID. It cannot be dropped individually and
+// PostgreSQL has no DETACH, so nothing this planner emits can converge. It must
+// refuse and say why rather than emit a graph that dies on the attach.
+func TestPlanRefusesAnUnusableIndexAttachedUnderAnotherName(t *testing.T) {
+	cat := newCatalog("p1")
+	// The parent is valid: indisvalid on a partitioned index tracks whether
+	// every partition has an attached child index, not whether those children
+	// are usable. So this state is reachable and the parent check passes.
+	cat.indexes[obj(testIndex)] = parentIndexState(true)
+
+	broken := attachedIndex("p1")
+	broken.Name = obj("p1_created_at_idx")
+	broken.Table = obj("p1")
+	broken.IsValid = false
+	cat.indexes[obj("p1_created_at_idx")] = broken
+
+	_, _, err := tryPlan(t, cat, newSpec())
+	if err == nil {
+		t.Fatal("planning succeeded against a partition whose attached child index is unusable")
+	}
+	for _, want := range []string{"p1_created_at_idx", "DETACH PARTITION"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q: %v", want, err)
+		}
+	}
+}

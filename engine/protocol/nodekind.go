@@ -58,15 +58,36 @@ const (
 )
 
 // LockLevel is the heaviest lock a node kind takes on a user relation, as
-// stated in TRD §7.2.2. It exists so `render` and `plan` output can warn the
-// operator (FR-DROP-5); the executor does not act on it.
+// MEASURED in docs/spikes/v0.0-results.md. It exists so `render` and `plan`
+// output can warn the operator (FR-DROP-5); the executor does not act on it.
+//
+// The spike overrides TRD §7.2.2, which this type used to cite. The one value
+// the TRD gets wrong is the one that matters most to an operator: it lists
+// ShareUpdateExclusive for CREATE INDEX ON ONLY <parent>, and PostgreSQL takes
+// ShareLock. The difference is the whole question the operator is asking.
+// ShareUpdateExclusiveLock does not conflict with RowExclusiveLock, so writes
+// continue; ShareLock does, so every INSERT/UPDATE/DELETE routed through the
+// partitioned parent blocks for the duration. Re-measured on PG 17.10: with
+// `BEGIN; CREATE INDEX ot_d_idx ON ONLY ot (d);` open, pg_locks shows ShareLock
+// on ot, and an INSERT through the parent fails on lock_timeout while an INSERT
+// straight into a leaf succeeds.
 type LockLevel string
 
-// The lock levels in the vocabulary.
+// The lock levels in the vocabulary, weakest first.
 const (
-	LockNone                 LockLevel = ""
+	LockNone LockLevel = ""
+
+	// LockShareUpdateExclusive does not conflict with RowExclusiveLock:
+	// reads and writes both continue.
 	LockShareUpdateExclusive LockLevel = "ShareUpdateExclusive"
-	LockAccessExclusive      LockLevel = "AccessExclusive"
+
+	// LockShare conflicts with RowExclusiveLock. Reads continue; every write
+	// to the relation blocks for the duration of the statement, including its
+	// lock_timeout wait.
+	LockShare LockLevel = "Share"
+
+	// LockAccessExclusive conflicts with everything.
+	LockAccessExclusive LockLevel = "AccessExclusive"
 )
 
 // allNodeKinds is the vocabulary in TRD §7.2.2 table order.
@@ -274,11 +295,22 @@ func (k NodeKind) RetrySafe() bool {
 	return false
 }
 
-// LockLevel returns the heaviest lock k takes on a user relation (TRD §7.2.2).
+// LockLevel returns the heaviest lock k takes on a user relation, as measured
+// in docs/spikes/v0.0-results.md.
+//
+// KindIndexAttach stays at ShareUpdateExclusive deliberately, and this is a
+// recorded decision rather than an omission: the spike measured
+// AccessExclusiveLock for an attach, but on the child INDEX, not on a user
+// relation, and a user relation is what this method documents itself as
+// reporting. An operator reading "AccessExclusive" here would schedule around
+// application blocking that does not happen.
 func (k NodeKind) LockLevel() LockLevel {
 	switch k {
-	case KindIndexCreateParentInvalid,
-		KindIndexCreateConcurrently,
+	case KindIndexCreateParentInvalid:
+		// CREATE INDEX ON ONLY <parent>. Measured ShareLock, not the
+		// ShareUpdateExclusive the TRD claims: writes through the parent block.
+		return LockShare
+	case KindIndexCreateConcurrently,
 		KindIndexAttach,
 		KindIndexDropConcurrently,
 		KindIndexReindexConcurrently:

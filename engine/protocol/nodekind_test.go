@@ -17,7 +17,9 @@ func TestNodeKindTable(t *testing.T) {
 		lock             LockLevel
 	}{
 		{KindCatalogAssert, false, false, false, true, LockNone},
-		{KindIndexCreateParentInvalid, false, true, false, true, LockShareUpdateExclusive},
+		// ShareLock, measured, not the TRD's ShareUpdateExclusive: this is the
+		// one kind whose lock blocks application writes through the parent.
+		{KindIndexCreateParentInvalid, false, true, false, true, LockShare},
 		{KindIndexCreateConcurrently, false, true, true, false, LockShareUpdateExclusive},
 		{KindIndexAttach, false, true, false, true, LockShareUpdateExclusive},
 		{KindIndexVerify, false, false, false, true, LockNone},

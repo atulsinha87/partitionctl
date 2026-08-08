@@ -184,7 +184,9 @@ func (a *App) usage() {
 
 const usageText = `partitionctl - partition-aware online schema evolution for PostgreSQL
 
-usage: partitionctl <command> [flags]
+usage: partitionctl <command> [flags] [<plan>]
+
+Flags must come before the positional argument: execute [flags] <plan>
 
 commands:
   plan    --spec <file> -o <plan>   read the catalog and emit a plan artifact
@@ -389,12 +391,29 @@ func loadPlan(path string) (*protocol.Plan, error) {
 }
 
 // requirePositional pulls exactly one positional argument.
+//
+// The len > 1 case is almost always one specific operator mistake, so it is
+// named rather than reported as a count. Go's flag package stops parsing at the
+// first non-flag token, so `partitionctl execute build/migration.plan -driver
+// postgres -state file` leaves all five flag tokens in Args() and the generic
+// message reads "expected exactly one <plan>, got 6" while listing the flags as
+// if they were plan files. That is the exact line `plan` tells the operator to
+// run, with the connection flags they need appended to it.
 func requirePositional(fs *flag.FlagSet, name string) (string, error) {
 	args := fs.Args()
 	if len(args) == 0 {
 		return "", protocol.ErrFailure.Detailf("%s is required", name)
 	}
 	if len(args) > 1 {
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				return "", protocol.ErrFailure.Detailf(
+					"flags must come before %s: got %s. Go's flag parser stops at the first "+
+						"non-flag argument, so everything after %s was treated as another %s. "+
+						"Re-run as: partitionctl <command> [flags] %s",
+					name, strings.Join(args, " "), args[0], name, name)
+			}
+		}
 		return "", protocol.ErrFailure.Detailf(
 			"expected exactly one %s, got %d: %s", name, len(args), strings.Join(args, " "))
 	}

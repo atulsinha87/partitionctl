@@ -439,12 +439,11 @@ func orphanDropNode(o orphan) protocol.Node {
 		Relation: &relation,
 		Reason:   protocol.DropUnattachedOrphan,
 	}
-	return protocol.Node{
-		ID:          orphanNodeID(o.index),
-		Kind:        protocol.KindIndexDropConcurrently,
-		Params:      params,
-		DependsOn:   []protocol.NodeID{nodeAssert},
-		RenderedSQL: renderDropConcurrently(params),
+	return planner.Preview(protocol.Node{
+		ID:        orphanNodeID(o.index),
+		Kind:      protocol.KindIndexDropConcurrently,
+		Params:    params,
+		DependsOn: []protocol.NodeID{nodeAssert},
 		Authorization: &protocol.Authorization{
 			Mode:     protocol.AuthProvenance,
 			Object:   o.index,
@@ -453,7 +452,7 @@ func orphanDropNode(o orphan) protocol.Node {
 				o.verdict.Reason,
 		},
 		EstimatedSeconds: catalogOnlySeconds,
-	}
+	}, protocol.OpDropIndex)
 }
 
 // dropNode is the statement the whole operation exists to gate.
@@ -471,12 +470,11 @@ func dropNode(parent, index protocol.ObjectName, leafCount int, deps []protocol.
 		Index:     index,
 		LeafCount: leafCount,
 	}
-	return protocol.Node{
-		ID:          nodeDrop,
-		Kind:        protocol.KindIndexDropPartitioned,
-		Params:      params,
-		DependsOn:   deps,
-		RenderedSQL: renderDropPartitioned(params),
+	n := planner.Preview(protocol.Node{
+		ID:        nodeDrop,
+		Kind:      protocol.KindIndexDropPartitioned,
+		Params:    params,
+		DependsOn: deps,
 		Authorization: &protocol.Authorization{
 			Mode:                 protocol.AuthExplicit,
 			Object:               index,
@@ -484,12 +482,15 @@ func dropNode(parent, index protocol.ObjectName, leafCount int, deps []protocol.
 			RequiredConfirmation: protocol.ConfirmExclusiveLock,
 			Note: fmt.Sprintf(
 				"the specification names %s and the operator supplied %s at plan time; the statement "+
-					"takes AccessExclusiveLock on %s and all %d leaf partition(s) simultaneously "+
-					"(FR-DROP-3, FR-DROP-4, AC-13)",
+					"takes AccessExclusiveLock on %s and all %d leaf partition(s), one relation at a "+
+					"time and held cumulatively, so blocking begins at the first acquisition and "+
+					"continues through every later wait (FR-DROP-3, FR-DROP-4, AC-13)",
 				index, protocol.ConfirmExclusiveLock, parent, leafCount),
 		},
 		EstimatedSeconds: catalogOnlySeconds,
-	}
+	}, protocol.OpDropIndex)
+	n.RenderedSQL = dropPartitionedPreamble(params) + "\n" + n.RenderedSQL
+	return n
 }
 
 // finalVerifyNode proves the end state: the parent index and every leaf index

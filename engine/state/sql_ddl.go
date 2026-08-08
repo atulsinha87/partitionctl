@@ -13,7 +13,13 @@ const DefaultSchema = "partitionctl"
 // SchemaVersion is the state schema's own version, recorded in the meta table.
 // It is not the plan format version: the two evolve independently, and
 // conflating them would tie a state migration to a plan-format bump.
-const SchemaVersion = "1"
+//
+// Version 2 added node_state.object_schema and node_state.object_name, which is
+// what the claim lookup reads. The row is written with DO UPDATE rather than
+// DO NOTHING so that a schema bootstrapped by a version-1 binary and since
+// upgraded in place reports the version it actually has, not the version it was
+// created at.
+const SchemaVersion = "2"
 
 // ddlTemplates is the bootstrap DDL, with %[1]s standing for the quoted schema
 // name.
@@ -49,7 +55,7 @@ var ddlTemplates = []string{
 )`,
 
 	`INSERT INTO %[1]s.meta (key, value) VALUES ('schema_version', '` + SchemaVersion + `')
-	ON CONFLICT (key) DO NOTHING`,
+	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 
 	`CREATE TABLE IF NOT EXISTS %[1]s.run (
 	run_id text PRIMARY KEY,
@@ -94,6 +100,25 @@ var ddlTemplates = []string{
 	updated_at timestamptz NOT NULL,
 	PRIMARY KEY (run_id, node_id)
 )`,
+
+	// The in-place upgrade from schema version 1.
+	//
+	// CREATE TABLE IF NOT EXISTS is a no-op against a table that already
+	// exists, whatever shape it has, so a schema bootstrapped by a version-1
+	// binary keeps a node_state with no object columns and every later
+	// statement that names them fails. That is not a corner case: it is what
+	// every existing installation looks like on the first run of this binary,
+	// on the default state backend, and the failure is permanent because
+	// bootstrap runs on every process start — `status` included, so an
+	// operator could not even read their own run history (FR-CLI-12, AC-25).
+	//
+	// ADD COLUMN IF NOT EXISTS is idempotent, is one catalog write on a fresh
+	// schema where the columns are already there, and needs no privilege
+	// beyond ownership of a table this package created. It must precede the
+	// index below, which is the statement that would otherwise fail 42703.
+	`ALTER TABLE %[1]s.node_state
+	ADD COLUMN IF NOT EXISTS object_schema text NOT NULL DEFAULT '',
+	ADD COLUMN IF NOT EXISTS object_name text NOT NULL DEFAULT ''`,
 
 	// The claim lookup asks "does any live node record name this object?", so
 	// it reads across runs rather than within one (see ClaimsObject).

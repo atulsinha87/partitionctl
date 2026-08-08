@@ -10,11 +10,13 @@
 // in-memory fakes and no server (HANDOFF §3).
 //
 // The consequence is that this binary connects to nothing until a driver is
-// registered. M1 is standard library only, so this file registers none, and
-// `partitionctl plan` will report that fact with the list of drivers it can see.
-// To produce a connecting binary, add a blank import to this package:
+// registered, and registering one is this file's only job. It registers lib/pq,
+// so `--driver postgres` works out of the box; `partitionctl plan` lists the
+// drivers it can see when asked for one it cannot.
 //
-//	import _ "github.com/lib/pq"              // registers "postgres"
+// To add another, add a blank import below alongside the lib/pq one — for
+// example:
+//
 //	import _ "github.com/jackc/pgx/v5/stdlib" // registers "pgx", needs Go 1.25+
 //
 // and select it with --driver, PARTITIONCTL_DRIVER, or `driver:` in the

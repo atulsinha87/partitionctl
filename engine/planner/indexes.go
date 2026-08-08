@@ -72,6 +72,22 @@ type ChildIndexPlan struct {
 	Existing *Index
 	// Condition classifies Existing. It is [IndexAbsent] when Existing is nil.
 	Condition IndexCondition
+
+	// Attached is an index already attached to the target partitioned index on
+	// this leaf under a name this tool did not generate, or nil.
+	//
+	// PostgreSQL creates and attaches one by itself: adding a partition to a
+	// table that already carries a partitioned index makes the server build the
+	// child index immediately, under its OWN generated name
+	// (orders_2026_01_created_at_idx), and attach it. The partition needs no
+	// work at all. Keying only on this tool's generated name made that index
+	// invisible, so the planner emitted a full CREATE INDEX CONCURRENTLY — hours
+	// on a large partition, plus its write amplification — followed by an ATTACH
+	// that fails terminally with SQLSTATE 55000, because PostgreSQL permits only
+	// one attached child index per (partition, partitioned index) and the slot
+	// is taken. Neither `resume` nor a re-plan could get past it, and each
+	// attempt left another stray marked duplicate index behind.
+	Attached *Index
 }
 
 // Exists reports whether an index already occupies the generated name.
@@ -83,12 +99,37 @@ func (c ChildIndexPlan) AttachedTo(parentIndexOID uint32) bool {
 	return c.Existing != nil && c.Existing.AttachedTo(parentIndexOID)
 }
 
-// Complete reports whether this leaf needs no work at all: a valid index under
-// the generated name, already attached to the parent index. FR-PLAN-5 turns
-// this into "emit no node", which is what makes a plan naturally idempotent and
-// a re-execute a no-op (AC-7).
+// Complete reports whether this leaf needs no work at all: a usable index
+// attached to the parent index, under the generated name or under the name
+// PostgreSQL chose when it propagated the index itself. FR-PLAN-5 turns this
+// into "emit no node", which is what makes a plan naturally idempotent and a
+// re-execute a no-op (AC-7).
 func (c ChildIndexPlan) Complete(parentIndexOID uint32) bool {
-	return c.Condition.Usable() && c.AttachedTo(parentIndexOID)
+	if c.Condition.Usable() && c.AttachedTo(parentIndexOID) {
+		return true
+	}
+	return c.Attached != nil && c.Attached.Condition().Usable() &&
+		c.Attached.AttachedTo(parentIndexOID)
+}
+
+// ForeignAttached returns an index attached to the parent under a name this
+// tool did not generate, when that index is NOT usable.
+//
+// It is separated from [ChildIndexPlan.Complete] because the two need opposite
+// treatment. A usable propagated index means the leaf is done. An unusable one
+// means the slot is occupied by something broken that this tool cannot repair:
+// it cannot be dropped individually (an attached child index is a dependency of
+// its parent, and PostgreSQL offers no ALTER INDEX ... DETACH PARTITION), and
+// anything this planner emits for the leaf would fail 55000 on the attach. That
+// has to be said, not walked into.
+func (c ChildIndexPlan) ForeignAttached(parentIndexOID uint32) (*Index, bool) {
+	if c.Attached == nil || !c.Attached.AttachedTo(parentIndexOID) {
+		return nil, false
+	}
+	if c.Attached.Condition().Usable() {
+		return nil, false
+	}
+	return c.Attached, true
 }
 
 // ChildIndexInspection is the whole-tree answer to "what already exists?".
@@ -187,6 +228,18 @@ func InspectChildren(ctx context.Context, cr CatalogReader, topo Topology, paren
 		if existing, ok := byName[key{leaf.OID, qualified[i].Name}]; ok {
 			c.Existing = existing
 			c.Condition = existing.Condition()
+		}
+		// A child index already attached to the target parent under any other
+		// name. The data needed for this was always in `indexes` -- Index
+		// carries ParentIndexOID -- it was simply never consulted.
+		if parent != nil && (c.Existing == nil || !c.Existing.AttachedTo(parent.OID)) {
+			for j := range indexes {
+				idx := &indexes[j]
+				if idx.TableOID == leaf.OID && idx.AttachedTo(parent.OID) {
+					c.Attached = idx
+					break
+				}
+			}
 		}
 		children[i] = c
 	}

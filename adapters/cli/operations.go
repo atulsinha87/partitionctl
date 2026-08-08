@@ -16,12 +16,33 @@ import (
 // operationRegistry is the whole of the CLI's knowledge of which operations
 // exist (NFR-EXT-1, AC-21).
 //
-// Wiring an operation is: write operations/<op>/, add one entry here. No
-// command is edited, no dispatch switch is extended, no catalog adapter is
-// written, and nothing in engine/ moves. That claim was untestable while one
-// operation existed; with three, the map below is the evidence, and
-// TestEveryOperationIsReachableFromTheRegistry fails if a fourth is declared in
-// the plan format's vocabulary without one.
+// What this map buys, stated as narrowly as it is true: an operation cannot
+// silently inherit another operation's command behaviour. Every way an
+// operation differs from its siblings is a field below, so `verify`, `render`,
+// `execute`, `resume`, `status` and `cancel` contain no per-operation branch at
+// all. TestEveryRegisteredOperationCarriesItsOwnCommandBehaviour
+// (integration_test.go) is the evidence, and it is a real test of that claim.
+//
+// The wider claim this comment used to make -- "wiring an operation is: write
+// operations/<op>/, add one entry here" -- is false, and it cited a test named
+// TestEveryOperationIsReachableFromTheRegistry that has never existed. Wiring
+// reindex-index needed a `ReindexSince` field on the shared
+// planner.Specification (engine/planner/host.go), a `reindex_since` field and
+// its RFC-3339 parsing on the shared SpecFile (adapters/cli/spec.go), and this
+// entry. drop-index separately needed a schema-qualification fix inside
+// planner.Host.Run. So operation #4, if it carries any parameter of its own,
+// edits engine/planner/host.go, adapters/cli/spec.go and this file at minimum,
+// plus engine/protocol/plan.go for the new Operation constant.
+//
+// The honest cost is: a sibling planner package, an entry here, and one field
+// per operation-specific parameter on two shared structs. An operation needing
+// a NEW NODE KIND costs far more than that -- ten switch statements in
+// engine/protocol/nodekind.go plus render, params, executor and authorize --
+// and, per nodekind.go, a PlanFormatVersion bump that invalidates every plan
+// artifact already committed to a repository. The obvious next operations
+// (ATTACH/DETACH PARTITION, ADD COLUMN, ADD CONSTRAINT NOT VALID + VALIDATE)
+// reuse none of the nine index node kinds, so that is the cost that matters for
+// NFR-EXT-1, and it is not what this comment used to describe.
 //
 // "One entry" is the honest unit, not "one line". An operation differs from its
 // siblings in four ways and all four are fields below: which planner to build,

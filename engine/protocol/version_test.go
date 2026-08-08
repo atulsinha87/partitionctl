@@ -68,11 +68,30 @@ func TestSupportedFormatVersions(t *testing.T) {
 
 // The vocabulary is a versioned engine contract (TRD §7.2.2). This test is the
 // tripwire: adding a node kind must be accompanied by a format-version bump.
+//
+// The count is pinned directly. It used to be guarded by
+// `if PlanFormatVersion == 1`, and M1 set PlanFormatVersion = 2, so the test
+// could not fail from that moment on — a tenth kind would have shipped inside
+// format version 2 in total silence. The failure that would then reach an
+// operator is the wrong one: an older binary accepts the plan (2 is a supported
+// version) and dies inside Node.Validate with `"index.detach" is not one of
+// [...]`, which reads as a corrupt plan file rather than "upgrade partitionctl"
+// (NFR-COMPAT-3).
+//
+// Update kindsInCurrentFormat and PlanFormatVersion together, in one change.
 func TestNodeVocabularyIsPinnedToTheFormatVersion(t *testing.T) {
-	const kindsInFormatV1 = 9
-	if PlanFormatVersion == 1 && len(AllNodeKinds()) != kindsInFormatV1 {
-		t.Fatalf("format version 1 defines %d node kinds, found %d. "+
+	const (
+		kindsInCurrentFormat = 9
+		formatForThatCount   = 2
+	)
+	if PlanFormatVersion != formatForThatCount {
+		t.Fatalf("PlanFormatVersion is %d, but this tripwire pins the kind count for format %d. "+
+			"Bumping the format version means re-pinning the count here in the same change",
+			PlanFormatVersion, formatForThatCount)
+	}
+	if len(AllNodeKinds()) != kindsInCurrentFormat {
+		t.Fatalf("format version %d defines %d node kinds, found %d. "+
 			"Adding a kind is a versioned engine change: bump PlanFormatVersion (TRD §7.2.2)",
-			kindsInFormatV1, len(AllNodeKinds()))
+			PlanFormatVersion, kindsInCurrentFormat, len(AllNodeKinds()))
 	}
 }

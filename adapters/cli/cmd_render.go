@@ -93,7 +93,7 @@ func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout, buildLockT
 			fmt.Fprintf(w, "--   estimate %s (FR-PLAN-9; advisory)\n", humanSeconds(n.EstimatedSeconds))
 		}
 		if lock := n.Kind.LockLevel(); lock != protocol.LockNone {
-			fmt.Fprintf(w, "--   lock %s\n", lock)
+			fmt.Fprintf(w, "--   lock %s%s\n", lock, lockScope(n, lock))
 		}
 		if n.Kind.MustRunOutsideTransaction() {
 			fmt.Fprintln(w, "--   MUST NOT run inside a transaction block; PostgreSQL rejects it (FR-EXEC-6)")
@@ -303,6 +303,35 @@ func writeHeader(w *bytes.Buffer, plan *protocol.Plan, kind string, lockTimeout 
 	fmt.Fprintln(w, "SET statement_timeout = 0;  -- index builds legitimately run for hours")
 }
 
+// lockScope says what a lock level is taken ON, and what that costs.
+//
+// A bare level name is not self-explanatory, and for the one AccessExclusive
+// statement in the product it is actively misleading: an operator can read
+// "lock AccessExclusive" above a DROP INDEX as a lock on the index. It is on
+// the parent table and on every leaf partition. The rollback path already
+// spells this out and additionally comments the statement out unless
+// --confirm-exclusive-lock is passed; the forward path emitted it live, ungated,
+// with one word of context, and this is the runbook for the shop that will never
+// see the plan artifact's rendered_sql or the plan command's notes.
+func lockScope(n *protocol.Node, lock protocol.LockLevel) string {
+	switch lock {
+	case protocol.LockAccessExclusive:
+		if p, ok := n.Params.(*protocol.DropPartitionedParams); ok {
+			return fmt.Sprintf(
+				" on %s AND on all %d leaf partition(s), acquired one relation at a time and held\n"+
+					"--   cumulatively. Every read and write against any of them blocks from the first\n"+
+					"--   acquisition onward, including if the statement aborts. lock_timeout bounds each\n"+
+					"--   acquisition separately, so the worst case is about %d x lock_timeout (FR-DROP-5)",
+				p.Parent.Quoted(), p.LeafCount, p.LeafCount+1)
+		}
+		return " — conflicts with every other lock"
+	case protocol.LockShare:
+		return " — conflicts with RowExclusiveLock: every INSERT/UPDATE/DELETE routed through the\n" +
+			"--   partitioned parent blocks for the duration, including the lock_timeout wait"
+	}
+	return ""
+}
+
 // pgDuration renders a duration as a PostgreSQL interval literal.
 //
 // time.Duration.String() is not one. It renders 15 minutes as "15m0s", which
@@ -310,10 +339,21 @@ func writeHeader(w *bytes.Buffer, plan *protocol.Plan, kind string, lockTimeout 
 // "min" — so the runbook's own preamble would have failed to parse the moment
 // anyone passed --lock-timeout 90s. Falling back to milliseconds keeps every
 // value expressible, since ms is lock_timeout's own default unit.
+//
+// A positive sub-millisecond duration floors to 1ms rather than truncating to
+// 0. PostgreSQL reads lock_timeout = '0ms' as DISABLED, so truncation made the
+// runbook emit `SET lock_timeout = '0ms';` directly beneath a preamble stating
+// that "lock_timeout is not optional: without it a statement queues behind a
+// long transaction forever" — asserting a protection it had just switched off,
+// for every CONCURRENTLY statement below it. engine/executor/sqlexec.go floors
+// the same input for the same reason, and the runbook must not disagree with
+// the executor about what a flag value means.
 func pgDuration(d time.Duration) string {
 	switch {
 	case d <= 0:
 		return "0"
+	case d < time.Millisecond:
+		return "1ms"
 	case d%time.Hour == 0:
 		return fmt.Sprintf("%dh", d/time.Hour)
 	case d%time.Minute == 0:

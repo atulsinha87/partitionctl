@@ -487,3 +487,98 @@ func TestInspectChildrenAllowsSameBareNameInDifferentSchemas(t *testing.T) {
 		t.Fatalf("got %d distinct child index names, want 2", len(seen))
 	}
 }
+
+// PostgreSQL propagates a partitioned index to a partition added after the
+// index was built: it creates the child index immediately, under a name it
+// chooses itself (orders_2026_01_created_at_idx), and attaches it. The
+// partition needs no work.
+//
+// Keying only on this tool's generated name made that index invisible, so the
+// leaf read as "needs a build". The plan that followed spent hours on a CREATE
+// INDEX CONCURRENTLY and then failed terminally on ATTACH with SQLSTATE 55000,
+// because a partition may carry only one attached child index per partitioned
+// index. Nothing in the tool could get past it afterwards, and every attempt
+// left another stray duplicate index on the partition.
+func TestInspectChildrenSeesAnIndexPostgreSQLAttachedUnderItsOwnName(t *testing.T) {
+	f := standardTree()
+	topo := mustDiscover(t, f)
+
+	parentIdx := Index{
+		OID: indexBase, Name: name("public", parentIndexName), Kind: RelKindPartitionedIndex,
+		OwnerOID: ownerOID, TableOID: rootOID, Table: name("public", "orders"),
+		IsValid: true, IsReady: true, IsLive: true,
+	}
+	f.AddIndex(parentIdx)
+
+	// The server's own name for the propagated child, which is not the name
+	// protocol.ChildIndexName generates.
+	leaf := topo.Leaves[0]
+	serverChosen := leaf.Name.Name + "_created_at_idx"
+	if serverChosen == protocol.ChildIndexName(parentIndexName, leaf.Name.Name) {
+		t.Fatal("the fixture's server-chosen name collides with the generated one")
+	}
+	propagated := idx(indexBase+50, "public", serverChosen, leaf.OID, leaf.Name.Name, true, true, true)
+	propagated.ParentIndexOID = parentIdx.OID
+	f.AddIndex(propagated)
+
+	in, err := InspectChildren(ctx(), f, topo, name("public", parentIndexName))
+	if err != nil {
+		t.Fatalf("InspectChildren: %v", err)
+	}
+	c := in.Children[0]
+	if c.Exists() {
+		t.Error("the propagated index was matched to the generated child name; it has a different name")
+	}
+	if c.Attached == nil {
+		t.Fatal("InspectChildren did not see the index PostgreSQL attached under its own name")
+	}
+	if c.Attached.Name.Name != serverChosen {
+		t.Errorf("Attached = %s, want %s", c.Attached.Name.Name, serverChosen)
+	}
+	if !c.Complete(in.ParentIndexOID()) {
+		t.Error("the leaf is not reported complete, so a plan would emit a doomed create+attach for it")
+	}
+	if n := in.CompleteCount(); n != 1 {
+		t.Errorf("CompleteCount = %d, want 1", n)
+	}
+	if r := in.Remaining(); len(r) != len(topo.Leaves)-1 {
+		t.Errorf("Remaining = %d leaves, want %d", len(r), len(topo.Leaves)-1)
+	}
+}
+
+// The same propagated index, but broken. It cannot be dropped individually and
+// there is no DETACH, so the leaf is neither complete nor plannable: it has to
+// be reported, not walked into.
+func TestInspectChildrenReportsAnUnusableForeignAttachedIndex(t *testing.T) {
+	f := standardTree()
+	topo := mustDiscover(t, f)
+
+	parentIdx := Index{
+		OID: indexBase, Name: name("public", parentIndexName), Kind: RelKindPartitionedIndex,
+		OwnerOID: ownerOID, TableOID: rootOID, Table: name("public", "orders"),
+		IsValid: false, IsReady: true, IsLive: true,
+	}
+	f.AddIndex(parentIdx)
+
+	leaf := topo.Leaves[0]
+	propagated := idx(indexBase+50, "public", leaf.Name.Name+"_created_at_idx",
+		leaf.OID, leaf.Name.Name, false, true, true)
+	propagated.ParentIndexOID = parentIdx.OID
+	f.AddIndex(propagated)
+
+	in, err := InspectChildren(ctx(), f, topo, name("public", parentIndexName))
+	if err != nil {
+		t.Fatalf("InspectChildren: %v", err)
+	}
+	c := in.Children[0]
+	if c.Complete(in.ParentIndexOID()) {
+		t.Error("an unusable attached index must not read as complete")
+	}
+	got, ok := c.ForeignAttached(in.ParentIndexOID())
+	if !ok {
+		t.Fatal("ForeignAttached did not report the unusable attached index")
+	}
+	if got.Name.Name != propagated.Name.Name {
+		t.Errorf("ForeignAttached = %s, want %s", got.Name.Name, propagated.Name.Name)
+	}
+}

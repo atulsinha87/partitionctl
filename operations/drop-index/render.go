@@ -21,22 +21,35 @@ func renderAssertComment(n int) string {
 			"index is partitioned, index is not constraint-backed)", n)
 }
 
-// renderDropConcurrently previews the online removal of one unattached orphan
-// leaf index. Unattached is what makes it online: an attached child index is a
-// dependency of its partitioned parent and DROP INDEX CONCURRENTLY is rejected
-// on it.
-func renderDropConcurrently(p *protocol.DropConcurrentlyParams) string {
-	return "DROP INDEX CONCURRENTLY " + p.Index.Quoted() + ";"
-}
-
-// renderDropPartitioned previews the one statement the operation is gated on,
-// with the lock it takes stated above it (FR-DROP-5).
-func renderDropPartitioned(p *protocol.DropPartitionedParams) string {
+// dropPartitionedPreamble is the FR-DROP-5 blast-radius disclosure that sits
+// above the one statement this operation is gated on. The statement itself is
+// rendered by [planner.Preview] from the node's params, so only the comment is
+// assembled here.
+//
+// The wording is measured, not inferred. PostgreSQL acquires the
+// AccessExclusiveLocks one relation at a time and holds each one while it waits
+// for the next, so blocking starts at the first acquisition and continues
+// through every subsequent wait — including on the path where the statement
+// ultimately aborts having changed nothing. Observed on PG 17.10: with a
+// session holding AccessShareLock on the LAST partition, pg_locks shows the
+// dropping backend already granted AccessExclusiveLock on the parent and every
+// earlier partition while it is still merely waiting, and reads against those
+// earlier partitions time out.
+//
+// lock_timeout bounds each acquisition attempt separately, not the statement,
+// so the worst case per attempt is about (leafCount + 1) x lock_timeout of
+// escalating tree-wide blocking. The texts used to say the locks were "taken
+// simultaneously" and held "until it commits", which reads as a single bounded
+// stall that either succeeds or vanishes.
+func dropPartitionedPreamble(p *protocol.DropPartitionedParams) string {
 	return fmt.Sprintf(
-		"-- AccessExclusiveLock on %s and on all %d leaf partition(s), taken simultaneously (FR-DROP-5)\n"+
-			"-- Not online: PostgreSQL rejects DROP INDEX CONCURRENTLY on a partitioned index (TRD §7.2.10)\n"+
-			"DROP INDEX %s;",
-		p.Parent.Quoted(), p.LeafCount, p.Index.Quoted())
+		"-- AccessExclusiveLock on %s and on all %d leaf partition(s), acquired one relation at a\n"+
+			"-- time and held cumulatively: blocking begins at the first acquisition and continues\n"+
+			"-- through every later wait, including if the statement aborts (FR-DROP-5).\n"+
+			"-- lock_timeout bounds each acquisition separately, so the worst case per attempt is\n"+
+			"-- about %d x lock_timeout, and each retry repeats the whole escalation.\n"+
+			"-- Not online: PostgreSQL rejects DROP INDEX CONCURRENTLY on a partitioned index (TRD §7.2.10)",
+		p.Parent.Quoted(), p.LeafCount, p.LeafCount+1)
 }
 
 // renderFinalVerifyComment previews the terminal verification.

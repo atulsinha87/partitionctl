@@ -249,8 +249,9 @@ func (a *App) cleanup(
 					return planner.ErrForeignInvalidIndex.Detailf(
 						"%s on %s is %s: %s. Halting rather than dropping it: an index this tool cannot "+
 							"prove it created is never destroyed (FR-PLAN-7, AC-6, NFR-REL-3). Resolve it "+
-							"by hand, then resume again",
-						child.ChildIndex, child.Leaf.Name, child.Condition, verdict.Reason)
+							"by hand, then resume again%s",
+						child.ChildIndex, child.Leaf.Name, child.Condition, verdict.Reason,
+						a.legacyProvenanceHint(cfg, plan, child.ChildIndex))
 				}
 				return err
 			}
@@ -481,4 +482,35 @@ func (a *App) adopt(
 		SQL:      protocol.RenderComment(object, text),
 		Settings: executor.SessionSettings{LockTimeout: cfg.LockTimeout},
 	})
+}
+
+// legacyProvenanceHint appends an explanation when the halt above is caused by
+// the version-1 -> version-2 provenance change rather than by a genuinely
+// foreign index.
+//
+// It returns "" whenever there is nothing to say, so the halt message is
+// unchanged for every operator who never ran a version-1 binary.
+//
+// The sentence it adds is the difference between "go and fix this by hand" and
+// "the tool changed how it proves ownership, here is the record it can see and
+// no longer honours". The record is NOT treated as authorization: a side-table
+// record outlives the object it names, so honouring one would authorize
+// destroying a same-named index somebody else created later, which is the hole
+// (AC-6, NFR-REL-3) that moving the marker onto the object was made to close.
+func (a *App) legacyProvenanceHint(cfg Config, plan *protocol.Plan, object protocol.ObjectName) string {
+	if cfg.State != StateFile {
+		return ""
+	}
+	runID, ok := state.LegacyProvenanceRun(cfg.StateDir, plan.Target.Database, object)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(
+		". NOTE: run %s holds a schema-version-1 provenance record naming this exact index, in %s. "+
+			"This build no longer reads those records: ownership is proved by the PartitionCTL marker "+
+			"on the object (COMMENT ON INDEX), or by a live claim from a node record naming it, and a "+
+			"version-1 binary wrote neither. If that record is the proof you expected this command to "+
+			"use, the index is almost certainly yours to drop -- but this build will not decide that "+
+			"for you. Drop it by hand, then resume again",
+		runID, cfg.StateDir)
 }

@@ -37,9 +37,11 @@ type Planner struct {
 	// The zero value reindexes every leaf, because an operator who asked for a
 	// reindex asked for a reindex.
 	//
-	// It lives here rather than on [planner.Specification] because the
-	// Specification has no reindex_since field today; see the package README
-	// note in the M3 handoff.
+	// It is set from [planner.Specification.ReindexSince], which the CLI
+	// parses from the spec file's `reindex_since` as RFC 3339 and passes to
+	// the constructor in the operation registry. The field is duplicated here
+	// rather than read from the Request because a planner may carry per-run
+	// configuration and the registry builds one planner per invocation.
 	ReindexSince time.Time
 }
 
@@ -511,11 +513,10 @@ func dropLeftoverNode(req planner.Request, leaf planner.Relation, leftover plann
 		Relation: &relation,
 		Reason:   reason,
 	}
-	return protocol.Node{
-		ID:          nodeID("drop", leftover.Name),
-		Kind:        protocol.KindIndexDropConcurrently,
-		Params:      params,
-		RenderedSQL: renderDropConcurrently(params),
+	return planner.Preview(protocol.Node{
+		ID:     nodeID("drop", leftover.Name),
+		Kind:   protocol.KindIndexDropConcurrently,
+		Params: params,
 		Authorization: &protocol.Authorization{
 			Mode:     protocol.AuthLeftover,
 			Object:   leftover.Name,
@@ -523,7 +524,7 @@ func dropLeftoverNode(req planner.Request, leaf planner.Relation, leftover plann
 			Note:     note,
 		},
 		EstimatedSeconds: req.Estimator.CatalogNodeSeconds(),
-	}
+	}, protocol.OpReindexIndex)
 }
 
 // reindexNode rebuilds one leaf index. This is the node that runs for hours: it
@@ -539,13 +540,12 @@ func reindexNode(req planner.Request, lp leafPlan, parentIndex protocol.ObjectNa
 		ParentIndex:        &pi,
 		EstimatedPeakBytes: req.Estimator.ReindexPeakBytes(lp.child.RelPages),
 	}
-	return protocol.Node{
+	return planner.Preview(protocol.Node{
 		ID:               nodeID("reindex", lp.leaf.Name),
 		Kind:             protocol.KindIndexReindexConcurrently,
 		Params:           params,
-		RenderedSQL:      renderReindexConcurrently(params),
 		EstimatedSeconds: req.Estimator.ReindexSeconds(lp.leaf.RelPages),
-	}
+	}, protocol.OpReindexIndex)
 }
 
 // leafVerifyNode checks the rebuilt leaf index immediately, before the run moves

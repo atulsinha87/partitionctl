@@ -218,8 +218,30 @@ func leafChain(
 	parentOID := insp.ParentIndexOID()
 	leaf, child := c.Leaf.Name, c.ChildIndex
 
+	// Asked before the generated name is consulted at all, because the answer
+	// can be yes while that name is free. PostgreSQL propagates and attaches a
+	// child index by itself when a partition is added to a table that already
+	// carries the partitioned index, using its own name. That leaf is done
+	// (FR-PLAN-5: emit no node). Building our own index for it and attaching it
+	// cannot work -- one attached child index per (partition, partitioned
+	// index) -- so the alternative to this check is hours of CREATE INDEX
+	// CONCURRENTLY followed by a terminal SQLSTATE 55000 that no resume or
+	// re-plan can get past.
+	if c.Complete(parentOID) {
+		return nil, nil
+	}
+	if foreign, ok := c.ForeignAttached(parentOID); ok {
+		return nil, protocol.ErrFailure.Detailf(
+			"partition %s already has %s attached to %s, and it is %s. PostgreSQL allows only one "+
+				"attached child index per partition per partitioned index and offers no ALTER INDEX ... "+
+				"DETACH PARTITION (TRD §7.2.10), so no plan this tool can emit will fix it: %s would "+
+				"fail on the attach. This needs manual repair before planning",
+			leaf, foreign.Name, parentIndex, foreign.Condition(), child)
+	}
+
 	needDrop := false
 	needCreate := true
+	var dropVerdict protocol.DropVerdict
 
 	if c.Exists() {
 		st := c.Existing
@@ -257,7 +279,7 @@ func leafChain(
 		default:
 			// Unattached wreckage of an interrupted CREATE INDEX CONCURRENTLY.
 			// Droppable online, but only with proof we created it.
-			decision, _, err := planner.DecideCleanup(ctx, req.Catalog, req.Claims, c)
+			decision, v, err := planner.DecideCleanup(ctx, req.Catalog, req.Claims, c)
 			if err != nil {
 				return nil, err
 			}
@@ -267,6 +289,7 @@ func leafChain(
 					child, leaf, st.Condition())
 			}
 			needDrop = true
+			dropVerdict = v
 		}
 	}
 
@@ -279,13 +302,27 @@ func leafChain(
 	}
 
 	if needDrop {
-		add(dropNode(req, leaf, child))
+		add(dropNode(req, leaf, child, dropVerdict))
 	}
 	if needCreate {
 		add(createNode(req, leaf, child, parentIndex))
 	}
 	add(leafVerifyNode(leaf, child))
 	add(attachNode(req, leaf, child, parentIndex))
+	// NOTE: this is emitted unconditionally, so a plan with pace_seconds = 0
+	// still carries one wait node per leaf with seconds = 0 and rendered_sql
+	// "-- no pause". TestPlanEmitsWaitNodesEvenWithZeroPacing pins that on
+	// purpose ("the graph's shape must not depend on pacing").
+	//
+	// reindex-index does the opposite: operations/reindex-index/planner.go
+	// gates the same node on `req.Spec.PaceSeconds > 0`. Both cannot be right,
+	// and the disagreement is visible to an operator as a step count -- a
+	// 12-leaf create-index reports 51 nodes of which 12 do nothing, while the
+	// same table reindexed reports a count with none. Resolving it means either
+	// gating here (honest count, graph shape varies with pacing) or removing
+	// the gate there (stable shape, inert nodes). That is an owner decision
+	// about the plan graph, not an integration repair, and it is deferred as
+	// one rather than settled by whichever file was edited last.
 	add(waitNode(req, leaf))
 	return chain, nil
 }
@@ -396,7 +433,7 @@ func parentIndexNode(req planner.Request, parent, parentIndex protocol.ObjectNam
 // proposal only: the executor re-evaluates it against live state immediately
 // before dispatch and halts if it is unsatisfied, whatever the plan asserts
 // (FR-AUTH-5, INV-2).
-func dropNode(req planner.Request, leaf, child protocol.ObjectName) protocol.Node {
+func dropNode(req planner.Request, leaf, child protocol.ObjectName, verdict protocol.DropVerdict) protocol.Node {
 	relation := leaf
 	n := preview(protocol.Node{
 		ID:   nodeID("drop", leaf),
@@ -408,12 +445,22 @@ func dropNode(req planner.Request, leaf, child protocol.ObjectName) protocol.Nod
 		},
 		EstimatedSeconds: req.Estimator.CatalogNodeSeconds(),
 	})
+	// The note carries the verdict this object actually got, not a fixed
+	// sentence. The two verdicts are not interchangeable to a reviewer: a
+	// marker on the object is standing proof, while a live claim is evidence
+	// held by an interrupted run, and `execute` refuses the second — only
+	// `resume` may act on it (FR-CLI-9). Printing "carrying PartitionCTL's
+	// ownership marker" for both named evidence that was not there, in the
+	// artifact FR-PLANFILE/AC-2 exist to have a human approve.
+	note := "an unusable index left by an interrupted CREATE INDEX CONCURRENTLY; " + verdict.Reason
+	if verdict.Reason == "" {
+		note = "an unusable index left by an interrupted CREATE INDEX CONCURRENTLY (FR-PLAN-6, AC-5)"
+	}
 	n.Authorization = &protocol.Authorization{
 		Mode:     protocol.AuthProvenance,
 		Object:   child,
 		Relation: &relation,
-		Note: "an unusable index left by an interrupted CREATE INDEX CONCURRENTLY, " +
-			"carrying PartitionCTL's ownership marker (FR-PLAN-6, AC-5)",
+		Note:     note,
 	}
 	return n
 }
@@ -550,12 +597,23 @@ func notes(leaves, builds, drops int, hasDDL bool) []string {
 	out := []string{
 		fmt.Sprintf("%d leaf partition(s) discovered; %d index build(s) remain, %d already complete (FR-PLAN-5)",
 			leaves, builds, leaves-builds),
-		"the parent index is INVALID for the whole build; PostgreSQL marks it valid on the final attach",
+	}
+	// Only while something is actually being built. Emitted unconditionally it
+	// contradicted the line above it on a converged tree -- "0 index build(s)
+	// remain" followed by "the parent index is INVALID" -- while the catalog
+	// said indisvalid = t.
+	if builds > 0 {
+		out = append(out,
+			"the parent index is INVALID for the duration of the remaining build(s); "+
+				"PostgreSQL marks it valid on the final attach")
 	}
 	if drops > 0 {
 		out = append(out, fmt.Sprintf(
-			"%d unusable index(es) will be dropped first, each authorized by the PartitionCTL ownership "+
-				"marker on the object itself, re-read at dispatch (FR-PLAN-6, FR-AUTH-5, AC-5)", drops))
+			"%d unusable index(es) will be dropped first. Each drop node states its own evidence in "+
+				"its authorization note, and every decision is re-evaluated against live state at "+
+				"dispatch (FR-PLAN-6, FR-AUTH-5, AC-5). A drop authorized only by an interrupted run's "+
+				"live claim rather than by a marker on the object is `resume`'s to perform: `execute` "+
+				"refuses it (FR-CLI-9)", drops))
 	}
 	out = append(out,
 		"every index this run creates is stamped with a PartitionCTL ownership marker "+

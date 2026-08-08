@@ -9,16 +9,16 @@ import (
 // The renderers here produce Node.RenderedSQL: the preview a reviewer reads in
 // the plan file. The executor re-renders from Params at dispatch and ignores
 // these strings (FR-PLANFILE-7), so they are documentation, not instructions.
-// They are kept byte-identical to engine/executor/render.go for the two kinds
-// that issue DDL, and a comment is used for the kinds that issue none.
-
-func renderReindexConcurrently(p *protocol.ReindexConcurrentlyParams) string {
-	return "REINDEX INDEX CONCURRENTLY " + p.Index.Quoted() + ";"
-}
-
-func renderDropConcurrently(p *protocol.DropConcurrentlyParams) string {
-	return "DROP INDEX CONCURRENTLY " + p.Index.Quoted() + ";"
-}
+//
+// The kinds that issue DDL do not appear here at all. They go through
+// [planner.Preview], which renders from the same function the executor sends
+// from and appends the ownership-marker COMMENT the executor issues after it.
+// Hand-written copies used to live here and claimed to be "kept byte-identical
+// to engine/executor/render.go"; that file no longer holds any SQL, and the
+// copy for index.reindex_concurrently silently dropped the marker statement, so
+// a reviewer approving a 12-partition reindex never saw the 12 COMMENT
+// statements that rewrite provenance on production indexes. The kinds that
+// issue no DDL keep their comment previews below.
 
 func renderAssertComment(n int) string {
 	return fmt.Sprintf(

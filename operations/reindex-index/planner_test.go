@@ -286,8 +286,30 @@ func TestReindexNodeCarriesRelationParentAndPeakStorage(t *testing.T) {
 	if n.Authorization != nil {
 		t.Errorf("a reindex is not destructive and must carry no authorization; got %+v", n.Authorization)
 	}
-	if want := "REINDEX INDEX CONCURRENTLY " + leafIndexName(4).Quoted() + ";"; n.RenderedSQL != want {
-		t.Errorf("rendered_sql = %q, want %q", n.RenderedSQL, want)
+	if want := "REINDEX INDEX CONCURRENTLY " + leafIndexName(4).Quoted() + ";"; !strings.HasPrefix(n.RenderedSQL, want) {
+		t.Errorf("rendered_sql = %q, want it to start with %q", n.RenderedSQL, want)
+	}
+}
+
+// The plan artifact is the thing a human approves, and approval has to cover
+// every statement the executor will send. index.reindex_concurrently writes an
+// ownership marker after its DDL — a COMMENT that mutates catalog metadata the
+// destructive-action table later reads as proof of ownership — and the preview
+// used to show only the REINDEX. On the 12-partition fixture that hid 12
+// catalog-mutating statements from the reviewer.
+func TestReindexRenderedSQLShowsTheOwnershipMarkerStatement(t *testing.T) {
+	out := mustRun(t, New(), fixture(t, 12), spec())
+
+	for i := 1; i <= 12; i++ {
+		n := nodeByID(t, out.Plan, nodeID("reindex", leafName(i)))
+		if !n.Kind.ClaimsOwnership() {
+			t.Fatalf("%s no longer claims ownership; this test is asserting the wrong thing", n.Kind)
+		}
+		want := "COMMENT ON INDEX " + leafIndexName(i).Quoted()
+		if !strings.Contains(n.RenderedSQL, want) {
+			t.Errorf("leaf %d rendered_sql does not show the marker statement the executor issues.\n"+
+				"want a line containing %q\ngot:\n%s", i, want, n.RenderedSQL)
+		}
 	}
 }
 
