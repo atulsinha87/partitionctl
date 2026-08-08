@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.atulsinha87</groupId>
+  <artifactId>liquibase-partitionctl</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>liquibase-partitionctl</name>
+  <description>Liquibase extension that creates indexes on partitioned PostgreSQL tables without
+    blocking writes, by discovering the partition tree from the live catalog and driving
+    CREATE INDEX CONCURRENTLY + ALTER INDEX ... ATTACH PARTITION per leaf.</description>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+
+  <properties>
+    <maven.compiler.release>8</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- API verified byte-identical across 4.0.0 -> 5.0.3; pinned for the build only. -->
+    <liquibase.version>4.33.0</liquibase.version>
+    <junit.version>5.8.2</junit.version>
+  </properties>
+
+  <dependencies>
+    <!--
+      PROVIDED, and it must stay provided. The host (Liquibase CLI, the maven plugin,
+      Spring Boot, ...) already has liquibase-core on the classpath. Shipping it would
+      let the jar override the host's own version. `unzip -l` on the built jar must
+      show zero liquibase/** entries.
+    -->
+    <dependency>
+      <groupId>org.liquibase</groupId>
+      <artifactId>liquibase-core</artifactId>
+      <version>${liquibase.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

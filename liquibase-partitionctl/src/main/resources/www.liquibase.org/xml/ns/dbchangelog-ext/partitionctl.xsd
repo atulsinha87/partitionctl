@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  partitionctl Liquibase extension schema.
+
+  Liquibase strips the protocol from the xsi:schemaLocation URL and resolves the
+  remainder as a CLASSPATH RESOURCE, so this file must live in the jar at exactly
+  www/liquibase/org/... that is, www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd.
+  Nothing is ever fetched over the network.
+
+  Attribute names here must match the Java property names EXACTLY. A mismatch binds to
+  null SILENTLY, with no error of any kind. XsdBindingTest fails the build on a mismatch.
+-->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            targetNamespace="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+            xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+            elementFormDefault="qualified">
+
+    <xsd:element name="createPartitionedTableIndex">
+        <xsd:complexType>
+            <!--
+              An xsd:choice, not a single wildcard, so BOTH child forms parse:
+
+                <ext:column .../>   our own namespace, declared explicitly below
+                <column .../>       unprefixed, so it lands in the dbchangelog namespace and
+                                    is matched by the ##other wildcard
+
+              processContents="strict" is deliberate and sufficient: the validator resolves
+              `column` from the dbchangelog schema the changelog already declares in its own
+              xsi:schemaLocation. No xsd:import, so the jar is not coupled to one Liquibase
+              version, and a misspelled element name is still rejected at parse time
+              ("The matching wildcard is strict, but no declaration can be found for element
+              'colum'"). lax would silently accept the misspelling and leave it to the Java
+              validate() backstop.
+            -->
+            <xsd:choice minOccurs="1" maxOccurs="unbounded">
+                <xsd:element name="column">
+                    <xsd:complexType>
+                        <xsd:attribute name="name" type="xsd:string" use="required"/>
+                        <xsd:attribute name="descending" type="xsd:boolean" use="optional"/>
+                    </xsd:complexType>
+                </xsd:element>
+                <xsd:any namespace="##other" processContents="strict"/>
+            </xsd:choice>
+
+            <xsd:attribute name="schemaName" type="xsd:string" use="required"/>
+            <xsd:attribute name="tableName" type="xsd:string" use="required"/>
+            <xsd:attribute name="indexName" type="xsd:string" use="required"/>
+            <!-- lock_timeout for the concurrent index builds. Default 15min. -->
+            <xsd:attribute name="lockTimeout" type="xsd:string" use="optional"/>
+            <!-- lock_timeout for ALTER INDEX ... ATTACH PARTITION. Default 30s. -->
+            <xsd:attribute name="attachLockTimeout" type="xsd:string" use="optional"/>
+            <!-- seconds to sleep between leaf partitions. Default none. -->
+            <xsd:attribute name="paceSeconds" type="xsd:integer" use="optional"/>
+        </xsd:complexType>
+    </xsd:element>
+
+    <xsd:element name="partitionctlIndexGate">
+        <xsd:complexType>
+            <xsd:attribute name="schema" type="xsd:string" use="required"/>
+            <xsd:attribute name="table" type="xsd:string" use="required"/>
+            <xsd:attribute name="index" type="xsd:string" use="required"/>
+        </xsd:complexType>
+    </xsd:element>
+
+</xsd:schema>

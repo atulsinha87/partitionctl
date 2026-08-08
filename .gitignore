@@ -13,3 +13,6 @@ build/
 partitionctl.yaml
 
 .DS_Store
+
+# Maven build output.
+target/
