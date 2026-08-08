@@ -251,9 +251,20 @@ func (f *FakeCatalog) IndexesOnRelations(ctx context.Context, tableOIDs []uint32
 	}
 	var out []Index
 	for _, idx := range f.Indexes {
-		if _, ok := want[idx.TableOID]; ok {
-			out = append(out, idx)
+		if _, ok := want[idx.TableOID]; !ok {
+			continue
 		}
+		// The real reader joins obj_description into the same row, so a comment
+		// set through Comment or Mark has to ride along here too. Without this
+		// the batched path — the one every planner actually uses — would never
+		// see a marker, and a test that called Mark would silently be testing
+		// nothing (NFR-PERF-1 is why the marker travels with the index state).
+		if idx.Comment == "" {
+			if c, ok := f.Comments[idx.Name.String()]; ok {
+				idx.Comment = c
+			}
+		}
+		out = append(out, idx)
 	}
 	sortIndexes(out)
 	return out, nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/atulsinha/partitionctl/engine/planner"
 	"github.com/atulsinha/partitionctl/engine/protocol"
@@ -73,6 +74,12 @@ type SpecFile struct {
 	// PaceReason is the operator-facing explanation recorded on each wait node.
 	PaceReason string `json:"pace_reason,omitempty"`
 
+	// ReindexSince is reindex-index's watermark, as an RFC 3339 instant. A leaf
+	// whose index records a PartitionCTL rebuild at or after it is skipped
+	// (FR-PLAN-5), which is what makes a 400-partition reindex resumable across
+	// days. Empty rebuilds every leaf.
+	ReindexSince string `json:"reindex_since,omitempty"`
+
 	// ConfirmExclusiveLock acknowledges that the operation takes an
 	// AccessExclusiveLock on the parent and every leaf. DropPartitionedIndex
 	// requires it and the plan records that it was given (FR-DROP-3, AC-13).
@@ -136,6 +143,14 @@ func (s SpecFile) Specification(actor string, now protocol.Timestamp) (planner.S
 		PaceSeconds: s.PaceSeconds,
 		PaceReason:  s.PaceReason,
 		Actor:       actor,
+	}
+	if since := strings.TrimSpace(s.ReindexSince); since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return planner.Specification{}, protocol.ErrFailure.Detailf(
+				"specification: reindex_since %q is not an RFC 3339 instant: %v", since, err)
+		}
+		spec.ReindexSince = t
 	}
 	if s.ConfirmExclusiveLock {
 		spec.Confirmations = append(spec.Confirmations, protocol.Confirmation{

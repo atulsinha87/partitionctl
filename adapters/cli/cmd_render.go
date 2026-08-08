@@ -33,8 +33,11 @@ func (a *App) cmdRender(ctx context.Context, args []string) error {
 		"acknowledge that the unwind's final statement takes an AccessExclusiveLock on the parent "+
 			"and every leaf; without it that statement is emitted commented out (TRD §13.2.1)")
 	out := fs.String("o", "", "write to this file instead of stdout")
-	lockTimeout := fs.Duration("lock-timeout", 5*time.Second,
-		"lock_timeout to set in the runbook's session preamble")
+	lockTimeout := fs.Duration("lock-timeout", executor.DefaultLockTimeout,
+		"lock_timeout for the runbook's ordinary DDL statements")
+	buildLockTimeout := fs.Duration("build-lock-timeout", executor.DefaultBuildLockTimeout,
+		"lock_timeout for the CONCURRENTLY statements, which wait on concurrent transactions "+
+			"throughout and not merely to acquire (FR-EXEC-5)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -55,7 +58,7 @@ func (a *App) cmdRender(ctx context.Context, args []string) error {
 	if *rollback {
 		err = renderRollback(&buf, plan, *confirm, *lockTimeout)
 	} else {
-		err = renderForward(&buf, plan, *lockTimeout)
+		err = renderForward(&buf, plan, *lockTimeout, *buildLockTimeout)
 	}
 	if err != nil {
 		return err
@@ -73,7 +76,7 @@ func (a *App) cmdRender(ctx context.Context, args []string) error {
 }
 
 // renderForward emits the runbook that reaches the plan's end state.
-func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout time.Duration) error {
+func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout, buildLockTimeout time.Duration) error {
 	order, err := plan.TopologicalOrder()
 	if err != nil {
 		return err
@@ -113,7 +116,31 @@ func renderForward(w *bytes.Buffer, plan *protocol.Plan, lockTimeout time.Durati
 			fmt.Fprintf(w, "--   no statement: %s\n", describeNonDDL(n))
 			continue
 		}
+
+		// A CONCURRENTLY statement needs the long lock_timeout, and it needs it
+		// here rather than in the preamble. lock_timeout does not bound only the
+		// initial acquisition: each of the wait-for-lockers phases *inside* the
+		// statement is subject to it too, and each waits for every transaction
+		// that touched the relation to finish. Under the preamble's 5s, one
+		// six-second application transaction aborts a build that has already
+		// scanned the whole partition, with 55P03, leaving a _ccnew behind.
+		//
+		// The executor learned this and switches on exactly this predicate
+		// (engine/executor/executor.go, cfg.BuildLockTimeout). The runbook is
+		// the documented offline path — the whole story for a shop that will not
+		// run a Go binary against production — and it was still shipping the
+		// short value over every REINDEX and CREATE INDEX CONCURRENTLY in the
+		// file. Sharing the predicate is what stops the two drifting apart.
+		concurrent := n.Kind.WaitsForConcurrentTransactions()
+		if concurrent {
+			fmt.Fprintf(w, "--   this statement waits on concurrent transactions throughout, not just to acquire:\n")
+			fmt.Fprintf(w, "SET lock_timeout = %s;\n", sqlLiteral(pgDuration(buildLockTimeout)))
+		}
 		fmt.Fprintf(w, "%s;\n", sql)
+		if concurrent {
+			fmt.Fprintf(w, "SET lock_timeout = %s;  -- back to the ordinary value\n",
+				sqlLiteral(pgDuration(lockTimeout)))
+		}
 
 		// TRD §14.2: the runbook must reach the same catalog state the engine
 		// would. That includes the ownership marker, or an operator who ran the
@@ -153,7 +180,31 @@ func manualMarker(plan *protocol.Plan) protocol.Marker {
 	}
 }
 
-// renderRollback emits the unwind runbook (TRD §13.2, §13.2.1).
+// renderRollback selects the unwind for the plan's operation, or refuses.
+//
+// The refusal is the feature. Before this dispatch existed there was one body,
+// written for create-index, that every plan reached: `render --rollback` on a
+// reindex plan emitted `DROP INDEX "public"."orders_created_at_idx";` as "the
+// unwind", destroying a production index the run never created, and on a drop
+// plan it emitted the same statement as the rollback of dropping that very
+// index. Both then advised confirming success with `verify --expect-absent`.
+func renderRollback(w *bytes.Buffer, plan *protocol.Plan, confirmed bool, lockTimeout time.Duration) error {
+	entry, ok := operationRegistry[plan.Operation]
+	if ok && entry.Rollback != nil {
+		return entry.Rollback(w, plan, confirmed, lockTimeout)
+	}
+	if reason, known := rollbackUnsupported[plan.Operation]; known {
+		return protocol.ErrFailure.Detailf(
+			"%s has no unwind runbook: %s.\n"+
+				"To see what this plan does, drop the --rollback flag", plan.Operation, reason)
+	}
+	return protocol.ErrFailure.Detailf(
+		"this build has no unwind runbook for operation %q, and will not guess one: "+
+			"an unwind emitted from the wrong operation's assumptions is a destructive statement "+
+			"presented as a safety measure", plan.Operation)
+}
+
+// renderRollbackCreate emits CreatePartitionedIndex's unwind (TRD §13.2, §13.2.1).
 //
 // Unwinding a partial create is only partially online, and the reason is two
 // PostgreSQL restrictions with no workaround: DROP INDEX CONCURRENTLY cannot be
@@ -170,7 +221,7 @@ func manualMarker(plan *protocol.Plan) protocol.Marker {
 // The second statement is gated. Without --confirm-exclusive-lock it is emitted
 // commented out, because an operator should never reach an AccessExclusiveLock
 // on their largest table by copying a block of text (TRD §13.2.1).
-func renderRollback(w *bytes.Buffer, plan *protocol.Plan, confirmed bool, lockTimeout time.Duration) error {
+func renderRollbackCreate(w *bytes.Buffer, plan *protocol.Plan, confirmed bool, lockTimeout time.Duration) error {
 	if plan.Target.Index == nil {
 		return protocol.ErrFailure.Detailf("this plan's target names no index, so there is nothing to unwind")
 	}
@@ -246,9 +297,32 @@ func writeHeader(w *bytes.Buffer, plan *protocol.Plan, kind string, lockTimeout 
 	fmt.Fprintln(w, "--")
 	fmt.Fprintln(w, "-- Every statement below assumes this session preamble. lock_timeout is not")
 	fmt.Fprintln(w, "-- optional: without it a statement queues behind a long transaction forever")
-	fmt.Fprintln(w, "-- and blocks everything behind it (FR-EXEC-5).")
-	fmt.Fprintf(w, "SET lock_timeout = %s;\n", sqlLiteral(lockTimeout.String()))
+	fmt.Fprintln(w, "-- and blocks everything behind it (FR-EXEC-5). This is the ordinary value;")
+	fmt.Fprintln(w, "-- the CONCURRENTLY statements raise it around themselves and restore it after.")
+	fmt.Fprintf(w, "SET lock_timeout = %s;\n", sqlLiteral(pgDuration(lockTimeout)))
 	fmt.Fprintln(w, "SET statement_timeout = 0;  -- index builds legitimately run for hours")
+}
+
+// pgDuration renders a duration as a PostgreSQL interval literal.
+//
+// time.Duration.String() is not one. It renders 15 minutes as "15m0s", which
+// PostgreSQL rejects outright, and its minute unit is "m" where PostgreSQL's is
+// "min" — so the runbook's own preamble would have failed to parse the moment
+// anyone passed --lock-timeout 90s. Falling back to milliseconds keeps every
+// value expressible, since ms is lock_timeout's own default unit.
+func pgDuration(d time.Duration) string {
+	switch {
+	case d <= 0:
+		return "0"
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dmin", d/time.Minute)
+	case d%time.Second == 0:
+		return fmt.Sprintf("%ds", int64(d/time.Second))
+	default:
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
 }
 
 // plannedChildIndexes lists the leaf indexes the plan creates, in plan order.

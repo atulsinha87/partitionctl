@@ -188,45 +188,170 @@ func (a *App) cleanup(
 		return executor.ErrMissingPort.Detailf("resume needs a connection to the target to clean up")
 	}
 
-	read, release, err := tgt.snapshot(ctx)
-	if err != nil {
-		return err
+	// Decide everything under the snapshot, then close it, then act.
+	//
+	// The two phases must not overlap. DROP INDEX CONCURRENTLY calls
+	// WaitForOlderSnapshots, so it waits for every snapshot older than itself to
+	// end — including this command's own REPEATABLE READ catalog snapshot, which
+	// cannot end until the drop it is blocking returns. Deciding and dropping
+	// inside one snapshot therefore deadlocks the process against itself:
+	// observed on PostgreSQL 17.10 as the tool's own connection sitting `idle in
+	// transaction` on obj_description while its second connection waited on that
+	// connection's virtualxid, ending in `canceling statement due to lock
+	// timeout` after the full build bound. It is not the adopt path only —
+	// the ordinary AC-5 case takes the identical call — and FR-CLI-9 reserves
+	// this cleanup to `resume`, so the deadlock removed the tool's only route to
+	// it entirely.
+	//
+	// Releasing early is only safe because every decision is re-evaluated
+	// against live state immediately before its statement, by [App.recheck]
+	// below (FR-AUTH-5). It is NOT re-evaluated by RecordAuthorization, which
+	// validates the record's shape and writes it; its own doc says so
+	// ([state.AuthorizationRecord.Validate]: "It cannot decide whether the mode
+	// is genuinely satisfied against live state"). This comment used to claim
+	// otherwise, and the gap it papered over is real and long: each DROP INDEX
+	// CONCURRENTLY calls WaitForOlderSnapshots and blocks on every transaction
+	// that can see the index, minutes at a time on a busy table, so the last
+	// item's verdict could be hours old by the time it was acted on — while the
+	// halt message this command prints is telling the operator to go and fix
+	// things by hand in exactly that window.
+	type cleanupItem struct {
+		child    planner.ChildIndexPlan
+		decision planner.CleanupDecision
+		verdict  protocol.DropVerdict
 	}
-	defer func() { _ = release() }()
+	var todo []cleanupItem
 
-	topo, err := planner.Discover(ctx, read, plan.Target.Table)
-	if err != nil {
-		return err
-	}
-	inspection, err := planner.InspectChildren(ctx, read, topo, *plan.Target.Index)
-	if err != nil {
-		return err
-	}
-
-	claims := claimLookup{store: store, database: plan.Target.Database}
-	for _, child := range inspection.Children {
-		if !child.Exists() || child.Condition.Usable() {
-			continue
-		}
-		decision, verdict, err := planner.DecideCleanup(ctx, read, claims, child)
+	if err := func() error {
+		read, release, err := tgt.snapshot(ctx)
 		if err != nil {
-			if decision == planner.CleanupHalt {
-				return planner.ErrForeignInvalidIndex.Detailf(
-					"%s on %s is %s: %s. Halting rather than dropping it: an index this tool cannot "+
-						"prove it created is never destroyed (FR-PLAN-7, AC-6, NFR-REL-3). Resolve it "+
-						"by hand, then resume again",
-					child.ChildIndex, child.Leaf.Name, child.Condition, verdict.Reason)
-			}
 			return err
 		}
-		if !decision.Destructive() {
-			continue
+		defer func() { _ = release() }()
+
+		topo, err := planner.Discover(ctx, read, plan.Target.Table)
+		if err != nil {
+			return err
 		}
-		if err := a.dropOwnedIndex(ctx, cfg, tgt, store, run, plan, child, decision, verdict); err != nil {
+		inspection, err := planner.InspectChildren(ctx, read, topo, *plan.Target.Index)
+		if err != nil {
+			return err
+		}
+
+		claims := claimLookup{store: store, database: plan.Target.Database}
+		for _, child := range inspection.Children {
+			if !child.Exists() || child.Condition.Usable() {
+				continue
+			}
+			decision, verdict, err := planner.DecideCleanup(ctx, read, claims, child)
+			if err != nil {
+				if decision == planner.CleanupHalt {
+					return planner.ErrForeignInvalidIndex.Detailf(
+						"%s on %s is %s: %s. Halting rather than dropping it: an index this tool cannot "+
+							"prove it created is never destroyed (FR-PLAN-7, AC-6, NFR-REL-3). Resolve it "+
+							"by hand, then resume again",
+						child.ChildIndex, child.Leaf.Name, child.Condition, verdict.Reason)
+				}
+				return err
+			}
+			if !decision.Destructive() {
+				continue
+			}
+			todo = append(todo, cleanupItem{child: child, decision: decision, verdict: verdict})
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+
+	// Snapshot closed. Now the DDL, each item re-decided against live state
+	// immediately before its own statement.
+	claims := claimLookup{store: store, database: plan.Target.Database}
+	for _, item := range todo {
+		decision, verdict, err := a.recheck(ctx, tgt, claims, item.child, item.decision)
+		if err != nil {
+			return err
+		}
+		if err := a.dropOwnedIndex(ctx, cfg, tgt, store, run, plan, item.child, decision, verdict); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// recheck re-evaluates one cleanup verdict against live state, outside the
+// snapshot the decision was taken under, immediately before the statement it
+// authorizes (FR-AUTH-5, INV-2).
+//
+// It is the same shared decision table, re-read: the object's condition and its
+// ownership marker come from a fresh, unpinned catalog read, and the claim is
+// re-asked of the store. A verdict that is no longer destructive, or that has
+// changed row — adopt-then-drop becoming marker-authorized, or either becoming
+// a halt — aborts the cleanup rather than proceeding on the strength of the
+// older answer.
+//
+// The window this closes is not theoretical. DROP INDEX CONCURRENTLY waits for
+// every transaction that can see the index, so a 30-item cleanup takes minutes
+// per item, and the tool's own halt message invites a DBA to work on the same
+// tree meanwhile ("Resolve it by hand, then resume again"). Two things a DBA
+// plausibly does in that window are fatal to a stale verdict: rebuilding a
+// wrecked leaf index under the same name with a plain CREATE INDEX, which makes
+// it healthy and unmarked; and writing their own COMMENT on it, which makes it
+// MarkerForeign. Acting on the old verdict destroys the first and overwrites the
+// second.
+func (a *App) recheck(
+	ctx context.Context,
+	tgt *Target,
+	claims claimLookup,
+	child planner.ChildIndexPlan,
+	was planner.CleanupDecision,
+) (planner.CleanupDecision, protocol.DropVerdict, error) {
+	if tgt.Catalog == nil {
+		return planner.CleanupHalt, protocol.DropVerdict{}, executor.ErrMissingPort.Detailf(
+			"resume cannot re-read %s before dropping it, and will not drop it on the strength of "+
+				"a decision taken under a snapshot that is now closed (FR-AUTH-5)", child.ChildIndex)
+	}
+
+	indexes, err := tgt.Catalog.IndexesOnRelations(ctx, []uint32{child.Leaf.OID})
+	if err != nil {
+		return planner.CleanupHalt, protocol.DropVerdict{}, err
+	}
+	fresh := planner.ChildIndexPlan{
+		Leaf:       child.Leaf,
+		ChildIndex: child.ChildIndex,
+		Condition:  planner.IndexAbsent,
+	}
+	for i := range indexes {
+		if indexes[i].Name == child.ChildIndex {
+			fresh.Existing = &indexes[i]
+			fresh.Condition = indexes[i].Condition()
+			break
+		}
+	}
+
+	decision, verdict, err := planner.DecideCleanup(ctx, tgt.Catalog, claims, fresh)
+	if err != nil {
+		return decision, verdict, planner.ErrForeignInvalidIndex.Detailf(
+			"%s changed under the cleanup: it was %s and %s when the snapshot was read, and re-reading "+
+				"it now says %s. Halting rather than acting on the older answer (FR-AUTH-5, AC-6). "+
+				"Resolve it by hand, then resume again",
+			child.ChildIndex, child.Condition, was, verdict.Reason)
+	}
+	if decision != was {
+		if !decision.Destructive() {
+			return decision, verdict, protocol.ErrFailure.Detailf(
+				"%s was %s and %s when the snapshot was read; re-reading it now says %s, so it is no "+
+					"longer this run's to drop. Halting: re-run `partitionctl resume` to plan the cleanup "+
+					"against what is there now",
+				child.ChildIndex, child.Condition, was, decision)
+		}
+		// Still destructive, but by different evidence than was recorded. The
+		// fresh verdict is what gets written to the audit trail, so say so
+		// rather than passing the old one along silently.
+		fmt.Fprintf(a.Stdout, "cleanup: %s is now authorized by %s rather than %s; re-read at dispatch (FR-AUTH-5)\n",
+			child.ChildIndex, verdict.Evidence["source"], was)
+	}
+	return decision, verdict, nil
 }
 
 // dropOwnedIndex records the justification and only then issues the drop

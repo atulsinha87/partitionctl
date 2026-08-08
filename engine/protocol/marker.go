@@ -163,10 +163,15 @@ func ParseMarker(comment string) (Marker, MarkerStatus) {
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(s, MarkerSentinel)), &m); err != nil {
 			return Marker{}, MarkerUnreadable
 		}
-		if m.Run == "" || m.Role == "" {
-			// A marker that names no run and no role proves nothing, and
-			// treating it as ours would authorize a drop on the strength of the
-			// sentinel alone.
+		// The read side accepts exactly the set the write side can produce.
+		// [FormatMarker] refuses anything Validate rejects, so a payload that
+		// fails here is a comment this binary could not have written: a
+		// truncated or partially overwritten marker, or a hand-typed one. A.5.1
+		// says that is MarkerUnreadable and a halt, not MarkerOurs — otherwise
+		// `partitionctl:v1:{"run":"x","role":"y"}` would authorize a DROP and
+		// the audit trail would record empty marker_plan, marker_at and
+		// marker_op as the evidence for it.
+		if err := m.Validate(); err != nil {
 			return Marker{}, MarkerUnreadable
 		}
 		return m, MarkerOurs
@@ -279,20 +284,37 @@ func paramsMismatch(n *Node) error {
 // primary statement, using base for the run, plan, operation and timestamp
 // fields the caller owns. It returns ok false for the kinds that mark nothing.
 //
-// prior is the marker already on the object, for the rewrite case; pass the
-// zero value when there is none. Only [MarkerTarget.Rewrite] kinds read it, and
-// they preserve its creation facts so that a reindex does not erase who built
-// the index.
+// prior is the marker already on the object; pass the zero value and
+// [MarkerAbsent] only when the object is known to carry no comment. The
+// [MarkerTarget.Rewrite] kinds additionally preserve prior's creation facts, so
+// that a reindex does not erase who built the index.
 //
-// A rewrite over a comment that is [MarkerForeign] or [MarkerUnreadable]
-// returns ok false rather than a statement. The rebuild has already succeeded
-// and the index is healthy; overwriting somebody else's comment to record that
-// fact is not a trade this tool makes. The leaf simply reads as un-reindexed on
-// the next plan and is rebuilt again, which is wasteful, safe and convergent.
+// # Never overwrite a human's comment
+//
+// A comment that is [MarkerForeign] or [MarkerUnreadable] returns ok false
+// rather than a statement, for *every* marking kind and not only the rewrite
+// ones. This used to be inside the rewrite branch, which meant index.attach —
+// whose whole job is to write the marker unconditionally as the crash-window
+// backstop — overwrote a DBA's `CHG-4471 pre-build by dba-team; DO NOT DROP`
+// with PartitionCTL's own marker, and downgraded a newer PartitionCTL's v2
+// marker to v1. That is worse than losing the text: [MarkerOurs] is the only
+// evidence [DecideProvenanceDrop] accepts as proof of creation, and unlike a
+// claim a marker never expires, so the overwrite manufactured permanent
+// provenance over an object this tool did not create — the exact hole the move
+// from a side table onto the object was made to close (AC-6, NFR-REL-3).
+//
+// The cost of refusing is bounded and safe in every case. A rebuilt leaf simply
+// reads as un-reindexed on the next plan and is rebuilt again; an attached leaf
+// under somebody's comment stays unmarked, so a later run halts on it rather
+// than destroying it.
 func RenderMarkerStatement(n *Node, base Marker, prior Marker, priorStatus MarkerStatus) (string, bool, error) {
 	t, ok, err := MarkerTargetFor(n)
 	if err != nil || !ok {
 		return "", false, err
+	}
+	switch priorStatus {
+	case MarkerForeign, MarkerUnreadable:
+		return "", false, nil
 	}
 	m := base
 	m.Role = t.Role
@@ -301,11 +323,32 @@ func RenderMarkerStatement(n *Node, base Marker, prior Marker, priorStatus Marke
 	}
 	if t.Rewrite {
 		switch priorStatus {
-		case MarkerForeign, MarkerUnreadable:
-			return "", false, nil
+		// NOTE (unfixed, deliberately): MarkerAbsent falls through and writes
+		// base verbatim, so a reindex over an index PartitionCTL never created
+		// stamps it with Op/Run/At describing the *reindex* as if it were the
+		// creation. reindex-index has no ownership precondition, so this is
+		// reachable by running it once over a hand-built index family; the
+		// family then reads as MarkerOurs for ever and DecideProvenanceDrop
+		// will authorize dropping it.
+		//
+		// Not fixed here because the obvious fix is not expressible: a marker
+		// recording only a rebuild needs empty Run/Op/At, and Marker.Validate
+		// rejects exactly that, so closing it means changing the marker shape,
+		// Validate, and DecideProvenanceDrop's reading of MarkerOurs together.
+		// TestRenderMarkerStatementNeverOverwritesAForeignComment also pins the
+		// current behaviour on purpose, because writing the marker is what makes
+		// the leaf skippable on the next plan (FR-PLAN-5). That is a marker
+		// design decision, not an integration repair.
 		case MarkerOurs:
 			// Keep who built it and when; record only that we rebuilt it.
-			m.Op, m.Run, m.At = prior.Op, prior.Run, prior.At
+			//
+			// Plan travels with Run: the pair is the audit answer to "which
+			// reviewed artifact authorized this object?", and Run without its
+			// own Plan is not an answer. Leaving base.Plan here produced a
+			// marker pairing the create run with the *reindex* plan's digest —
+			// a run that never executed that plan — which a live run wrote onto
+			// all 12 leaves before anyone noticed.
+			m.Op, m.Run, m.At, m.Plan = prior.Op, prior.Run, prior.At, prior.Plan
 			if prior.Parent != "" {
 				m.Parent = prior.Parent
 			}

@@ -54,11 +54,13 @@ func (a *App) cmdPlan(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if spec.Operation != protocol.OpCreateIndex {
-		return protocol.ErrFailure.Detailf(
-			"operation %q is in the plan format's vocabulary but has no planner in this build; "+
-				"M1 ships %q, and %q and %q arrive with M2 and M3",
-			spec.Operation, protocol.OpCreateIndex, protocol.OpDropIndex, protocol.OpReindexIndex)
+	// Dispatch is a registry lookup, not a switch: wiring an operation is one
+	// entry in operations.go and nothing else (NFR-EXT-1, AC-21). Resolving it
+	// before opening a connection means an unknown operation costs no round
+	// trip.
+	op, discoverOptions, err := plannerFor(spec)
+	if err != nil {
+		return err
 	}
 
 	db, err := a.openDB(ctx, cfg)
@@ -118,11 +120,12 @@ func (a *App) cmdPlan(ctx context.Context, args []string) error {
 	}
 
 	host := &planner.Host{
-		Catalog: read,
-		Claims:  claims,
-		Now:     a.Now,
+		Catalog:         read,
+		Claims:          claims,
+		Now:             a.Now,
+		DiscoverOptions: discoverOptions,
 	}
-	outcome, err := host.Run(ctx, &createIndexOperation{}, spec)
+	outcome, err := host.Run(ctx, op, spec)
 	if err != nil {
 		return err
 	}

@@ -2,13 +2,9 @@ package createindex
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"fmt"
-	"sort"
-	"time"
 
+	"github.com/atulsinha/partitionctl/engine/planner"
 	"github.com/atulsinha/partitionctl/engine/protocol"
 )
 
@@ -25,131 +21,84 @@ func nodeID(step string, leaf protocol.ObjectName) protocol.NodeID {
 	return protocol.NodeID(step + ":" + leaf.String())
 }
 
-// Planner compiles a [Specification] into a [protocol.Plan].
+// Planner implements [planner.OperationPlanner] for CreatePartitionedIndex.
 //
-// The zero value is usable and is deliberately the strictest configuration: it
-// has no claim source, so the only thing that can authorize a drop is the
-// ownership marker on the object itself (FR-PLAN-7).
-type Planner struct {
-	// Now supplies the plan's CreatedAt. Nil means [time.Now]. Injecting it is
-	// what lets a test assert a byte-exact plan digest.
-	Now func() time.Time
+// The zero value is the whole configuration. Everything the operation needs
+// arrives on [planner.Request]: the host has already proved the session is
+// read-only (FR-PLAN-8), checked the server version (NFR-COMPAT-1), discovered
+// and validated the tree (FR-PLAN-1..3) and checked role membership
+// (FR-PLAN-10), and it owns plan identity, the topology fingerprint and the
+// digest. What is left here is the one thing only this operation knows: which
+// nodes to emit.
+type Planner struct{}
 
-	// Claims reports whether a run still holds a live claim on an object
-	// (FR-PLAN-6, FR-PLAN-7). Nil means [NoClaims].
-	Claims ClaimReader
-}
+var _ planner.OperationPlanner = Planner{}
 
-// Plan is the package-level convenience form of [Planner.Plan], using the
-// default planner. Because the default has no claim source, it halts on an
-// unmarked INVALID index; a caller that can resume must supply one.
-func Plan(ctx context.Context, spec Specification, cat CatalogReader) (*protocol.Plan, error) {
-	return Planner{}.Plan(ctx, spec, cat)
-}
+// Operation names the operation this planner implements.
+func (Planner) Operation() protocol.Operation { return protocol.OpCreateIndex }
 
-// HasWork reports whether a plan contains any node that issues DDL.
+// Plan emits the build graph for one specification against one discovered
+// topology (FR-PLAN-12).
 //
-// A plan for a fully converged catalog carries only its precondition assert and
-// its final verify, so it is a checked no-op rather than an empty file: running
-// it re-proves the end state and exits zero (AC-7). HasWork is how a caller
-// tells that case from a plan with work in it, without inspecting node kinds.
-func HasWork(p *protocol.Plan) bool {
-	if p == nil {
-		return false
-	}
-	for i := range p.Nodes {
-		if p.Nodes[i].Kind.IssuesDDL() {
-			return true
-		}
-	}
-	return false
-}
+// It issues no DDL and opens no write transaction: the only database access
+// available to it is [planner.Request.Catalog], which is read-only. It emits
+// only the work that remains (FR-PLAN-5), and it returns an error and no nodes
+// at all rather than a graph it cannot justify: a name occupied by something
+// that is not ours, or an unusable index this tool cannot prove it created
+// (exit 13, FR-PLAN-7, AC-6).
+func (Planner) Plan(ctx context.Context, req planner.Request) (planner.Result, error) {
+	parent := req.Topology.Root.Name
 
-// Plan reads the catalog and compiles spec into a sealed plan.
-//
-// It issues no DDL and opens no write transaction (FR-PLAN-8). It emits only
-// the work that remains (FR-PLAN-5), and it returns an error and no plan at all
-// rather than emitting a graph it cannot justify: an unsupported topology
-// (exit 15), a role that is not a member of an owning role (exit 16), or an
-// INVALID index without provenance (exit 13, FR-PLAN-7, AC-6).
-func (pl Planner) Plan(ctx context.Context, spec Specification, cat CatalogReader) (*protocol.Plan, error) {
-	if err := spec.Validate(); err != nil {
-		return nil, err
-	}
-	if cat == nil {
-		return nil, protocol.ErrFailure.Detailf("create-index: catalog reader is nil")
-	}
-
-	topo, err := cat.Topology(ctx, spec.Table)
-	if err != nil {
-		return nil, fmt.Errorf("create-index: discover topology of %s: %w", spec.Table, err)
-	}
-	if err := topo.Validate(); err != nil {
-		return nil, err
-	}
-
-	parent := protocol.NewObjectName(topo.Root.Schema, topo.Root.Name)
-	if err := checkResolution(spec.Table, parent); err != nil {
-		return nil, err
-	}
-	if err := checkTopology(topo, parent); err != nil {
-		return nil, err
-	}
-
-	leaves := sortedPartitions(topo.Partitions)
-
-	parentIndex := spec.Index
+	parentIndex := req.Spec.Index
 	if parentIndex.Schema == "" {
 		parentIndex.Schema = parent.Schema
 	}
 
-	children, err := childIndexNames(parentIndex, leaves)
+	// One pg_index pass over the whole tree, which generates every child index
+	// name and proves the set collision-free (FR-PLAN-4, FR-PLAN-11,
+	// FR-PLAN-13). `resume` calls the identical function, which is what keeps
+	// the two paths from disagreeing about whether a tree is legal (AC-4).
+	insp, err := planner.InspectChildren(ctx, req.Catalog, req.Topology, parentIndex)
 	if err != nil {
-		return nil, err
+		return planner.Result{}, err
+	}
+	if err := checkChildNames(insp, parentIndex); err != nil {
+		return planner.Result{}, err
 	}
 
-	// FR-PLAN-10 / AC-12: the connected role must be a member of the owning
-	// role of the parent and of every leaf. Checked now so an unprivileged run
-	// fails at plan time with exit 16, and recorded as an assertion so the
-	// executor re-checks it against live state.
-	relations := append([]protocol.ObjectName{parent}, leaves...)
-	if err := checkRoleMembership(ctx, cat, spec.Role, relations); err != nil {
-		return nil, err
-	}
-
-	states, err := cat.Indexes(ctx, append([]protocol.ObjectName{parentIndex}, children...))
+	needParent, err := classifyParentIndex(ctx, req, insp, parent, parentIndex)
 	if err != nil {
-		return nil, fmt.Errorf("create-index: read index state: %w", err)
-	}
-	pages, err := cat.RelationPages(ctx, leaves)
-	if err != nil {
-		return nil, fmt.Errorf("create-index: read relation sizes: %w", err)
+		return planner.Result{}, err
 	}
 
-	claims := pl.claims()
+	relations := append([]protocol.ObjectName{parent}, req.Topology.LeafObjectNames()...)
 
-	needParent, err := classifyParentIndex(ctx, claims, states, parent, parentIndex)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes := make([]protocol.Node, 0, 2+len(leaves)*5)
-	nodes = append(nodes, assertNode(spec.Role, parent, parentIndex, topo.Strategy, relations))
+	nodes := make([]protocol.Node, 0, 2+len(insp.Children)*5)
+	nodes = append(nodes, assertNode(req.Role, parent, parentIndex, req.Topology.Strategy, relations))
 
 	chainRoot := nodeAssert
 	if needParent {
-		nodes = append(nodes, parentIndexNode(parent, parentIndex, spec.Definition))
+		nodes = append(nodes, parentIndexNode(req, parent, parentIndex))
 		chainRoot = nodeParentIndex
 	}
 
 	var tails []protocol.NodeID
-	for i, leaf := range leaves {
-		chain, err := pl.leafChain(ctx, claims, spec, leaf, children[i], parentIndex, states, pages[leaf], chainRoot)
+	drops, builds := 0, 0
+	for _, c := range insp.Children {
+		chain, err := leafChain(ctx, req, insp, c, parentIndex, chainRoot)
 		if err != nil {
-			return nil, err
+			return planner.Result{}, err
 		}
 		if len(chain) == 0 {
 			continue
+		}
+		for i := range chain {
+			switch chain[i].Kind {
+			case protocol.KindIndexDropConcurrently:
+				drops++
+			case protocol.KindIndexCreateConcurrently:
+				builds++
+			}
 		}
 		nodes = append(nodes, chain...)
 		tails = append(tails, chain[len(chain)-1].ID)
@@ -159,198 +108,37 @@ func (pl Planner) Plan(ctx context.Context, spec Specification, cat CatalogReade
 		// converged plan is a checked no-op rather than an empty one (AC-7).
 		tails = []protocol.NodeID{chainRoot}
 	}
+
+	children := make([]protocol.ObjectName, len(insp.Children))
+	for i, c := range insp.Children {
+		children[i] = c.ChildIndex
+	}
 	nodes = append(nodes, finalVerifyNode(parentIndex, children, tails))
 
-	fingerprint, err := topo.Fingerprint()
-	if err != nil {
-		return nil, err
+	hasDDL := false
+	for i := range nodes {
+		if nodes[i].Kind.IssuesDDL() {
+			hasDDL = true
+			break
+		}
 	}
-	createdAt := protocol.NewTimestamp(pl.now())
-
-	plan := &protocol.Plan{
-		FormatVersion: protocol.PlanFormatVersion,
-		PlanID:        spec.PlanID,
-		Operation:     protocol.OpCreateIndex,
-		Target: protocol.Target{
-			Database: spec.Database,
-			Table:    parent,
-			Index:    &parentIndex,
-		},
-		CreatedAt:           createdAt,
-		Nodes:               nodes,
-		TopologyFingerprint: fingerprint,
-	}
-	if plan.PlanID == "" {
-		plan.PlanID = derivePlanID(spec.Database, parent, parentIndex, fingerprint, createdAt)
-	}
-
-	if err := plan.Validate(); err != nil {
-		return nil, err
-	}
-	if err := plan.Seal(); err != nil {
-		return nil, err
-	}
-	return plan, nil
+	return planner.Result{Nodes: nodes, Notes: notes(len(children), builds, drops, hasDDL)}, nil
 }
 
-func (pl Planner) now() time.Time {
-	if pl.Now != nil {
-		return pl.Now()
-	}
-	return time.Now()
-}
-
-func (pl Planner) claims() ClaimReader {
-	if pl.Claims != nil {
-		return pl.Claims
-	}
-	return NoClaims()
-}
-
-// ownership evaluates the shared destructive-action decision table for one
-// object: the marker on it, and the live claim consulted only where the marker
-// is missing ([protocol.DecideProvenanceDrop]).
-func ownership(ctx context.Context, claims ClaimReader, object protocol.ObjectName, st IndexState) (protocol.DropVerdict, error) {
-	marker, status := st.Marker()
-	in := protocol.ProvenanceDropInput{Object: object, Status: status, Marker: marker}
-	if status == protocol.MarkerAbsent {
-		run, found, err := claims.ClaimsObject(ctx, object)
-		if err != nil {
-			return protocol.DropVerdict{}, fmt.Errorf("create-index: read the claim on %s: %w", object, err)
+// checkChildNames applies the two checks that are specific to emitting a plan,
+// on top of the collision proof [planner.InspectChildren] has already made: a
+// generated name must be a legal identifier, and it must not equal the parent
+// index name.
+func checkChildNames(insp planner.ChildIndexInspection, parentIndex protocol.ObjectName) error {
+	for _, c := range insp.Children {
+		if err := c.ChildIndex.Validate(); err != nil {
+			return protocol.ErrInvalidIdentifier.Detailf(
+				"generated child index name for %s: %v", c.Leaf.Name, err)
 		}
-		if found {
-			in.ClaimRun = run
-		}
-	}
-	return protocol.DecideProvenanceDrop(in), nil
-}
-
-// ---------------------------------------------------------------------------
-// Topology validation (FR-PLAN-2, FR-PLAN-3, AC-11)
-// ---------------------------------------------------------------------------
-
-// checkResolution guards against a CatalogReader that answered about a
-// different relation than the one asked for.
-func checkResolution(asked, resolved protocol.ObjectName) error {
-	if asked.Name != resolved.Name || (asked.Schema != "" && asked.Schema != resolved.Schema) {
-		return protocol.ErrFailure.Detailf(
-			"create-index: asked for topology of %s but the catalog resolved %s", asked, resolved)
-	}
-	return nil
-}
-
-// checkTopology rejects every topology v0.1 cannot plan, each with its own
-// message, and all of them with exit code 15 (AC-11).
-func checkTopology(topo protocol.TopologyInput, parent protocol.ObjectName) error {
-	if topo.Root.RelKind != RelKindPartitionedTable {
-		return protocol.ErrUnsupportedTopology.Detailf(
-			"%s has relkind %q; CreatePartitionedIndex requires a partitioned table (relkind 'p')",
-			parent, topo.Root.RelKind)
-	}
-	if !topo.Strategy.SupportedInV01() {
-		return protocol.ErrUnsupportedTopology.Detailf(
-			"%s is %s partitioned; v0.1 supports RANGE and LIST only (FR-PLAN-3). "+
-				"A HASH-partitioned tree has no ordering that makes per-partition pacing meaningful",
-			parent, topo.Strategy)
-	}
-	if len(topo.Partitions) == 0 {
-		return protocol.ErrUnsupportedTopology.Detailf(
-			"%s has no leaf partitions; there is nothing to index, and the parent index "+
-				"created by CREATE INDEX ON ONLY would have no attach to make it valid", parent)
-	}
-	for _, p := range topo.Partitions {
-		if p.IsDefault {
-			return protocol.ErrUnsupportedTopology.Detailf(
-				"%s has a DEFAULT partition, %s; v0.1 rejects it (FR-PLAN-3). "+
-					"A DEFAULT partition can absorb rows for a range that is later added as its own "+
-					"partition, so the leaf set is not stable across a long run", parent, p)
-		}
-	}
-	for _, p := range topo.Partitions {
-		if p.RelKind == RelKindPartitionedTable {
-			return protocol.ErrUnsupportedTopology.Detailf(
-				"%s is itself partitioned, so the tree rooted at %s has depth > 1; "+
-					"v0.1 requires exactly 1 (FR-PLAN-2)", p, parent)
-		}
-		if p.RelKind != RelKindTable {
-			return protocol.ErrUnsupportedTopology.Detailf(
-				"partition %s has relkind %q; v0.1 supports ordinary table partitions (relkind 'r') only",
-				p, p.RelKind)
-		}
-		if p.ParentOID != topo.Root.OID {
-			return protocol.ErrUnsupportedTopology.Detailf(
-				"partition %s has parent OID %d, not %s's OID %d, so the tree has depth > 1; "+
-					"v0.1 requires exactly 1 (FR-PLAN-2)", p, p.ParentOID, parent, topo.Root.OID)
-		}
-	}
-	return nil
-}
-
-// sortedPartitions orders the leaves by schema then name.
-//
-// The catalog returns partitions in whatever order the scan produced. Ordering
-// them here is what makes the graph, and therefore the plan digest, a function
-// of the catalog's content rather than of its physical layout. For a RANGE tree
-// with conventional names it also happens to put the leaves in bound order,
-// which is the order an operator expects to see them paced in.
-func sortedPartitions(parts []protocol.RelationState) []protocol.ObjectName {
-	out := make([]protocol.ObjectName, len(parts))
-	for i, p := range parts {
-		out[i] = protocol.NewObjectName(p.Schema, p.Name)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Schema != out[j].Schema {
-			return out[i].Schema < out[j].Schema
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out
-}
-
-// childIndexNames generates the leaf index name for every partition
-// (FR-PLAN-11) and proves the set is collision-free (FR-PLAN-13).
-//
-// The collision proof lives in [protocol.ChildIndexNamesQualified] and is
-// applied per schema, which is where a collision can actually happen:
-// PostgreSQL puts an index in its table's schema, so two partitions in
-// different schemas cannot collide even when their names generate the same
-// index name. Sharing that one generator with planner.InspectChildren is what
-// keeps the plan path and the resume path agreeing on which trees are legal
-// (AC-4).
-//
-// The two checks layered on top are specific to emitting a plan: the generated
-// name must be a legal identifier, and it must not equal the parent index name.
-func childIndexNames(parentIndex protocol.ObjectName, leaves []protocol.ObjectName) ([]protocol.ObjectName, error) {
-	out, err := protocol.ChildIndexNamesQualified(parentIndex.Name, leaves)
-	if err != nil {
-		return nil, err
-	}
-	for i, child := range out {
-		if err := child.Validate(); err != nil {
-			return nil, protocol.ErrInvalidIdentifier.Detailf(
-				"generated child index name for %s: %v", leaves[i], err)
-		}
-		if child == parentIndex {
-			return nil, protocol.ErrNameCollision.Detailf(
+		if c.ChildIndex == parentIndex {
+			return protocol.ErrNameCollision.Detailf(
 				"the child index name generated for %s equals the parent index name %s",
-				leaves[i], parentIndex)
-		}
-	}
-	return out, nil
-}
-
-// checkRoleMembership fails the plan at exit 16 if the connected role is not a
-// member of any owning role it would need (FR-PLAN-10, AC-12).
-func checkRoleMembership(ctx context.Context, cat CatalogReader, role string, relations []protocol.ObjectName) error {
-	member, err := cat.OwnedByMemberRole(ctx, role, relations)
-	if err != nil {
-		return fmt.Errorf("create-index: check role membership: %w", err)
-	}
-	for _, r := range relations {
-		if !member[r] {
-			return protocol.ErrInsufficientPrivilege.Detailf(
-				"role %q is not a member of the owning role of %s; "+
-					"every relation the run modifies needs it (FR-PLAN-10, AC-12)", role, r)
+				c.Leaf.Name, parentIndex)
 		}
 	}
 	return nil
@@ -366,38 +154,44 @@ func checkRoleMembership(ctx context.Context, cat CatalogReader, role string, re
 // A parent index that exists and is INVALID is the normal mid-build state, so
 // adopting it is exactly what resume must do. Adopting one PartitionCTL cannot
 // prove it created is not: the precondition in TRD §7.2.13 is that the target
-// index name is free *or* matches an in-progress build with provenance.
+// index name is free *or* matches an in-progress build carrying PartitionCTL's
+// ownership marker.
 func classifyParentIndex(
 	ctx context.Context,
-	claims ClaimReader,
-	states map[protocol.ObjectName]IndexState,
+	req planner.Request,
+	insp planner.ChildIndexInspection,
 	parent, parentIndex protocol.ObjectName,
 ) (needCreate bool, err error) {
-	st, exists := states[parentIndex]
-	if !exists {
+	existing := insp.ParentIndex
+	if existing == nil {
 		return true, nil
 	}
-	if !st.IsPartitioned {
+	if existing.Kind != planner.RelKindPartitionedIndex {
 		return false, protocol.ErrFailure.Detailf(
 			"the index name %s is already taken by an ordinary index; "+
 				"CreatePartitionedIndex needs the name for a partitioned index on %s", parentIndex, parent)
 	}
-	if st.Relation != parent {
-		return false, protocol.ErrFailure.Detailf(
-			"the index name %s already exists on %s, not on %s", parentIndex, st.Relation, parent)
-	}
-	if st.Healthy() {
+	if existing.Condition().Usable() {
 		return false, nil
 	}
-	v, err := ownership(ctx, claims, parentIndex, st)
+
+	// Unusable, and the name is the one we want. The shared decision table
+	// answers whether it is ours to adopt; a plan that adopted somebody else's
+	// half-built index would attach leaves to it (FR-PLAN-7, AC-6).
+	_, verdict, err := planner.DecideCleanup(ctx, req.Catalog, req.Claims, planner.ChildIndexPlan{
+		Leaf:       req.Topology.Root,
+		ChildIndex: parentIndex,
+		Existing:   existing,
+		Condition:  existing.Condition(),
+	})
 	if err != nil {
-		return false, err
-	}
-	if !v.Satisfied() {
-		return false, protocol.ErrAuthorizationUnsatisfied.Detailf(
-			"%s already exists and is INVALID: %s. This is an in-progress build belonging to something "+
+		if verdict.Reason == "" {
+			return false, err
+		}
+		return false, planner.ErrForeignInvalidIndex.Detailf(
+			"%s already exists and is %s: %s. This is an in-progress build belonging to something "+
 				"else. Halting with no plan: resolve it by hand, then re-plan (FR-PLAN-7, AC-6)",
-			parentIndex, v.Reason)
+			parentIndex, existing.Condition(), verdict.Reason)
 	}
 	return false, nil
 }
@@ -410,72 +204,67 @@ func classifyParentIndex(
 //   - already built, valid and attached: no nodes at all;
 //   - built and valid but unattached: verify → attach → wait;
 //   - absent: create → verify → attach → wait;
-//   - INVALID and ours: drop → create → verify → attach → wait
+//   - unusable and ours: drop → create → verify → attach → wait
 //     (FR-PLAN-6, AC-5);
-//   - INVALID and not provably ours: no plan at all (FR-PLAN-7, AC-6).
-func (pl Planner) leafChain(
+//   - unusable and not provably ours: no plan at all (FR-PLAN-7, AC-6).
+func leafChain(
 	ctx context.Context,
-	claims ClaimReader,
-	spec Specification,
-	leaf, child, parentIndex protocol.ObjectName,
-	states map[protocol.ObjectName]IndexState,
-	pages int64,
+	req planner.Request,
+	insp planner.ChildIndexInspection,
+	c planner.ChildIndexPlan,
+	parentIndex protocol.ObjectName,
 	root protocol.NodeID,
 ) ([]protocol.Node, error) {
-	st, exists := states[child]
+	parentOID := insp.ParentIndexOID()
+	leaf, child := c.Leaf.Name, c.ChildIndex
 
 	needDrop := false
 	needCreate := true
 
-	if exists {
-		if st.Relation != leaf {
-			return nil, protocol.ErrFailure.Detailf(
-				"the child index name %s generated for partition %s already exists on %s. "+
-					"Halting: building over it would corrupt an unrelated object", child, leaf, st.Relation)
-		}
-		if st.IsPartitioned {
+	if c.Exists() {
+		st := c.Existing
+		if st.Kind == planner.RelKindPartitionedIndex {
 			return nil, protocol.ErrFailure.Detailf(
 				"the child index name %s generated for partition %s is a partitioned index, "+
 					"not a leaf index. Halting", child, leaf)
 		}
-		if st.AttachedTo != nil && *st.AttachedTo != parentIndex {
+		if st.Attached() && !st.AttachedTo(parentOID) {
 			return nil, protocol.ErrFailure.Detailf(
-				"%s is already attached to %s, not to %s. Halting: PostgreSQL has no "+
+				"%s is already attached to another partitioned index, not to %s. Halting: PostgreSQL has no "+
 					"ALTER INDEX ... DETACH PARTITION, so this cannot be undone by the tool (TRD §7.2.10)",
-				child, *st.AttachedTo, parentIndex)
+				child, parentIndex)
 		}
 		switch {
-		case st.Healthy() && st.AttachedTo != nil:
+		case c.Complete(parentOID):
 			// Built, verified and attached. Nothing remains (FR-PLAN-5).
 			return nil, nil
-		case st.Healthy():
+		case st.Condition().Usable():
 			// Built but not yet attached: the interruption landed between
 			// CREATE INDEX CONCURRENTLY and ATTACH PARTITION. Rebuilding would
 			// be hours of wasted work, so only the tail of the chain is
 			// emitted.
 			needCreate = false
-		case st.AttachedTo != nil:
-			// INVALID and attached. An attached child index is a dependency of
+		case st.Attached():
+			// Unusable and attached. An attached child index is a dependency of
 			// its partitioned parent and cannot be dropped individually, and
 			// there is no DETACH (TRD §7.2.10), so no graph this planner can
 			// emit will fix it.
 			return nil, protocol.ErrFailure.Detailf(
-				"%s is attached to %s but is not valid. PostgreSQL cannot drop an attached child "+
+				"%s is attached to %s but is %s. PostgreSQL cannot drop an attached child "+
 					"index individually and offers no ALTER INDEX ... DETACH PARTITION (TRD §7.2.10), "+
 					"so this needs manual repair: DROP INDEX %s takes AccessExclusiveLock on the whole tree",
-				child, parentIndex, parentIndex.Quoted())
+				child, parentIndex, st.Condition(), parentIndex.Quoted())
 		default:
-			// INVALID and unattached: the wreckage of an interrupted CREATE
-			// INDEX CONCURRENTLY. Droppable online, but only with proof we
-			// created it.
-			v, err := ownership(ctx, claims, child, st)
+			// Unattached wreckage of an interrupted CREATE INDEX CONCURRENTLY.
+			// Droppable online, but only with proof we created it.
+			decision, _, err := planner.DecideCleanup(ctx, req.Catalog, req.Claims, c)
 			if err != nil {
 				return nil, err
 			}
-			if !v.Satisfied() {
-				return nil, protocol.ErrAuthorizationUnsatisfied.Detailf(
-					"%s on %s is INVALID: %s. Halting with no plan: an INVALID index this tool cannot "+
-						"prove it created is never dropped (FR-PLAN-7, AC-6, NFR-REL-3)", child, leaf, v.Reason)
+			if !decision.Destructive() {
+				return nil, planner.ErrForeignInvalidIndex.Detailf(
+					"%s on %s is %s and is not provably ours. Halting with no plan (FR-PLAN-7, AC-6)",
+					child, leaf, st.Condition())
 			}
 			needDrop = true
 		}
@@ -490,14 +279,14 @@ func (pl Planner) leafChain(
 	}
 
 	if needDrop {
-		add(dropNode(leaf, child))
+		add(dropNode(req, leaf, child))
 	}
 	if needCreate {
-		add(createNode(leaf, child, parentIndex, spec.Definition, estimateBuildSeconds(pages, spec.buildRate())))
+		add(createNode(req, leaf, child, parentIndex))
 	}
 	add(leafVerifyNode(leaf, child))
-	add(attachNode(leaf, child, parentIndex))
-	add(waitNode(leaf, spec.PaceSeconds))
+	add(attachNode(req, leaf, child, parentIndex))
+	add(waitNode(req, leaf))
 	return chain, nil
 }
 
@@ -508,9 +297,10 @@ func (pl Planner) leafChain(
 // assertNode carries every precondition from TRD §7.2.13 in a single
 // catalog.assert evaluated before anything else runs.
 //
-// The assertions are ordered so the cheapest and most structural failures
-// surface first, and each carries the exit code its failure class maps to:
-// unsupported topology is 15, insufficient privilege is 16 (TRD §7.2.12).
+// The host has already checked all of these against the catalog it planned
+// from; recording them as assertions is what makes the executor re-check them
+// against live state, so a plan that was valid an hour ago fails at exit 15 or
+// 16 rather than half-running.
 func assertNode(
 	role string,
 	parent, parentIndex protocol.ObjectName,
@@ -585,73 +375,77 @@ func assertNode(
 // parentIndexNode issues CREATE INDEX ON ONLY <parent>: catalog-only, no
 // partition data scanned, and ONLY is what stops PostgreSQL recursing into the
 // leaves. The resulting index is deliberately INVALID for the whole build.
-func parentIndexNode(parent, parentIndex protocol.ObjectName, def protocol.IndexDefinition) protocol.Node {
-	params := &protocol.CreateParentInvalidParams{
-		Parent:     parent,
-		Index:      parentIndex,
-		Definition: def,
-	}
-	return withMarkerPreview(protocol.Node{
-		ID:               nodeParentIndex,
-		Kind:             protocol.KindIndexCreateParentInvalid,
-		Params:           params,
+func parentIndexNode(req planner.Request, parent, parentIndex protocol.ObjectName) protocol.Node {
+	return preview(protocol.Node{
+		ID:   nodeParentIndex,
+		Kind: protocol.KindIndexCreateParentInvalid,
+		Params: &protocol.CreateParentInvalidParams{
+			Parent:     parent,
+			Index:      parentIndex,
+			Definition: req.Spec.Definition,
+		},
 		DependsOn:        []protocol.NodeID{nodeAssert},
-		RenderedSQL:      renderCreateParentInvalid(params),
-		EstimatedSeconds: catalogOnlySeconds,
+		EstimatedSeconds: req.Estimator.CatalogNodeSeconds(),
 	})
 }
 
-// dropNode removes the INVALID leaf index left by an interrupted CREATE INDEX
+// dropNode removes the unusable leaf index left by an interrupted CREATE INDEX
 // CONCURRENTLY, so the rebuild has a free name (FR-PLAN-6, AC-5).
 //
 // The authorization it carries is [protocol.AuthProvenance] and it is a
 // proposal only: the executor re-evaluates it against live state immediately
 // before dispatch and halts if it is unsatisfied, whatever the plan asserts
 // (FR-AUTH-5, INV-2).
-func dropNode(leaf, child protocol.ObjectName) protocol.Node {
+func dropNode(req planner.Request, leaf, child protocol.ObjectName) protocol.Node {
 	relation := leaf
-	params := &protocol.DropConcurrentlyParams{
-		Index:    child,
-		Relation: &relation,
-		Reason:   protocol.DropInvalidBuild,
-	}
-	return protocol.Node{
-		ID:          nodeID("drop", leaf),
-		Kind:        protocol.KindIndexDropConcurrently,
-		Params:      params,
-		RenderedSQL: renderDropConcurrently(params),
-		Authorization: &protocol.Authorization{
-			Mode:     protocol.AuthProvenance,
-			Object:   child,
+	n := preview(protocol.Node{
+		ID:   nodeID("drop", leaf),
+		Kind: protocol.KindIndexDropConcurrently,
+		Params: &protocol.DropConcurrentlyParams{
+			Index:    child,
 			Relation: &relation,
-			Note: "an INVALID index left by an interrupted CREATE INDEX CONCURRENTLY, " +
-				"with a committed PartitionCTL provenance record (FR-PLAN-6, AC-5)",
+			Reason:   protocol.DropInvalidBuild,
 		},
-		EstimatedSeconds: catalogOnlySeconds,
+		EstimatedSeconds: req.Estimator.CatalogNodeSeconds(),
+	})
+	n.Authorization = &protocol.Authorization{
+		Mode:     protocol.AuthProvenance,
+		Object:   child,
+		Relation: &relation,
+		Note: "an unusable index left by an interrupted CREATE INDEX CONCURRENTLY, " +
+			"carrying PartitionCTL's ownership marker (FR-PLAN-6, AC-5)",
 	}
+	return n
 }
 
 // createNode builds one leaf index. This is the node that runs for hours: two
 // table scans, and it waits for every transaction that could see the index.
-func createNode(
-	leaf, child, parentIndex protocol.ObjectName,
-	def protocol.IndexDefinition,
-	seconds int,
-) protocol.Node {
+func createNode(req planner.Request, leaf, child, parentIndex protocol.ObjectName) protocol.Node {
 	pi := parentIndex
-	params := &protocol.CreateConcurrentlyParams{
-		Partition:   leaf,
-		Index:       child,
-		Definition:  def,
-		ParentIndex: &pi,
+	pages := int64(0)
+	if r, ok := leafRelation(req, leaf); ok {
+		pages = r.RelPages
 	}
-	return withMarkerPreview(protocol.Node{
-		ID:               nodeID("create", leaf),
-		Kind:             protocol.KindIndexCreateConcurrently,
-		Params:           params,
-		RenderedSQL:      renderCreateConcurrently(params),
-		EstimatedSeconds: seconds,
+	return preview(protocol.Node{
+		ID:   nodeID("create", leaf),
+		Kind: protocol.KindIndexCreateConcurrently,
+		Params: &protocol.CreateConcurrentlyParams{
+			Partition:   leaf,
+			Index:       child,
+			Definition:  req.Spec.Definition,
+			ParentIndex: &pi,
+		},
+		EstimatedSeconds: req.Estimator.BuildSeconds(pages),
 	})
+}
+
+func leafRelation(req planner.Request, leaf protocol.ObjectName) (planner.Relation, bool) {
+	for _, r := range req.Topology.Leaves {
+		if r.Name == leaf {
+			return r, true
+		}
+	}
+	return planner.Relation{}, false
 }
 
 // leafVerifyNode checks the child before it is attached: indisvalid, indisready
@@ -674,30 +468,30 @@ func leafVerifyNode(leaf, child protocol.ObjectName) protocol.Node {
 // attachNode issues ALTER INDEX <parent> ATTACH PARTITION <child>. Catalog
 // only. On the final attach PostgreSQL marks the parent index valid by itself;
 // no statement is issued for that.
-func attachNode(leaf, child, parentIndex protocol.ObjectName) protocol.Node {
-	params := &protocol.AttachParams{ParentIndex: parentIndex, ChildIndex: child}
-	return withMarkerPreview(protocol.Node{
+func attachNode(req planner.Request, leaf, child, parentIndex protocol.ObjectName) protocol.Node {
+	return preview(protocol.Node{
 		ID:               nodeID("attach", leaf),
 		Kind:             protocol.KindIndexAttach,
-		Params:           params,
-		RenderedSQL:      renderAttach(params),
-		EstimatedSeconds: catalogOnlySeconds,
+		Params:           &protocol.AttachParams{ParentIndex: parentIndex, ChildIndex: child},
+		EstimatedSeconds: req.Estimator.CatalogNodeSeconds(),
 	})
 }
 
 // waitNode is the planner-emitted pause between leaves (FR-ORD-3). It is a node
 // so that every pause is visible in the plan the operator reviews; the executor
 // introduces no delays of its own.
-func waitNode(leaf protocol.ObjectName, seconds int) protocol.Node {
+func waitNode(req planner.Request, leaf protocol.ObjectName) protocol.Node {
+	reason := req.Spec.PaceReason
+	if reason == "" {
+		reason = "pacing after " + leaf.String() + " attached (FR-ORD-3)"
+	}
+	seconds := req.Spec.PaceSeconds
 	return protocol.Node{
-		ID:   nodeID("wait", leaf),
-		Kind: protocol.KindWait,
-		Params: &protocol.WaitParams{
-			Seconds: seconds,
-			Reason:  "pacing after " + leaf.String() + " attached (FR-ORD-3)",
-		},
+		ID:               nodeID("wait", leaf),
+		Kind:             protocol.KindWait,
+		Params:           &protocol.WaitParams{Seconds: seconds, Reason: reason},
 		RenderedSQL:      renderWaitComment(seconds),
-		EstimatedSeconds: seconds,
+		EstimatedSeconds: req.Estimator.WaitSeconds(seconds),
 	}
 }
 
@@ -747,32 +541,29 @@ func finalVerifyNode(parentIndex protocol.ObjectName, children []protocol.Object
 }
 
 // ---------------------------------------------------------------------------
-// Plan identity
+// Operator-facing notes
 // ---------------------------------------------------------------------------
 
-// planIDDomain separates this hash from every other SHA-256 in the system.
-const planIDDomain = "partitionctl.planid.create-index.v1"
-
-// derivePlanID produces a stable, collision-resistant plan identity from the
-// plan's own identity fields, so that planning is a pure function of the
-// catalog and the specification. Drawing randomness here would make two
-// otherwise identical plan files differ, which would defeat reviewing a plan as
-// a diff.
-func derivePlanID(database string, table, index protocol.ObjectName, fingerprint string, createdAt protocol.Timestamp) protocol.PlanID {
-	h := sha256.New()
-	for _, field := range []string{
-		planIDDomain,
-		string(protocol.OpCreateIndex),
-		database,
-		table.String(),
-		index.String(),
-		fingerprint,
-		createdAt.Canonical(),
-	} {
-		var n [8]byte
-		binary.BigEndian.PutUint64(n[:], uint64(len(field)))
-		h.Write(n[:])
-		h.Write([]byte(field))
+// notes are the lines `plan` prints for what the artifact cannot state
+// structurally: FR-PLAN-5's skip count, and what the ownership marker buys.
+func notes(leaves, builds, drops int, hasDDL bool) []string {
+	out := []string{
+		fmt.Sprintf("%d leaf partition(s) discovered; %d index build(s) remain, %d already complete (FR-PLAN-5)",
+			leaves, builds, leaves-builds),
+		"the parent index is INVALID for the whole build; PostgreSQL marks it valid on the final attach",
 	}
-	return protocol.PlanID(string(protocol.OpCreateIndex) + "-" + hex.EncodeToString(h.Sum(nil))[:16])
+	if drops > 0 {
+		out = append(out, fmt.Sprintf(
+			"%d unusable index(es) will be dropped first, each authorized by the PartitionCTL ownership "+
+				"marker on the object itself, re-read at dispatch (FR-PLAN-6, FR-AUTH-5, AC-5)", drops))
+	}
+	out = append(out,
+		"every index this run creates is stamped with a PartitionCTL ownership marker "+
+			"(COMMENT ON INDEX, ShareUpdateExclusiveLock, ~1ms), which is what lets a later run prove "+
+			"the object is its own to clean up (AC-6)")
+	if !hasDDL {
+		out = append(out,
+			"no DDL remains: this plan is a checked no-op that re-proves the end state and exits zero (AC-7)")
+	}
+	return out
 }

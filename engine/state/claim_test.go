@@ -30,15 +30,10 @@ func TestCreateRunSeedsTheClaimedObject(t *testing.T) {
 	}
 
 	// The record exists before anything is dispatched, which is INV-1; it
-	// starts *claiming* the object when the node goes READY, which is what
-	// keeps a plan's mere intent from authorizing a drop.
+	// starts *claiming* the object at the first dispatch, which is what keeps a
+	// plan's mere intent from authorizing a drop.
 	idx := protocol.NewObjectName("public", "orders_idx_p1")
-	if _, err := s.TransitionNode(ctx, NodeTransition{
-		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
-		From: protocol.NodePending, To: protocol.NodeReady,
-	}); err != nil {
-		t.Fatalf("TransitionNode: %v", err)
-	}
+	dispatch(t, s, run.RunID, "cic:orders_idx_p1")
 	id, found, err := ClaimsObject(ctx, s, idx)
 	if err != nil {
 		t.Fatalf("ClaimsObject: %v", err)
@@ -63,36 +58,14 @@ func TestCompletedRunLeavesNoClaim(t *testing.T) {
 	if _, found, _ := ClaimsObject(ctx, s, idx); found {
 		t.Fatal("a plan that has issued nothing already claims its objects (AC-6)")
 	}
-	if _, err := s.TransitionNode(ctx, NodeTransition{
-		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
-		From: protocol.NodePending, To: protocol.NodeReady,
-	}); err != nil {
-		t.Fatalf("TransitionNode: %v", err)
-	}
+	dispatch(t, s, run.RunID, "cic:orders_idx_p1")
 	if _, found, _ := ClaimsObject(ctx, s, idx); !found {
-		t.Fatal("a READY node holds no claim on the object it is about to create")
+		t.Fatal("a dispatched node holds no claim on the object it is about to create")
 	}
 
 	// Walk every node to DONE, exactly as a successful run does.
 	for _, n := range plan.Nodes {
-		cur, err := s.GetNode(ctx, run.RunID, n.ID)
-		if err != nil {
-			t.Fatalf("GetNode %q: %v", n.ID, err)
-		}
-		for _, to := range []protocol.NodeState{
-			protocol.NodeReady, protocol.NodeRunning, protocol.NodeVerifying, protocol.NodeDone,
-		} {
-			if cur.State == to {
-				continue
-			}
-			rec, err := s.TransitionNode(ctx, NodeTransition{
-				RunID: run.RunID, NodeID: n.ID, From: cur.State, To: to,
-			})
-			if err != nil {
-				t.Fatalf("node %q %s -> %s: %v", n.ID, cur.State, to, err)
-			}
-			cur = rec
-		}
+		walkToDone(t, s, run.RunID, n.ID)
 	}
 	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
 		RunID: run.RunID, From: RunRunning, To: RunCompleted,
@@ -177,18 +150,96 @@ func TestTheClaimSurvivesOrphanRecovery(t *testing.T) {
 	}
 }
 
+// The executor checkpoints PENDING -> READY before it authorizes or dispatches
+// anything, and only increments the attempt counter on READY -> RUNNING. A
+// process killed in that gap leaves a durably READY node with attempts = 0 that
+// issued no statement, so there is nothing of ours under that name.
+//
+// If such a node claimed the name, `resume` would read MarkerAbsent plus that
+// stale claim, stamp PartitionCTL's ownership marker onto whatever unmarked
+// INVALID index a DBA had since left there, and drop it — destroying an object
+// this tool never created, authorized by a node that never ran. That is the
+// circularity claim.go's own doc says it excludes (AC-6).
+func TestAReadyNodeThatNeverDispatchedClaimsNothing(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newFileStore(t)
+	run := mustCreateRun(t, s, testClaimPlan(t, "orders_idx_p1"), "run-killed-at-ready")
+	idx := protocol.NewObjectName("public", "orders_idx_p1")
+
+	// PENDING -> READY, checkpointed, with no attempt recorded: the exact state
+	// a SIGKILL in that gap leaves behind.
+	rec, err := s.TransitionNode(ctx, NodeTransition{
+		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
+		From: protocol.NodePending, To: protocol.NodeReady,
+	})
+	if err != nil {
+		t.Fatalf("TransitionNode: %v", err)
+	}
+	if rec.State != protocol.NodeReady || rec.Attempts != 0 {
+		t.Fatalf("setup: node is %s with %d attempts, want READY with 0", rec.State, rec.Attempts)
+	}
+	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
+		RunID: run.RunID, From: RunRunning, To: RunOrphaned,
+	}); err != nil {
+		t.Fatalf("SetRunStatus: %v", err)
+	}
+
+	if id, found, err := ClaimsObject(ctx, s, idx); err != nil || found {
+		t.Fatalf("ClaimsObject = %q, %t; a node that issued nothing claims nothing (AC-6)", id, found)
+	}
+
+	// The claim goes live at the first dispatch, which is checkpointed before
+	// the statement is sent — so the crash window that actually needs covering
+	// is still covered.
+	if _, err := s.TransitionNode(ctx, NodeTransition{
+		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
+		From: protocol.NodeReady, To: protocol.NodeRunning, IncrementAttempt: true,
+	}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, found, err := ClaimsObject(ctx, s, idx); err != nil || !found {
+		t.Fatalf("found=%t err=%v; a dispatched node must claim its object", found, err)
+	}
+}
+
+// A retry sits in RETRY_WAIT and comes back through READY with its attempt
+// count intact, so requiring a dispatch for READY does not cost the resume path
+// the claim it needs.
+func TestAReadyNodeAwaitingItsRetryStillClaims(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newFileStore(t)
+	run := mustCreateRun(t, s, testClaimPlan(t, "orders_idx_p1"), "run-retry")
+	node := protocol.NodeID("cic:orders_idx_p1")
+	idx := protocol.NewObjectName("public", "orders_idx_p1")
+
+	dispatch(t, s, run.RunID, node)
+	for _, step := range []struct{ from, to protocol.NodeState }{
+		{protocol.NodeRunning, protocol.NodeRetryWait},
+		{protocol.NodeRetryWait, protocol.NodeReady},
+	} {
+		if _, err := s.TransitionNode(ctx, NodeTransition{
+			RunID: run.RunID, NodeID: node, From: step.from, To: step.to,
+		}); err != nil {
+			t.Fatalf("%s -> %s: %v", step.from, step.to, err)
+		}
+	}
+	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
+		RunID: run.RunID, From: RunRunning, To: RunInterrupted,
+	}); err != nil {
+		t.Fatalf("SetRunStatus: %v", err)
+	}
+	if _, found, err := ClaimsObject(ctx, s, idx); err != nil || !found {
+		t.Fatalf("found=%t err=%v; a node awaiting a retry has already dispatched", found, err)
+	}
+}
+
 // A terminally cancelled run is one `resume` will not adopt (FR-CLI-11), so its
 // claims must not authorize an adoption either.
 func TestACancelledRunClaimsNothing(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFileStore(t)
 	run := mustCreateRun(t, s, testClaimPlan(t, "orders_idx_p1"), "run-cancelled")
-	if _, err := s.TransitionNode(ctx, NodeTransition{
-		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
-		From: protocol.NodePending, To: protocol.NodeReady,
-	}); err != nil {
-		t.Fatalf("TransitionNode: %v", err)
-	}
+	dispatch(t, s, run.RunID, "cic:orders_idx_p1")
 	if _, err := s.SetRunStatus(ctx, RunStatusUpdate{
 		RunID: run.RunID, From: RunRunning, To: RunCancelled,
 	}); err != nil {
@@ -206,12 +257,7 @@ func TestClaimsObjectInScopesByDatabase(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFileStore(t)
 	run := mustCreateRun(t, s, testClaimPlan(t, "orders_idx_p1"), "run-appdb")
-	if _, err := s.TransitionNode(ctx, NodeTransition{
-		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
-		From: protocol.NodePending, To: protocol.NodeReady,
-	}); err != nil {
-		t.Fatalf("TransitionNode: %v", err)
-	}
+	dispatch(t, s, run.RunID, "cic:orders_idx_p1")
 	idx := protocol.NewObjectName("public", "orders_idx_p1")
 
 	if _, found, err := ClaimsObjectIn(ctx, s, "appdb", idx); err != nil || !found {
@@ -285,12 +331,7 @@ func TestClaimsObjectIgnoresOtherObjects(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFileStore(t)
 	run := mustCreateRun(t, s, testClaimPlan(t, "orders_idx_p1"), "run-other")
-	if _, err := s.TransitionNode(ctx, NodeTransition{
-		RunID: run.RunID, NodeID: "cic:orders_idx_p1",
-		From: protocol.NodePending, To: protocol.NodeReady,
-	}); err != nil {
-		t.Fatalf("TransitionNode: %v", err)
-	}
+	dispatch(t, s, run.RunID, "cic:orders_idx_p1")
 
 	if _, found, err := ClaimsObject(ctx, s, protocol.NewObjectName("public", "somebody_elses_idx")); err != nil || found {
 		t.Fatalf("found=%t err=%v", found, err)
@@ -299,6 +340,52 @@ func TestClaimsObjectIgnoresOtherObjects(t *testing.T) {
 	// a different object.
 	if _, found, err := ClaimsObject(ctx, s, protocol.NewObjectName("archive", "orders_idx_p1")); err != nil || found {
 		t.Fatalf("found=%t err=%v; schema must be part of the match", found, err)
+	}
+}
+
+// dispatch drives a node to the state the executor leaves it in when it sends a
+// statement: RUNNING, with the attempt counter incremented. That increment is
+// the durable record of a dispatch, and it is what makes a claim live.
+func dispatch(t *testing.T, s StateStore, run RunID, node protocol.NodeID) {
+	t.Helper()
+	ctx := context.Background()
+	for _, to := range []protocol.NodeState{protocol.NodeReady, protocol.NodeRunning} {
+		if _, err := s.TransitionNode(ctx, NodeTransition{
+			RunID: run, NodeID: node, From: priorState(to), To: to,
+			IncrementAttempt: to == protocol.NodeRunning,
+		}); err != nil {
+			t.Fatalf("dispatch %s -> %s: %v", priorState(to), to, err)
+		}
+	}
+}
+
+// walkToDone drives a node from wherever it is to DONE along the happy path.
+func walkToDone(t *testing.T, s StateStore, run RunID, node protocol.NodeID) {
+	t.Helper()
+	ctx := context.Background()
+	order := []protocol.NodeState{
+		protocol.NodePending, protocol.NodeReady, protocol.NodeRunning,
+		protocol.NodeVerifying, protocol.NodeDone,
+	}
+	cur, err := s.GetNode(ctx, run, node)
+	if err != nil {
+		t.Fatalf("GetNode %q: %v", node, err)
+	}
+	at := 0
+	for i, st := range order {
+		if cur.State == st {
+			at = i
+		}
+	}
+	for _, to := range order[at+1:] {
+		rec, err := s.TransitionNode(ctx, NodeTransition{
+			RunID: run, NodeID: node, From: cur.State, To: to,
+			IncrementAttempt: to == protocol.NodeRunning,
+		})
+		if err != nil {
+			t.Fatalf("node %q %s -> %s: %v", node, cur.State, to, err)
+		}
+		cur = rec
 	}
 }
 

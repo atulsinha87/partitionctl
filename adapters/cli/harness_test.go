@@ -345,6 +345,15 @@ func (h *harness) Run(args ...string) int {
 	return h.App.Run(ctx(), full)
 }
 
+// RunBare drives App.Run with exactly the arguments given, injecting no state
+// flags. `render` is offline and declares none, so it rejects them.
+func (h *harness) RunBare(args ...string) int {
+	h.t.Helper()
+	h.Stdout.Reset()
+	h.Stderr.Reset()
+	return h.App.Run(ctx(), args)
+}
+
 // Out is everything the last command wrote to stdout and stderr.
 func (h *harness) Out() string { return h.Stdout.String() + h.Stderr.String() }
 

@@ -228,20 +228,77 @@ func TestRenderMarkerStatementPreservesCreationFactsOnReindex(t *testing.T) {
 	}
 }
 
+// Every kind that writes a marker refuses to write it over a comment somebody
+// else wrote — not only the rewrite kinds.
+//
+// index.attach is the case that mattered and the case this test did not cover:
+// it marks unconditionally as the crash-window backstop, so with the refusal
+// gated behind Rewrite it replaced a DBA's comment on an index it had merely
+// attached, and downgraded a newer PartitionCTL's marker to v1. MarkerOurs is
+// the only proof of creation the drop table accepts and a marker never expires,
+// so that overwrite minted permanent provenance over an object this tool did
+// not create (AC-6, NFR-REL-3).
 func TestRenderMarkerStatementNeverOverwritesAForeignComment(t *testing.T) {
+	pidx := NewObjectName("public", "orders_idx")
 	cidx := NewObjectName("public", "orders_idx_p1")
-	n := Node{ID: "r", Kind: KindIndexReindexConcurrently, Params: &ReindexConcurrentlyParams{Index: cidx}}
 	base := Marker{Run: "run-1", Plan: "sha256:b", Op: string(OpReindexIndex), At: "2026-08-07T00:00:00Z"}
 
-	for _, status := range []MarkerStatus{MarkerForeign, MarkerUnreadable} {
-		if _, ok, err := RenderMarkerStatement(&n, base, Marker{}, status); ok || err != nil {
-			t.Fatalf("status %v: ok=%t err=%v; a reindex must not overwrite it", status, ok, err)
+	nodes := []Node{
+		{ID: "r", Kind: KindIndexReindexConcurrently, Params: &ReindexConcurrentlyParams{Index: cidx}},
+		{ID: "a", Kind: KindIndexAttach, Params: &AttachParams{ParentIndex: pidx, ChildIndex: cidx}},
+		{ID: "c", Kind: KindIndexCreateConcurrently, Params: &CreateConcurrentlyParams{Index: cidx}},
+		{ID: "p", Kind: KindIndexCreateParentInvalid, Params: &CreateParentInvalidParams{Index: pidx}},
+	}
+	for i := range nodes {
+		n := &nodes[i]
+		for _, status := range []MarkerStatus{MarkerForeign, MarkerUnreadable} {
+			stmt, ok, err := RenderMarkerStatement(n, base, Marker{}, status)
+			if ok || err != nil {
+				t.Fatalf("%s over a %v comment: ok=%t err=%v, stmt=%q; it must write nothing",
+					n.Kind, status, ok, err, stmt)
+			}
+		}
+		// An unmarked object does get a marker: there is nothing to overwrite,
+		// and for a reindex recording the rebuild is what makes the leaf
+		// skippable on the next plan.
+		if _, ok, err := RenderMarkerStatement(n, base, Marker{}, MarkerAbsent); !ok || err != nil {
+			t.Fatalf("%s over an unmarked object: ok=%t err=%v", n.Kind, ok, err)
 		}
 	}
-	// An unmarked index we just rebuilt does get a marker: there is nothing to
-	// overwrite, and recording the rebuild is what makes the leaf skippable.
-	if _, ok, err := RenderMarkerStatement(&n, base, Marker{}, MarkerAbsent); !ok || err != nil {
-		t.Fatalf("MarkerAbsent: ok=%t err=%v", ok, err)
+}
+
+// The read side accepts exactly what the write side can produce. A payload
+// FormatMarker would refuse must classify as MarkerUnreadable — a halt — rather
+// than as proof of ownership carrying empty evidence (A.5.1).
+func TestParseMarkerRejectsWhatFormatMarkerWouldRefuseToWrite(t *testing.T) {
+	unreadable := []string{
+		// No op, no at, and a role that is neither parent nor leaf: a payload
+		// this binary could not have written.
+		`partitionctl:v1:{"run":"x","role":"y"}`,
+		// Truncated: run and role survive, the creation facts do not.
+		`partitionctl:v1:{"run":"run-1","role":"leaf"}`,
+		// A role outside the vocabulary.
+		`partitionctl:v1:{"run":"run-1","op":"create-index","role":"partition","at":"2026-01-01T00:00:00Z"}`,
+		// No run at all.
+		`partitionctl:v1:{"op":"create-index","role":"leaf","at":"2026-01-01T00:00:00Z"}`,
+	}
+	for _, c := range unreadable {
+		m, status := ParseMarker(c)
+		if status != MarkerUnreadable {
+			t.Errorf("ParseMarker(%s) = %v, %v; want MarkerUnreadable", c, m, status)
+		}
+	}
+
+	// Everything FormatMarker writes still round-trips.
+	text, err := FormatMarker(Marker{
+		Run: "run-1", Plan: "sha256:a", Op: string(OpCreateIndex),
+		Role: MarkerRoleLeaf, At: "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("FormatMarker: %v", err)
+	}
+	if m, status := ParseMarker(text); status != MarkerOurs || m.Run != "run-1" {
+		t.Fatalf("ParseMarker(%s) = %v, %v; want MarkerOurs", text, m, status)
 	}
 }
 

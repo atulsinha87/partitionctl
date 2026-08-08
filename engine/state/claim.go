@@ -17,13 +17,22 @@ type ClaimReader interface {
 // claimingNode reports whether a node record still claims its object: the
 // statement may have run, may be running, or may be about to be re-attempted.
 //
-// PENDING is included only when the node has been dispatched at least once, and
-// the distinction is load-bearing in both directions.
+// READY and PENDING are included only when the node has been dispatched at
+// least once, and the distinction is load-bearing in both directions.
 //
 // A node that has never dispatched claims nothing, even though its record
 // already names the object. Otherwise a plan that merely *intends* to create
 // public.orders_idx_p1 would authorize destroying whatever unmarked index is
 // already sitting under that name, which is exactly the confusion AC-6 forbids.
+//
+// The attempt counter is what marks the boundary, and it marks it in the right
+// place: the executor increments it on the READY -> RUNNING transition, which
+// is checkpointed *before* the statement is sent, so the claim goes live one
+// durable write ahead of any DDL. READY used to claim unconditionally, which
+// made this paragraph false — a process killed in the PENDING -> READY -> RUNNING
+// gap left a durably READY node with attempts = 0 that had issued nothing, and
+// `resume` would then stamp its marker onto whatever unmarked index a DBA had
+// since left at that name and drop it.
 //
 // A node that has dispatched and is back in PENDING is the crash window itself:
 // orphan recovery is the one non-monotonic edge in D7 (RUNNING -> PENDING,
@@ -44,9 +53,10 @@ func claimingNode(n NodeRecord) bool {
 		return false
 	}
 	switch n.State {
-	case protocol.NodeReady, protocol.NodeRunning, protocol.NodeRetryWait, protocol.NodeVerifying:
+	case protocol.NodeRunning, protocol.NodeRetryWait, protocol.NodeVerifying:
+		// Every one of these implies a dispatch happened.
 		return true
-	case protocol.NodePending:
+	case protocol.NodeReady, protocol.NodePending:
 		return n.Attempts > 0
 	}
 	return false

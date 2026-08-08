@@ -78,7 +78,16 @@ func (a *App) cmdVerify(ctx context.Context, args []string) error {
 		if plan.Target.Index == nil {
 			return protocol.ErrFailure.Detailf("--end-state needs a plan whose target names an index")
 		}
-		report, err = v.VerifyPartitionedIndex(ctx, plan.Target.Table, *plan.Target.Index)
+		// The gate comes from the operation, not from the flag. "Did it reach
+		// its end state" has three different answers here: an index present and
+		// fully attached, the same plus no leftovers, and the index gone.
+		entry, ok := operationRegistry[plan.Operation]
+		if !ok || entry.EndState == nil {
+			return protocol.ErrFailure.Detailf(
+				"this build has no end-state gate for operation %q; it ships %v",
+				plan.Operation, registeredOperations())
+		}
+		report, err = entry.EndState(ctx, v, plan)
 	default:
 		// The plan's own index.verify nodes, in the order the executor would
 		// have run them, so a `verify` transcript reads in the same sequence as

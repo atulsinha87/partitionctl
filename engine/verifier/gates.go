@@ -104,9 +104,13 @@ func (v *Verifier) VerifyPartitionedIndex(ctx context.Context, table, parentInde
 // parent must stay valid and every leaf must stay attached across the swap, plus
 // the absence of any _ccnew/_ccold leftover on the tree.
 //
-// It answers only the catalog half of <partitionctlReindexGate>. "A PartitionCTL
-// reindex run completed at or after `since`" is a StateStore query the verifier
-// does not own, and the gate must ask it separately (TRD §7.2.7, FR-LB-4).
+// Since M2 this answers the whole of <partitionctlReindexGate> except the
+// watermark comparison itself. "A PartitionCTL reindex ran at or after `since`"
+// used to be a StateStore query the verifier did not own; the ownership marker
+// records `reindexed` and `reindex_run` on the leaf index, so it is now a
+// catalog fact read from obj_description like everything else here. The gate
+// keeps its `since` parameter and loses its StateStore dependency, which makes
+// it structurally identical to the other two (TRD §7.2.7, FR-LB-4, AC-22).
 func (v *Verifier) VerifyReindexedIndex(ctx context.Context, table, parentIndex protocol.ObjectName) (Report, error) {
 	r, err := v.VerifyPartitionedIndex(ctx, table, parentIndex)
 	if err != nil {

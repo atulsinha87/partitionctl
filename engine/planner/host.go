@@ -41,6 +41,13 @@ type Specification struct {
 	// node.
 	PaceReason string
 
+	// ReindexSince is ReindexPartitionedIndex's FR-PLAN-5 watermark: a leaf
+	// whose index carries a PartitionCTL marker recording a rebuild at or after
+	// this instant emits no reindex node. The zero value rebuilds every leaf,
+	// because an operator who asked for a reindex asked for a reindex. Ignored
+	// by the other two operations.
+	ReindexSince time.Time
+
 	// Confirmations are the acknowledgements the operator supplied at plan
 	// time. DropPartitionedIndex requires [protocol.ConfirmExclusiveLock]
 	// (FR-DROP-3, AC-13).
@@ -324,7 +331,27 @@ func (h *Host) Run(ctx context.Context, op OperationPlanner, spec Specification)
 			spec.Operation)
 	}
 
+	// Seal the target index schema-qualified, defaulting the schema from the
+	// discovered root the way Table already is (topo.Root.Name, just below).
+	//
+	// This is load-bearing, not cosmetic. FR-AUTH-4's `explicit` mode compares
+	// plan.Target.Index against the catalog-resolved object the destructive node
+	// names (engine/executor/authorize.go), and the catalog always answers
+	// schema-qualified. The documented specification form is unqualified —
+	// adapters/cli/spec.go's own example is "index": "orders_created_at_idx" —
+	// so sealing the raw value made the comparison fail against itself: a live
+	// drop-index run halted at index.drop_partitioned with exit 13 and the
+	// self-contradictory reason "the plan's target does not name
+	// public.orders_created_at_idx", after the plan had already validated and
+	// printed normally. Every operation resolves the schema this way internally;
+	// the artifact has to record what they resolved, not what was typed.
+	//
+	// An index always lives in its table's schema — PostgreSQL gives no way to
+	// put it elsewhere — so the root is the correct and only source.
 	index := spec.Index
+	if index.Schema == "" && index.Name != "" {
+		index.Schema = topo.Root.Name.Schema
+	}
 	plan := &protocol.Plan{
 		FormatVersion: protocol.PlanFormatVersion,
 		PlanID:        planID,

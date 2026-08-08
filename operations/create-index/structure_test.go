@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/atulsinha/partitionctl/engine/planner"
 )
 
 // This file is the machine-checked form of TRD §17.3 and AC-21: operations/
@@ -49,6 +51,7 @@ func TestPackageImportsNothingThatCanExecute(t *testing.T) {
 	}
 	allowedNonStdlib := map[string]bool{
 		"github.com/atulsinha/partitionctl/engine/protocol": true,
+		"github.com/atulsinha/partitionctl/engine/planner":  true,
 	}
 
 	fset := token.NewFileSet()
@@ -66,8 +69,8 @@ func TestPackageImportsNothingThatCanExecute(t *testing.T) {
 				t.Errorf("%s imports %q: %s", name, path, why)
 			}
 			if strings.Contains(path, ".") && !allowedNonStdlib[path] {
-				t.Errorf("%s imports %q; this package depends only on the standard library "+
-					"and engine/protocol", name, path)
+				t.Errorf("%s imports %q; this package depends only on the standard library, "+
+					"engine/protocol and engine/planner", name, path)
 			}
 		}
 	}
@@ -108,12 +111,16 @@ func TestPackageContainsNoExecutor(t *testing.T) {
 	}
 }
 
-// NFR-EXT-1 evidence in the small: everything this package needs from outside
-// is one interface it defines itself, so adding an operation is a new planner
-// and nothing else.
-func TestPackageDeclaresItsOwnSeams(t *testing.T) {
+// NFR-EXT-1 evidence in the small, in the direction the reduction moved it: the
+// package declares no interface at all. Every seam it needs — the catalog
+// reader, the specification, the claim lookup, the estimator, the renderer —
+// belongs to engine/planner or engine/protocol, so there is exactly one of each
+// in the tree and an operation is a consumer of them rather than an author of a
+// parallel set. A new interface appearing here is the beginning of a second
+// planning stack, which is what B1 removed.
+func TestPackageDeclaresNoInterfacesOfItsOwn(t *testing.T) {
 	fset := token.NewFileSet()
-	found := map[string]bool{}
+	var found []string
 	for _, name := range sourceFiles(t) {
 		f, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
@@ -125,19 +132,20 @@ func TestPackageDeclaresItsOwnSeams(t *testing.T) {
 				return true
 			}
 			if _, isIface := ts.Type.(*ast.InterfaceType); isIface {
-				found[ts.Name.Name] = true
+				found = append(found, ts.Name.Name)
 			}
 			return true
 		})
 	}
-	for _, want := range []string{"CatalogReader", "ClaimReader"} {
-		if !found[want] {
-			t.Errorf("package does not declare the %s interface", want)
-		}
+	if len(found) > 0 {
+		t.Errorf("package declares interfaces %v; an operation consumes engine/planner's seams "+
+			"and declares none of its own (NFR-EXT-1)", found)
 	}
-	if len(found) > 2 {
-		t.Errorf("package declares %d interfaces (%v); the seam should stay small", len(found), found)
-	}
+}
+
+// The one thing the package must satisfy from outside is the host's interface.
+func TestPlannerImplementsTheHostInterface(t *testing.T) {
+	var _ planner.OperationPlanner = Planner{}
 }
 
 // The package doc is load-bearing: it is what tells the next reader that the

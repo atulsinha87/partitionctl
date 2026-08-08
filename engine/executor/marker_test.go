@@ -160,9 +160,49 @@ func TestReindexDoesNotOverwriteAForeignComment(t *testing.T) {
 	}
 }
 
-// A plan that reindexes needs the catalog port, because the rewrite reads the
-// marker already on the object. Refusing up front beats discovering it halfway
-// through a 400-partition rebuild.
+// index.attach marks unconditionally — that is its job, as the backstop for a
+// crash between CREATE INDEX CONCURRENTLY and its COMMENT. "Unconditionally"
+// must still stop at a comment somebody else wrote.
+//
+// A DBA can pre-build a leaf index at the generated name (protocol.ChildIndexName
+// is a documented pure function of the parent index name and the partition name)
+// and comment it for change management. Before this, the attach replaced that
+// comment with PartitionCTL's marker — and MarkerOurs is the only proof of
+// creation DecideProvenanceDrop accepts, and a marker never expires. The attach
+// still runs; the index simply stays unmarked, so a later run halts on it
+// rather than destroying it.
+func TestAttachDoesNotOverwriteAForeignComment(t *testing.T) {
+	for _, comment := range []string{
+		"CHG-4471 pre-build by dba-team; DO NOT DROP",     // MarkerForeign
+		`partitionctl:v2:{"run":"run-future","role":"x"}`, // MarkerUnreadable: a newer tool's marker
+	} {
+		h := newHarness()
+		leaf := obj(t, "public.orders_created_at_idx_orders_2026_03")
+		h.catalog.setComment(leaf, comment)
+
+		plan := newPlan(t,
+			node("n1", protocol.KindIndexAttach, &protocol.AttachParams{
+				ParentIndex: obj(t, "public.orders_created_at_idx"),
+				ChildIndex:  leaf,
+			}),
+		)
+		if _, err := h.run(t, plan); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		stmts := h.sql.statementsFor("n1")
+		if len(stmts) != 1 {
+			t.Fatalf("comment %q: issued %d statements, want the ATTACH alone:\n%+v",
+				comment, len(stmts), stmts)
+		}
+		if !strings.HasPrefix(stmts[0].SQL, "ALTER INDEX ") {
+			t.Fatalf("comment %q: the one statement is not the attach:\n%s", comment, stmts[0].SQL)
+		}
+	}
+}
+
+// A plan that marks anything needs the catalog port, because every marking kind
+// reads whatever comment the object already carries before it writes. Refusing
+// up front beats discovering it halfway through a 400-partition build.
 func TestReindexNeedsTheCatalogPort(t *testing.T) {
 	h := newHarness()
 	h.cfg.Catalog = nil

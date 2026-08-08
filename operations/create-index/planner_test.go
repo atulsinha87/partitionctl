@@ -6,18 +6,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/atulsinha/partitionctl/engine/planner"
 	"github.com/atulsinha/partitionctl/engine/protocol"
 )
-
-var fixedNow = func() time.Time { return time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC) }
-
-func testPlanner() Planner { return Planner{Now: fixedNow} }
-
-func testPlannerWith(claims ClaimReader) Planner {
-	return Planner{Now: fixedNow, Claims: claims}
-}
 
 // ---------------------------------------------------------------------------
 // The graph of TRD §7.2.13
@@ -26,7 +18,7 @@ func testPlannerWith(claims ClaimReader) Planner {
 func TestPlanCleanBuildEmitsTheSpecifiedGraph(t *testing.T) {
 	leaves := []string{"orders_2026_01", "orders_2026_02", "orders_2026_03"}
 	cat := newCatalog(leaves...)
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	// 1 assert + 1 parent + 4 per leaf + 1 final verify.
 	if got, want := len(p.Nodes), 2+len(leaves)*4+1; got != want {
@@ -71,15 +63,15 @@ func TestPlanCleanBuildEmitsTheSpecifiedGraph(t *testing.T) {
 	if _, err := p.TopologicalOrder(); err != nil {
 		t.Fatalf("TopologicalOrder() error = %v", err)
 	}
-	if !HasWork(p) {
-		t.Fatal("HasWork() = false on a clean build")
+	if !hasWork(p) {
+		t.Fatal("a clean build produced no DDL")
 	}
 }
 
 func TestPlanNodeKindsAreOnlyTheSpecifiedSix(t *testing.T) {
 	cat := newCatalog("p1", "p2")
 	cat.indexes[child("p1")] = marked(invalidIndex("p1"))
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	allowed := map[protocol.NodeKind]bool{
 		protocol.KindCatalogAssert:            true,
@@ -105,7 +97,7 @@ func TestPlanNodeKindsAreOnlyTheSpecifiedSix(t *testing.T) {
 func TestPlanAssertNodeCarriesEveryPrecondition(t *testing.T) {
 	leaves := []string{"p1", "p2"}
 	cat := newCatalog(leaves...)
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	params, ok := node(t, p, nodeAssert).Params.(*protocol.CatalogAssertParams)
 	if !ok {
@@ -159,7 +151,7 @@ func TestPlanAssertNodeCarriesEveryPrecondition(t *testing.T) {
 func TestPlanFinalVerifyAssertsTheWhole(t *testing.T) {
 	leaves := []string{"p1", "p2", "p3"}
 	cat := newCatalog(leaves...)
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	params := node(t, p, nodeFinalVerify).Params.(*protocol.VerifyParams)
 
@@ -194,7 +186,7 @@ func TestPlanFinalVerifyAssertsTheWhole(t *testing.T) {
 
 func TestPlanLeafVerifyChecksValidReadyLiveBeforeAttach(t *testing.T) {
 	cat := newCatalog("p1")
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	verify := node(t, p, nodeID("verify", obj("p1")))
 	params := verify.Params.(*protocol.VerifyParams)
@@ -220,15 +212,10 @@ func TestPlanFullyCompleteEmitsNoWork(t *testing.T) {
 		cat.indexes[child(l)] = attachedIndex(l)
 	}
 
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
-	if HasWork(p) {
-		t.Fatalf("HasWork() = true on a converged catalog; nodes: %v", nodeIDs(p))
-	}
-	for i := range p.Nodes {
-		if p.Nodes[i].Kind.IssuesDDL() {
-			t.Fatalf("converged plan contains a DDL node %q of kind %q", p.Nodes[i].ID, p.Nodes[i].Kind)
-		}
+	if hasWork(p) {
+		t.Fatalf("converged catalog still produced DDL; nodes: %v", nodeIDs(p))
 	}
 	// It is a checked no-op, not an empty file: assert plus final verify.
 	if got := nodeIDs(p); len(got) != 2 || got[0] != nodeAssert || got[1] != nodeFinalVerify {
@@ -251,7 +238,7 @@ func TestPlanPartiallyCompleteEmitsOnlyTheRemainingLeaves(t *testing.T) {
 	cat.indexes[child("p2")] = attachedIndex("p2")                // done
 	cat.indexes[child("p3")] = builtIndex("p3")                   // built, not attached
 
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	// The parent index already exists, so no create_parent_invalid.
 	if hasNode(p, nodeParentIndex) {
@@ -291,25 +278,25 @@ func TestPlanPartiallyCompleteEmitsOnlyTheRemainingLeaves(t *testing.T) {
 func TestPlanIsIdempotentAcrossReplans(t *testing.T) {
 	leaves := []string{"p1", "p2"}
 	cat := newCatalog(leaves...)
-	first := mustPlan(t, testPlanner(), newSpec(), cat)
+	first := mustPlan(t, cat, newSpec())
 
 	// Simulate the run having completed, then re-plan.
 	cat.indexes[obj(testIndex)] = parentIndexState(true)
 	for _, l := range leaves {
 		cat.indexes[child(l)] = attachedIndex(l)
 	}
-	second := mustPlan(t, testPlanner(), newSpec(), cat)
+	second := mustPlan(t, cat, newSpec())
 
-	if !HasWork(first) {
+	if !hasWork(first) {
 		t.Fatal("first plan has no work")
 	}
-	if HasWork(second) {
+	if hasWork(second) {
 		t.Fatalf("re-plan after convergence still has work: %v", nodeIDs(second))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// FR-PLAN-6 / FR-PLAN-7: INVALID index handling
+// FR-PLAN-6 / FR-PLAN-7: unusable-index handling
 // ---------------------------------------------------------------------------
 
 func TestPlanInvalidMarkedLeafEmitsDropBeforeRebuild(t *testing.T) {
@@ -318,7 +305,7 @@ func TestPlanInvalidMarkedLeafEmitsDropBeforeRebuild(t *testing.T) {
 	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
 	cat.indexes[child("p1")] = marked(invalidIndex("p1"))
 
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	drop := node(t, p, nodeID("drop", obj("p1")))
 	if drop.Kind != protocol.KindIndexDropConcurrently {
@@ -370,30 +357,27 @@ func TestPlanUnmarkedInvalidLeafHalts(t *testing.T) {
 	// The parent index is ours; the leaf carries nothing.
 	cat.indexes[child("p1")] = invalidIndex("p1")
 
-	p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil {
 		t.Fatalf("Plan() returned a plan of %d nodes; FR-PLAN-7 requires no plan at all", len(p.Nodes))
 	}
-	if !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
-		t.Fatalf("Plan() error = %v, want ErrAuthorizationUnsatisfied", err)
-	}
 	if got := protocol.ExitCodeFor(err); got != protocol.ExitAuthorizationUnsatisfied {
-		t.Errorf("exit code = %d, want %d", got, protocol.ExitAuthorizationUnsatisfied)
+		t.Errorf("exit code = %d, want %d (%v)", got, protocol.ExitAuthorizationUnsatisfied, err)
 	}
 	if !strings.Contains(err.Error(), child("p1").String()) {
 		t.Errorf("error does not name the offending index: %v", err)
 	}
 }
 
-func TestPlanDefaultPlannerHasNoClaimSourceAndSoHalts(t *testing.T) {
+func TestPlanWithNoClaimSourceHalts(t *testing.T) {
 	cat := newCatalog("p1")
 	cat.indexes[child("p1")] = invalidIndex("p1")
 
-	// Planner{} has no claim source, and the object carries no marker. The safe
-	// default is to halt, never to drop.
-	p, err := Plan(context.Background(), newSpec(), cat)
-	if p != nil || !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
-		t.Fatalf("Plan() = (%v, %v), want (nil, ErrAuthorizationUnsatisfied)", p, err)
+	// No claim source, and the object carries no marker. The safe default is to
+	// halt, never to drop.
+	p, _, err := tryPlan(t, cat, newSpec())
+	if p != nil || protocol.ExitCodeFor(err) != protocol.ExitAuthorizationUnsatisfied {
+		t.Fatalf("Plan() = (%v, %v), want (nil, an authorization halt)", p, err)
 	}
 }
 
@@ -404,11 +388,11 @@ func TestPlanUnmarkedInvalidLeafWithALiveClaimIsDropped(t *testing.T) {
 	cat := newCatalog("p1", "p2")
 	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
 	cat.indexes[child("p1")] = invalidIndex("p1")
+	cat.claims = planner.NewFakeClaims(child("p1"))
 
-	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
-	p := mustPlan(t, testPlannerWith(claims), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 	if !hasNode(p, nodeID("drop", obj("p1"))) {
-		t.Fatal("a claimed, unmarked INVALID index was not planned for cleanup (FR-PLAN-6)")
+		t.Fatal("a claimed, unmarked unusable index was not planned for cleanup (FR-PLAN-6)")
 	}
 }
 
@@ -418,45 +402,56 @@ func TestPlanInvalidLeafUnderAForeignCommentHalts(t *testing.T) {
 	cat := newCatalog("p1", "p2")
 	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
 	cat.indexes[child("p1")] = commented(invalidIndex("p1"), "built by the DBA team, do not touch")
+	cat.claims = planner.NewFakeClaims(child("p1"))
 
-	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
-	p, err := testPlannerWith(claims).Plan(context.Background(), newSpec(), cat)
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil {
 		t.Fatal("Plan() emitted a graph that would drop an index under somebody else's comment")
 	}
-	if !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
-		t.Fatalf("Plan() error = %v, want ErrAuthorizationUnsatisfied", err)
+	if got := protocol.ExitCodeFor(err); got != protocol.ExitAuthorizationUnsatisfied {
+		t.Fatalf("exit code = %d, want %d (%v)", got, protocol.ExitAuthorizationUnsatisfied, err)
 	}
 }
 
 func TestPlanUnmarkedInvalidParentIndexHalts(t *testing.T) {
 	cat := newCatalog("p1")
 	cat.indexes[obj(testIndex)] = parentIndexState(false)
+	cat.claims = planner.NewFakeClaims()
 
-	p, err := testPlannerWith(&fakeClaims{}).Plan(context.Background(), newSpec(), cat)
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil {
 		t.Fatal("Plan() adopted an in-progress parent index it cannot prove it created")
 	}
-	if !errors.Is(err, protocol.ErrAuthorizationUnsatisfied) {
-		t.Fatalf("Plan() error = %v, want ErrAuthorizationUnsatisfied", err)
+	if got := protocol.ExitCodeFor(err); got != protocol.ExitAuthorizationUnsatisfied {
+		t.Fatalf("exit code = %d, want %d (%v)", got, protocol.ExitAuthorizationUnsatisfied, err)
+	}
+}
+
+func TestPlanMarkedInvalidParentIndexIsAdopted(t *testing.T) {
+	cat := newCatalog("p1")
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+
+	p := mustPlan(t, cat, newSpec())
+	if hasNode(p, nodeParentIndex) {
+		t.Error("re-created a parent index that already exists and is ours to adopt")
+	}
+	if !hasNode(p, nodeID("create", obj("p1"))) {
+		t.Error("adopting the parent index dropped the leaf work with it")
 	}
 }
 
 func TestPlanInvalidAttachedLeafHalts(t *testing.T) {
 	cat := newCatalog("p1")
-	cat.indexes[obj(testIndex)] = parentIndexState(true)
-	st := invalidIndex("p1")
-	parent := obj(testIndex)
-	st.AttachedTo = &parent
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(true))
+	st := marked(invalidIndex("p1"))
+	st.ParentIndexOID = parentIndexOID
 	cat.indexes[child("p1")] = st
 
 	// Even when it is provably ours: PostgreSQL cannot drop an attached child
 	// index individually, so no graph fixes this (TRD §7.2.10).
-	cat.indexes[obj(testIndex)] = marked(cat.indexes[obj(testIndex)])
-	cat.indexes[child("p1")] = marked(cat.indexes[child("p1")])
-	p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil {
-		t.Fatal("Plan() emitted a graph for an attached INVALID leaf index")
+		t.Fatal("Plan() emitted a graph for an attached, unusable leaf index")
 	}
 	if err == nil || !strings.Contains(err.Error(), "attached") {
 		t.Fatalf("Plan() error = %v, want an explanation naming the attachment", err)
@@ -464,7 +459,6 @@ func TestPlanInvalidAttachedLeafHalts(t *testing.T) {
 }
 
 func TestPlanRefusesForeignObjectsOccupyingTargetNames(t *testing.T) {
-	other := protocol.NewObjectName(testSchema, "other_table")
 	tests := []struct {
 		name  string
 		setup func(c *fakeCatalog)
@@ -474,34 +468,16 @@ func TestPlanRefusesForeignObjectsOccupyingTargetNames(t *testing.T) {
 			name: "parent index name taken by an ordinary index",
 			setup: func(c *fakeCatalog) {
 				st := parentIndexState(true)
-				st.IsPartitioned = false
+				st.Kind = planner.RelKindIndex
 				c.indexes[obj(testIndex)] = st
 			},
 			want: "ordinary index",
 		},
 		{
-			name: "parent index exists on another relation",
-			setup: func(c *fakeCatalog) {
-				st := parentIndexState(true)
-				st.Relation = other
-				c.indexes[obj(testIndex)] = st
-			},
-			want: "not on",
-		},
-		{
-			name: "child index name exists on another relation",
-			setup: func(c *fakeCatalog) {
-				st := builtIndex("p1")
-				st.Relation = other
-				c.indexes[child("p1")] = st
-			},
-			want: "already exists on",
-		},
-		{
 			name: "child index name is a partitioned index",
 			setup: func(c *fakeCatalog) {
 				st := builtIndex("p1")
-				st.IsPartitioned = true
+				st.Kind = planner.RelKindPartitionedIndex
 				c.indexes[child("p1")] = st
 			},
 			want: "partitioned index",
@@ -510,7 +486,7 @@ func TestPlanRefusesForeignObjectsOccupyingTargetNames(t *testing.T) {
 			name: "child index attached to a different parent",
 			setup: func(c *fakeCatalog) {
 				st := builtIndex("p1")
-				st.AttachedTo = &other
+				st.ParentIndexOID = foreignOID
 				c.indexes[child("p1")] = st
 			},
 			want: "already attached to",
@@ -520,7 +496,7 @@ func TestPlanRefusesForeignObjectsOccupyingTargetNames(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cat := newCatalog("p1")
 			tc.setup(cat)
-			p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
+			p, _, err := tryPlan(t, cat, newSpec())
 			if p != nil {
 				t.Fatalf("Plan() returned a plan; want a halt")
 			}
@@ -538,7 +514,7 @@ func TestPlanRefusesForeignObjectsOccupyingTargetNames(t *testing.T) {
 func TestPlanRecordsChildIndexNamesFromTheProtocolFunction(t *testing.T) {
 	leaves := []string{"orders_2026_01", "orders_2026_02"}
 	cat := newCatalog(leaves...)
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	for _, l := range leaves {
 		want := protocol.ChildIndexName(testIndex, l)
@@ -569,7 +545,7 @@ func TestPlanTruncatesOverlongChildNamesDeterministically(t *testing.T) {
 	cat := newCatalog(leaves...)
 	spec := newSpec()
 	spec.Index = obj(longParent)
-	p := mustPlan(t, testPlanner(), spec, cat)
+	p := mustPlan(t, cat, spec)
 
 	seen := map[string]bool{}
 	for _, l := range leaves {
@@ -590,9 +566,10 @@ func TestPlanTruncatesOverlongChildNamesDeterministically(t *testing.T) {
 
 func TestPlanRejectsCollidingChildNames(t *testing.T) {
 	// Two partitions whose names differ only past the truncation point still
-	// get distinct names, so force a genuine duplicate instead.
+	// get distinct names, so force a genuine duplicate instead: two relations,
+	// same schema, same name.
 	cat := newCatalog("p1", "p1")
-	_, err := testPlanner().Plan(context.Background(), newSpec(), cat)
+	_, _, err := tryPlan(t, cat, newSpec())
 	if !errors.Is(err, protocol.ErrNameCollision) {
 		t.Fatalf("Plan() error = %v, want ErrNameCollision", err)
 	}
@@ -602,11 +579,11 @@ func TestPlanNamesChildrenPerSchema(t *testing.T) {
 	// Same partition name in two schemas is legal and must not be reported as
 	// a collision: each index lives in its own table's schema.
 	cat := newCatalog()
-	cat.topology.Partitions = []protocol.RelationState{
-		{OID: 1, Schema: "a", Name: "p1", RelKind: RelKindTable, ParentOID: rootOID},
-		{OID: 2, Schema: "b", Name: "p1", RelKind: RelKindTable, ParentOID: rootOID},
-	}
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	cat.setLeaves(
+		protocol.NewObjectName("a", "p1"),
+		protocol.NewObjectName("b", "p1"),
+	)
+	p := mustPlan(t, cat, newSpec())
 
 	for _, schema := range []string{"a", "b"} {
 		leaf := protocol.NewObjectName(schema, "p1")
@@ -625,10 +602,10 @@ func TestPlanEstimatesFromRelPages(t *testing.T) {
 	cat := newCatalog("small", "large")
 	cat.pages[obj("small")] = 128              // 1 MiB
 	cat.pages[obj("large")] = 128 * 1024 * 100 // 100 GiB
-	spec := newSpec()
-	spec.BuildBytesPerSecond = 10 << 20 // 10 MiB/s, so the arithmetic is checkable
+	// 10 MiB/s, so the arithmetic is checkable, and a 1s floor.
+	cat.estimator = planner.Estimator{BuildBytesPerSecond: 10 << 20, MinBuildSeconds: 1}
 
-	p := mustPlan(t, testPlanner(), spec, cat)
+	p := mustPlan(t, cat, newSpec())
 
 	small := node(t, p, nodeID("create", obj("small"))).EstimatedSeconds
 	large := node(t, p, nodeID("create", obj("large"))).EstimatedSeconds
@@ -641,11 +618,10 @@ func TestPlanEstimatesFromRelPages(t *testing.T) {
 	if large <= small {
 		t.Error("estimates do not scale with relpages (FR-PLAN-9)")
 	}
-	// A leaf with no relpages entry still estimates, at the floor.
-	cat2 := newCatalog("unknown")
-	p2 := mustPlan(t, testPlanner(), newSpec(), cat2)
-	if got := node(t, p2, nodeID("create", obj("unknown"))).EstimatedSeconds; got != 1 {
-		t.Errorf("unknown-size leaf estimate = %d, want the 1s floor", got)
+	// A leaf with no relpages still estimates, at the default floor.
+	p2 := mustPlan(t, newCatalog("unknown"), newSpec())
+	if got := node(t, p2, nodeID("create", obj("unknown"))).EstimatedSeconds; got != planner.DefaultMinBuildSeconds {
+		t.Errorf("unknown-size leaf estimate = %d, want the %ds floor", got, planner.DefaultMinBuildSeconds)
 	}
 }
 
@@ -654,7 +630,7 @@ func TestPlanTotalEstimateIncludesPacing(t *testing.T) {
 	spec := newSpec()
 	spec.PaceSeconds = 45
 
-	p := mustPlan(t, testPlanner(), spec, cat)
+	p := mustPlan(t, cat, spec)
 	for _, l := range []string{"p1", "p2"} {
 		w := node(t, p, nodeID("wait", obj(l)))
 		params := w.Params.(*protocol.WaitParams)
@@ -678,7 +654,7 @@ func TestPlanEmitsWaitNodesEvenWithZeroPacing(t *testing.T) {
 	spec := newSpec()
 	spec.PaceSeconds = 0
 
-	p := mustPlan(t, testPlanner(), spec, cat)
+	p := mustPlan(t, cat, spec)
 	w := node(t, p, nodeID("wait", obj("p1")))
 	if got := w.Params.(*protocol.WaitParams).Seconds; got != 0 {
 		t.Errorf("wait seconds = %d, want 0", got)
@@ -687,26 +663,15 @@ func TestPlanEmitsWaitNodesEvenWithZeroPacing(t *testing.T) {
 	depsEqual(t, p, nodeFinalVerify, nodeID("wait", obj("p1")))
 }
 
-func TestEstimateBuildSeconds(t *testing.T) {
-	tests := []struct {
-		name  string
-		pages int64
-		rate  int64
-		want  int
-	}{
-		{"zero pages floors at one second", 0, DefaultBuildBytesPerSecond, 1},
-		{"negative pages floors at one second", -5, DefaultBuildBytesPerSecond, 1},
-		{"rounds up a partial second", 1, 1, 2 * PageBytes},
-		{"two passes over the relation", 1024, 8192, 2 * 1024},
-		{"zero rate falls back to the default", 1024, 0, estimateBuildSeconds(1024, DefaultBuildBytesPerSecond)},
-		{"absurd relpages stays finite", 1 << 62, 1, maxEstimateSeconds},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := estimateBuildSeconds(tc.pages, tc.rate); got != tc.want {
-				t.Errorf("estimateBuildSeconds(%d, %d) = %d, want %d", tc.pages, tc.rate, got, tc.want)
-			}
-		})
+func TestPlanRecordsTheOperatorsPaceReason(t *testing.T) {
+	cat := newCatalog("p1")
+	spec := newSpec()
+	spec.PaceSeconds = 30
+	spec.PaceReason = "replica lag budget"
+
+	p := mustPlan(t, cat, spec)
+	if got := node(t, p, nodeID("wait", obj("p1"))).Params.(*protocol.WaitParams).Reason; got != spec.PaceReason {
+		t.Errorf("wait reason = %q, want the operator's %q", got, spec.PaceReason)
 	}
 }
 
@@ -715,23 +680,19 @@ func TestEstimateBuildSeconds(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPlanIsDeterministic(t *testing.T) {
-	cat := newCatalog("p3", "p1", "p2") // deliberately unsorted
-	first := mustPlan(t, testPlanner(), newSpec(), cat)
+	first := mustPlan(t, newCatalog("p3", "p1", "p2"), newSpec())
 
-	// The same partitions returned in a different scan order must produce the
+	// The same partitions declared in a different order must produce the
 	// identical artifact: the graph is a function of the catalog's content, not
-	// of its physical layout.
-	shuffled := newCatalog()
-	shuffled.topology = cat.topology
-	parts := cat.topology.Partitions
-	shuffled.topology.Partitions = []protocol.RelationState{parts[2], parts[0], parts[1]}
-	second := mustPlan(t, testPlanner(), newSpec(), shuffled)
+	// of its physical layout. Leaf OIDs are derived from leaf names, so these
+	// two catalogs are the same tree.
+	second := mustPlan(t, newCatalog("p2", "p3", "p1"), newSpec())
 
 	if first.Digest != second.Digest {
 		t.Fatalf("digests differ across partition orderings:\n %s\n %s", first.Digest, second.Digest)
 	}
-	if first.PlanID != second.PlanID {
-		t.Fatalf("plan ids differ: %q vs %q", first.PlanID, second.PlanID)
+	if first.TopologyFingerprint != second.TopologyFingerprint {
+		t.Fatalf("fingerprints differ: %q vs %q", first.TopologyFingerprint, second.TopologyFingerprint)
 	}
 	a, err := protocol.EncodePlan(first)
 	if err != nil {
@@ -748,12 +709,12 @@ func TestPlanIsDeterministic(t *testing.T) {
 
 func TestPlanOrdersLeavesBySchemaThenName(t *testing.T) {
 	cat := newCatalog()
-	cat.topology.Partitions = []protocol.RelationState{
-		{OID: 3, Schema: "b", Name: "a1", RelKind: RelKindTable, ParentOID: rootOID},
-		{OID: 1, Schema: "a", Name: "z9", RelKind: RelKindTable, ParentOID: rootOID},
-		{OID: 2, Schema: "a", Name: "a1", RelKind: RelKindTable, ParentOID: rootOID},
-	}
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	cat.setLeaves(
+		protocol.NewObjectName("b", "a1"),
+		protocol.NewObjectName("a", "z9"),
+		protocol.NewObjectName("a", "a1"),
+	)
+	p := mustPlan(t, cat, newSpec())
 
 	var creates []protocol.NodeID
 	for i := range p.Nodes {
@@ -772,8 +733,8 @@ func TestPlanOrdersLeavesBySchemaThenName(t *testing.T) {
 func TestPlanRoundTripsThroughTheArtifact(t *testing.T) {
 	cat := newCatalog("p1", "p2")
 	cat.indexes[child("p1")] = invalidIndex("p1")
-	claims := &fakeClaims{claimed: map[protocol.ObjectName]bool{child("p1"): true}}
-	p := mustPlan(t, testPlannerWith(claims), newSpec(), cat)
+	cat.claims = planner.NewFakeClaims(child("p1"))
+	p := mustPlan(t, cat, newSpec())
 
 	data, err := protocol.EncodePlan(p)
 	if err != nil {
@@ -799,7 +760,7 @@ func TestPlanRoundTripsThroughTheArtifact(t *testing.T) {
 
 func TestPlanCarriesIdentityAndFingerprint(t *testing.T) {
 	cat := newCatalog("p1", "p2")
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	p := mustPlan(t, cat, newSpec())
 
 	if p.FormatVersion != protocol.PlanFormatVersion {
 		t.Errorf("format version = %d, want %d", p.FormatVersion, protocol.PlanFormatVersion)
@@ -807,21 +768,20 @@ func TestPlanCarriesIdentityAndFingerprint(t *testing.T) {
 	if p.Operation != protocol.OpCreateIndex {
 		t.Errorf("operation = %q, want %q", p.Operation, protocol.OpCreateIndex)
 	}
-	if p.Target.Database != "shop" || p.Target.Table != obj(testTable) {
-		t.Errorf("target = %+v, want database shop and table %s", p.Target, obj(testTable))
+	if p.Target.Database != testDB || p.Target.Table != obj(testTable) {
+		t.Errorf("target = %+v, want database %s and table %s", p.Target, testDB, obj(testTable))
 	}
 	if p.Target.Index == nil || *p.Target.Index != obj(testIndex) {
 		t.Errorf("target index = %v, want %s", p.Target.Index, obj(testIndex))
 	}
-	want, err := cat.topology.Fingerprint()
-	if err != nil {
-		t.Fatal(err)
+	if p.TopologyFingerprint == "" {
+		t.Error("plan carries no topology fingerprint (FR-PLANFILE-4)")
 	}
-	if p.TopologyFingerprint != want {
-		t.Errorf("fingerprint = %q, want %q (FR-PLANFILE-4)", p.TopologyFingerprint, want)
+	if p.Topology == nil || len(p.Topology.Partitions) != 2 {
+		t.Errorf("plan does not carry the tree it was checked against: %+v", p.Topology)
 	}
-	if !strings.HasPrefix(string(p.PlanID), string(protocol.OpCreateIndex)+"-") {
-		t.Errorf("derived plan id = %q, want it to name its operation", p.PlanID)
+	if p.PlanID != testPlanID {
+		t.Errorf("plan id = %q, want the host's %q", p.PlanID, testPlanID)
 	}
 	if !p.CreatedAt.Time.Equal(fixedNow()) {
 		t.Errorf("created_at = %v, want %v", p.CreatedAt, fixedNow())
@@ -832,12 +792,85 @@ func TestPlanCarriesIdentityAndFingerprint(t *testing.T) {
 	}
 }
 
-func TestPlanHonoursAnExplicitPlanID(t *testing.T) {
-	spec := newSpec()
-	spec.PlanID = "hand-written-id"
-	p := mustPlan(t, testPlanner(), spec, newCatalog("p1"))
-	if p.PlanID != "hand-written-id" {
-		t.Errorf("plan id = %q, want the specified one", p.PlanID)
+// ---------------------------------------------------------------------------
+// Operator-facing notes
+// ---------------------------------------------------------------------------
+
+func TestNotesReportTheSkipCountAndTheMarker(t *testing.T) {
+	leaves := []string{"p1", "p2", "p3", "p4"}
+	cat := newCatalog(leaves...)
+	cat.indexes[obj(testIndex)] = marked(parentIndexState(false))
+	cat.indexes[child("p1")] = attachedIndex("p1")
+	cat.indexes[child("p2")] = attachedIndex("p2")
+
+	_, notes, err := tryPlan(t, cat, newSpec())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	joined := strings.Join(notes, "\n")
+	if !strings.Contains(joined, "4 leaf partition(s) discovered; 2 index build(s) remain, 2 already complete") {
+		t.Errorf("notes do not state the skip count (FR-PLAN-5):\n%s", joined)
+	}
+	if !strings.Contains(joined, "ownership marker") {
+		t.Errorf("notes do not explain the ownership marker (AC-6):\n%s", joined)
+	}
+}
+
+func TestNotesSayWhenNothingRemains(t *testing.T) {
+	cat := newCatalog("p1")
+	cat.indexes[obj(testIndex)] = parentIndexState(true)
+	cat.indexes[child("p1")] = attachedIndex("p1")
+
+	_, notes, err := tryPlan(t, cat, newSpec())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if !strings.Contains(strings.Join(notes, "\n"), "no DDL remains") {
+		t.Errorf("a converged plan does not say so:\n%s", strings.Join(notes, "\n"))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// rendered_sql
+// ---------------------------------------------------------------------------
+
+// The preview in the artifact is the executor's own renderer plus a terminator,
+// so the two cannot drift (FR-PLANFILE-7, T2).
+func TestRenderedSQLIsTheExecutorsRendererPlusATerminator(t *testing.T) {
+	cat := newCatalog("p1")
+	cat.indexes[child("p1")] = marked(invalidIndex("p1"))
+	p := mustPlan(t, cat, newSpec())
+
+	for i := range p.Nodes {
+		n := &p.Nodes[i]
+		if n.RenderedSQL == "" {
+			t.Errorf("node %q has no rendered_sql", n.ID)
+			continue
+		}
+		if !n.Kind.IssuesDDL() {
+			if !strings.HasPrefix(n.RenderedSQL, "--") {
+				t.Errorf("node %q issues no DDL but renders %q rather than a comment", n.ID, n.RenderedSQL)
+			}
+			continue
+		}
+		want, err := protocol.Render(n)
+		if err != nil {
+			t.Fatalf("protocol.Render(%q) error = %v", n.ID, err)
+		}
+		if !strings.HasPrefix(n.RenderedSQL, want+";") {
+			t.Errorf("node %q previews\n  %q\nwhich does not start with the rendered statement\n  %q",
+				n.ID, n.RenderedSQL, want+";")
+		}
+	}
+}
+
+// Every statement the run issues has to be in the artifact, including the
+// ownership marker the executor writes after the DDL (G2).
+func TestRenderedSQLShowsTheOwnershipMarkerStatement(t *testing.T) {
+	p := mustPlan(t, newCatalog("p1"), newSpec())
+	sql := node(t, p, nodeID("create", obj("p1"))).RenderedSQL
+	if !strings.Contains(sql, "COMMENT ON INDEX") {
+		t.Errorf("create node preview omits the marker statement:\n%s", sql)
 	}
 }
 
@@ -851,49 +884,63 @@ func TestPlanBatchesCatalogReads(t *testing.T) {
 		leaves = append(leaves, fmt.Sprintf("p%03d", i))
 	}
 	cat := newCatalog(leaves...)
-	p := mustPlan(t, testPlanner(), newSpec(), cat)
+	fake := cat.build()
+	host := &planner.Host{Catalog: fake, Now: fixedNow, NewPlanID: func() protocol.PlanID { return testPlanID }}
 
-	if cat.topologyCalls != 1 {
-		t.Errorf("Topology called %d times, want 1", cat.topologyCalls)
+	out, err := host.Run(context.Background(), testPlanner, newSpec())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
-	// One batched Indexes call covering the parent index and every child.
-	if got, want := len(cat.askedIndexes), 1+len(leaves); got != want {
-		t.Errorf("asked about %d indexes, want %d", got, want)
+
+	// NFR-PERF-1: discovery and inspection are O(1) queries in the number of
+	// partitions. The only per-index read there could be is the marker
+	// fallback, and a clean tree must not reach it at all.
+	for method, want := range map[string]int{
+		"PartitionTree":      1,
+		"IndexesOnRelations": 1,
+		"RoleMemberships":    1,
+		"IndexComment":       0,
+		"LookupIndex":        0,
+		"PartitionStrategy":  1,
+		"AssertReadOnly":     1,
+		"ServerVersionNum":   1,
+		"CurrentRole":        1,
+		"CurrentDatabase":    1,
+	} {
+		if got := fake.Calls[method]; got != want {
+			t.Errorf("%s called %d times, want %d (calls: %v)", method, got, want, fake.Calls)
+		}
 	}
-	if got, want := len(cat.askedMembers), 1+len(leaves); got != want {
-		t.Errorf("asked about %d role memberships, want %d (parent plus every leaf)", got, want)
-	}
-	if got, want := len(cat.askedPages), len(leaves); got != want {
-		t.Errorf("asked about %d relation sizes, want %d", got, want)
-	}
-	if got, want := len(p.Nodes), 2+len(leaves)*4+1; got != want {
+	if got, want := len(out.Plan.Nodes), 2+len(leaves)*4+1; got != want {
 		t.Errorf("plan has %d nodes, want %d", got, want)
 	}
 }
 
+// indexReadFails is the operation's own catalog read failing. Discovery
+// failures belong to the host and are covered by engine/planner's tests.
+type indexReadFails struct {
+	*planner.FakeCatalog
+	err error
+}
+
+func (f indexReadFails) IndexesOnRelations(context.Context, []uint32) ([]planner.Index, error) {
+	return nil, f.err
+}
+
 func TestPlanPropagatesCatalogErrors(t *testing.T) {
 	boom := errors.New("connection reset")
-	tests := []struct {
-		name  string
-		setup func(c *fakeCatalog)
-	}{
-		{"topology", func(c *fakeCatalog) { c.topoErr = boom }},
-		{"indexes", func(c *fakeCatalog) { c.indexErr = boom }},
-		{"pages", func(c *fakeCatalog) { c.pagesErr = boom }},
-		{"memberships", func(c *fakeCatalog) { c.memberErr = boom }},
+	cat := newCatalog("p1")
+	host := &planner.Host{
+		Catalog:   indexReadFails{FakeCatalog: cat.build(), err: boom},
+		Now:       fixedNow,
+		NewPlanID: func() protocol.PlanID { return testPlanID },
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cat := newCatalog("p1")
-			tc.setup(cat)
-			p, err := testPlanner().Plan(context.Background(), newSpec(), cat)
-			if p != nil {
-				t.Fatal("Plan() returned a plan despite a catalog error")
-			}
-			if !errors.Is(err, boom) {
-				t.Fatalf("Plan() error = %v, want it to wrap %v", err, boom)
-			}
-		})
+	out, err := host.Run(context.Background(), testPlanner, newSpec())
+	if out != nil {
+		t.Fatal("Run() returned an outcome despite a catalog error")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run() error = %v, want it to wrap %v", err, boom)
 	}
 }
 
@@ -901,47 +948,11 @@ func TestPlanPropagatesClaimErrors(t *testing.T) {
 	boom := errors.New("state store unreachable")
 	cat := newCatalog("p1")
 	cat.indexes[child("p1")] = invalidIndex("p1")
-	p, err := testPlannerWith(&fakeClaims{err: boom}).Plan(context.Background(), newSpec(), cat)
+	cat.claims = &planner.FakeClaims{Err: boom}
+
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil || !errors.Is(err, boom) {
 		t.Fatalf("Plan() = (%v, %v), want (nil, wrapped %v)", p, err, boom)
-	}
-}
-
-func TestPlanRejectsANilCatalog(t *testing.T) {
-	if _, err := testPlanner().Plan(context.Background(), newSpec(), nil); err == nil {
-		t.Fatal("Plan() with a nil catalog returned no error")
-	}
-}
-
-func TestPlanRejectsACatalogThatResolvedADifferentRelation(t *testing.T) {
-	cat := newCatalog("p1")
-	cat.topology.Root.Name = "something_else"
-	_, err := testPlanner().Plan(context.Background(), newSpec(), cat)
-	if err == nil || !strings.Contains(err.Error(), "resolved") {
-		t.Fatalf("Plan() error = %v, want a resolution mismatch", err)
-	}
-}
-
-func TestHasWorkOnNil(t *testing.T) {
-	if HasWork(nil) {
-		t.Error("HasWork(nil) = true")
-	}
-}
-
-func indexOf(ids []protocol.NodeID, want protocol.NodeID) int {
-	for i, id := range ids {
-		if id == want {
-			return i
-		}
-	}
-	return -1
-}
-
-func TestPlannerUsesTheWallClockByDefault(t *testing.T) {
-	before := time.Now().Add(-time.Second)
-	p := mustPlan(t, Planner{}, newSpec(), newCatalog("p1"))
-	if p.CreatedAt.Time.Before(before) {
-		t.Errorf("created_at = %v, want a time from the wall clock", p.CreatedAt)
 	}
 }
 
@@ -949,8 +960,9 @@ func TestPlanPropagatesClaimErrorsForTheParentIndex(t *testing.T) {
 	boom := errors.New("state store unreachable")
 	cat := newCatalog("p1")
 	cat.indexes[obj(testIndex)] = parentIndexState(false)
+	cat.claims = &planner.FakeClaims{Err: boom}
 
-	p, err := testPlannerWith(&fakeClaims{err: boom}).Plan(context.Background(), newSpec(), cat)
+	p, _, err := tryPlan(t, cat, newSpec())
 	if p != nil || !errors.Is(err, boom) {
 		t.Fatalf("Plan() = (%v, %v), want (nil, wrapped %v)", p, err, boom)
 	}
@@ -969,7 +981,7 @@ func TestPlanAtScaleNamesEveryLeafWithoutCollision(t *testing.T) {
 	spec := newSpec()
 	spec.Index = obj(strings.Repeat("x", 40))
 
-	p := mustPlan(t, testPlanner(), spec, cat)
+	p := mustPlan(t, cat, spec)
 
 	if got, want := len(p.Nodes), 2+n*4+1; got != want {
 		t.Fatalf("plan has %d nodes, want %d", got, want)
@@ -1009,7 +1021,7 @@ func TestPlanAtScaleNamesEveryLeafWithoutCollision(t *testing.T) {
 func TestPlanDigestIsStableAcrossRepeatedPlanning(t *testing.T) {
 	var want string
 	for i := 0; i < 20; i++ {
-		p := mustPlan(t, testPlanner(), newSpec(), newCatalog("p1", "p2", "p3"))
+		p := mustPlan(t, newCatalog("p1", "p2", "p3"), newSpec())
 		if i == 0 {
 			want = p.Digest
 			continue

@@ -400,9 +400,11 @@ func (e *Executor) preflight(plan *protocol.Plan) error {
 			// about to destroy (FR-AUTH-2, FR-AUTH-3 as amended), so the
 			// catalog port is as load-bearing here as it is for an assertion.
 			needsCatalog = true
-		case n.Kind == protocol.KindIndexReindexConcurrently:
-			// The reindex marker rewrite preserves the creation facts already
-			// on the object, which means reading them first.
+		case n.Kind.ClaimsOwnership():
+			// Every marking kind reads whatever comment the object already
+			// carries before it writes: a rewrite preserves the creation facts,
+			// and all of them refuse to overwrite a comment somebody else wrote
+			// ([protocol.RenderMarkerStatement]).
 			needsCatalog = true
 		}
 		if n.Kind.IssuesDDL() {
@@ -837,23 +839,30 @@ func (e *Executor) markObject(ctx context.Context, run RunID, plan *protocol.Pla
 		return err
 	}
 
-	// A rewrite preserves the creation facts already on the object, so they
-	// have to be read first. This is also what stops a reindex from
-	// overwriting a comment a human wrote.
-	var (
-		prior  protocol.Marker
-		status protocol.MarkerStatus
-	)
-	if target.Rewrite {
-		if e.cfg.Catalog == nil {
-			return ErrMissingPort.Detailf(
-				"node %q rewrites the ownership marker on %s but no CatalogEvaluator is configured",
-				n.ID, target.Index)
-		}
-		prior, status, err = e.cfg.Catalog.Marker(ctx, target.Index)
-		if err != nil {
-			return err
-		}
+	// Whatever the object already carries is read first, for every marking
+	// kind and not only the rewrite ones.
+	//
+	// Two things depend on it. A rewrite preserves the creation facts already
+	// there, so a reindex does not erase who built the index. And every kind
+	// refuses to overwrite a comment somebody else wrote
+	// ([protocol.RenderMarkerStatement]) — which needs the read, or the refusal
+	// is unreachable. index.attach is the kind that made this necessary: it
+	// marks unconditionally as the crash-window backstop, and with the read
+	// skipped it silently replaced a DBA's comment on an index it had merely
+	// attached, minting permanent provenance over an object this run never
+	// created.
+	//
+	// For the two create kinds the object was brought into existence by the
+	// statement that just returned, so the read is a formality that costs one
+	// catalog query and buys uniformity: markObject switches on nothing.
+	if e.cfg.Catalog == nil {
+		return ErrMissingPort.Detailf(
+			"node %q writes the ownership marker on %s but no CatalogEvaluator is configured",
+			n.ID, target.Index)
+	}
+	prior, status, err := e.cfg.Catalog.Marker(ctx, target.Index)
+	if err != nil {
+		return err
 	}
 
 	stmt, ok, err := protocol.RenderMarkerStatement(n, e.markerBase(run, plan), prior, status)
