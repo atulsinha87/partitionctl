@@ -227,6 +227,36 @@ class StatementBuilderTest {
     }
 
     @Test
+    @DisplayName("a finite statement_timeout is lifted for DROP INDEX CONCURRENTLY too")
+    void statementTimeoutLiftedAroundTheConcurrentDrop() {
+        // DROP INDEX CONCURRENTLY waits for concurrent transactions exactly as CIC does.
+        // Measured on 17.10 with one open writer: 9.5s with statement_timeout = 0, cancelled
+        // at 197ms under an adopter statement_timeout of 200ms. This is the invalid-child
+        // repair path, and a failed changeset is never recorded, so leaving it bounded makes
+        // the repair fail identically on every re-run.
+        LeafPartition interrupted = new LeafPartition(SCHEMA, "person_p01");
+        interrupted.addIndex(new LeafIndex("idx_personaddress_person_p01", false, false, false));
+        TreeState state = state(true, false, interrupted);
+        state.setOriginalStatementTimeout("30s");
+
+        List<PlannedStatement> statements = StatementBuilder.build(plan(), state);
+        String sql = sqlOf(statements);
+
+        int drop = indexOf(statements, "DROP INDEX CONCURRENTLY");
+        assertTrue(drop > 0, sql);
+        boolean liftedBeforeTheDrop = false;
+        for (int i = 0; i < drop; i++) {
+            if (statements.get(i).getSql().equals("SET statement_timeout = 0")) {
+                liftedBeforeTheDrop = true;
+            } else if (statements.get(i).getSql().equals("SET statement_timeout = '30s'")) {
+                liftedBeforeTheDrop = false;
+            }
+        }
+        assertTrue(liftedBeforeTheDrop,
+                "DROP INDEX CONCURRENTLY must run with statement_timeout lifted:\n" + sql);
+    }
+
+    @Test
     @DisplayName("lock_timeout: 15min for the concurrent build, 30s for the attach, restored at the end")
     void lockTimeoutsDifferPerStatement() {
         List<PlannedStatement> statements = StatementBuilder.build(plan(),

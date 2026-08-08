@@ -114,10 +114,22 @@ public final class StatementBuilder {
 
             if (named != null && !named.isValid()) {
                 // The whole point. An invalid leftover is ABSENT, not "already there".
+                //
+                // DROP INDEX CONCURRENTLY waits for every transaction that could still be
+                // using the index, exactly as CREATE INDEX CONCURRENTLY does, so it needs
+                // statement_timeout lifted for the same reason. Measured on 17.10 against a
+                // table with one open writer transaction: the drop waited 9.5s and succeeded
+                // with statement_timeout = 0, and was cancelled at 197ms under an adopter
+                // statement_timeout of 200ms. Leaving it bounded would make THIS path -- the
+                // one that defends against the invalid-child defect -- fail on a busy table,
+                // and since a failed changeset is never recorded, fail identically on every
+                // re-run, forever.
+                setStatementTimeoutUnbounded();
                 setLockTimeout(plan.getLockTimeout());
                 emit("DROP INDEX CONCURRENTLY " + childQualified,
                         position + ": dropping INVALID leftover " + child
                                 + " from an interrupted CREATE INDEX CONCURRENTLY");
+                restoreStatementTimeout();
                 emitBuild(leaf, position, "rebuilding");
             } else if (named == null) {
                 emitBuild(leaf, position, "building");
