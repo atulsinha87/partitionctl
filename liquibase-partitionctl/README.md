@@ -11,25 +11,39 @@ resumes correctly when a run is interrupted.
 
 ---
 
-## Before you start: what is not ready
+## Where to get it
 
-**This artifact is not published anywhere.** `io.github.atulsinha87` returns HTTP 404 on Maven
-Central — the whole groupId, not just this artifact. The version is `0.1.0-SNAPSHOT`, and Maven
-Central never accepts `-SNAPSHOT` versions. The `pom.xml` also has none of the plumbing Central
-requires (no `maven-gpg-plugin`, no source or javadoc jar, no `<scm>`, no `<developers>`, no
-`distributionManagement`).
+**Not on Maven Central.** `io.github.atulsinha87` returns HTTP 404 there — the whole groupId, not
+just this artifact — and the `pom.xml` has none of the plumbing Central requires (no
+`maven-gpg-plugin`, no source or javadoc jar, no `distributionManagement`).
 
-So the coordinate below **will not resolve** from Maven Central today. The only install path that
-works is building from source:
+It is published from GitHub through **JitPack**, which needs no credentials. Add the repository:
 
-```bash
-git clone <this repository>
-cd liquibase-partitionctl && mvn clean install     # installs 0.1.0-SNAPSHOT into your ~/.m2
+```xml
+<repositories>
+  <repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+  </repository>
+</repositories>
 ```
 
-Everything else in this document is exercised and true. Licensing is Apache 2.0 (`LICENSE` at the
-repository root); the copyright holder line in `NOTICE` is still a placeholder the project owner
-must fill in.
+Note the groupId JitPack serves it under — `com.github.atulsinha87.partitionctl` — which is not
+the `io.github.atulsinha87` in this project's own `pom.xml`. JitPack republishes under a
+coordinate derived from the GitHub owner and repository.
+
+Building from source works too, and needs no repository entry:
+
+```bash
+git clone https://github.com/atulsinha87/partitionctl.git
+cd partitionctl && mvn clean install     # installs 0.1.0 into your ~/.m2
+```
+
+Build with **JDK 17**: the jar targets Java 8 bytecode and recent javac releases have been
+dropping old `--release` targets.
+
+Licensing is Apache 2.0 (`LICENSE` at the repository root); the copyright holder line in `NOTICE`
+is still a placeholder the project owner must fill in.
 
 ---
 
@@ -58,9 +72,9 @@ is the single most common way to get a "no declaration can be found" error.
       <version>42.7.4</version>
     </dependency>
     <dependency>
-      <groupId>io.github.atulsinha87</groupId>
+      <groupId>com.github.atulsinha87.partitionctl</groupId>
       <artifactId>liquibase-partitionctl</artifactId>
-      <version>0.1.0-SNAPSHOT</version>
+      <version>v0.1.0</version>
     </dependency>
   </dependencies>
 </plugin>

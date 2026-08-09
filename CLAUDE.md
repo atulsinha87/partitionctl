@@ -13,18 +13,27 @@ Partition-aware online schema evolution for PostgreSQL. It exists because `CREAT
 
 | Document | When |
 |---|---|
-| [docs/M4-HANDOFF.md](docs/M4-HANDOFF.md) | **Start here.** Where work stopped, what is verified vs merely written, settled decisions |
-| [docs/LAPTOP-TRANSFER.md](docs/LAPTOP-TRANSFER.md) | Moving the repo to another machine, and the prerequisites to re-establish |
-| [docs/NEW-MACHINE-PROMPT.md](docs/NEW-MACHINE-PROMPT.md) | The first prompt to paste after a move — what a fresh session cannot infer |
+| [README.md](README.md) | What this is, which of the two products to pick |
 | [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md) | The adopter-facing quickstart, attribute reference and troubleshooting |
-| [docs/M4-PLAN.md](docs/M4-PLAN.md) | The Liquibase plugin design, with every question answered by experiment |
-| [docs/experiments/](docs/experiments/) | **Measured facts. These override the TRD wherever they disagree.** |
-| [docs/TRD.md](docs/TRD.md) | The original spec. Authoritative for the Go CLI, **wrong in places** — see below |
-| [docs/HANDOFF.md](docs/HANDOFF.md) | Go CLI working state (M1–M3) |
+| `docs/experiments/poc-trees/m4-e2e/` | The live end-to-end harness. `make lb-e2e` runs it |
 
-### The TRD is wrong about two things
+### Working documents, on the author's disk only — not in this repository
 
-Both measured against real servers, both recorded in `docs/experiments/v0.0-results.md`:
+Everything else under `docs/` is **gitignored**: `M4-HANDOFF.md` (**start here if you have it**),
+`HANDOFF.md`, `M4-PLAN.md`, `TRD.md`, `M2-M3-DIRECTIVE.md`, `M2-M3-FOUNDATION.md`,
+`REPAIR-REPORT.md`, `REVIEW-ROUND1.md`, `REVIEW-ROUND2.md`, `NEW-MACHINE-PROMPT.md`,
+`LAPTOP-TRANSFER.md`, `workflows/`, the `experiments/*.md` write-ups and every `poc-trees/`
+harness except `m4-e2e`.
+
+They are handover, planning and research records — how the work was driven, not how either
+product is used. **If this is a fresh clone they are not present, and nothing in the build needs
+them.** The measured facts that outrank the spec are restated below so they survive without the
+documents.
+
+### The spec is wrong about two things
+
+The TRD (`docs/TRD.md`, on the author's disk only) is authoritative for the Go CLI but wrong
+here. Both corrections were measured against real servers:
 
 - It says `REINDEX CONCURRENTLY` is unsupported on partitioned relations. **It works**, on 14.23 and 17.10.
 - Its lock table is wrong twice: `CREATE INDEX ON ONLY` takes `ShareLock` on the parent table, and `ALTER INDEX … ATTACH PARTITION` takes `AccessExclusiveLock` on the child index.
@@ -40,14 +49,19 @@ gofmt -l . && go vet ./... && go build ./... && go test ./... -count=1
 ```
 
 ```bash
-cd liquibase-partitionctl && mvn clean install
+mvn clean install                                  # from the root, or from liquibase-partitionctl/
 ```
+
+Build with **JDK 17**. The jar targets Java 8 bytecode (`--release 8`) and recent javac releases
+have been dropping old `--release` targets — a JDK 26 default was rejected in favour of 17, which
+is the newest verified to build this tree. `jitpack.yml` pins the same.
 
 Live database work needs Docker:
 
 ```bash
 make db-reset      # PostgreSQL 17, 12 RANGE partitions, ~1.05M rows
 make demo-all      # full scripted walkthrough, every command echoed
+make lb-e2e        # the plugin: create, gate, reindex, drop, catalog-checked at each stage
 ```
 
 ---
@@ -72,4 +86,4 @@ This project has shipped a wrong design twice by trusting a documentation summar
 
 ## Checkpointing
 
-Before compacting context or pausing work, use the `smart-compact` skill (`.claude/skills/smart-compact/`). It stops background work, verifies the build by running it, commits, updates the handoff, and refreshes this index.
+Before compacting context or pausing work, use the `smart-compact` skill. It stops background work, verifies the build by running it, commits, updates the handoff, and refreshes this index. The skill lives in `.claude/`, which is gitignored, so it is present on the author's machine and not in a fresh clone.

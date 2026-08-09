@@ -16,3 +16,43 @@ partitionctl.yaml
 
 # Maven build output.
 target/
+
+# Internal working documents. These stay on the author's disk and out of the public
+# repository. They record how the work was driven and reasoned about — handovers, planning,
+# directives, adversarial review rounds, experiment write-ups, proof-of-concept harnesses and
+# agent orchestration scripts. None is needed to build, run, adopt or contribute to either
+# product; the conclusions that matter are stated in README.md and CLAUDE.md.
+#
+# Ignored, NOT deleted. Note that `git bundle` does not carry untracked files, so moving this
+# checkout to another machine means copying docs/ across separately.
+
+# Handover, planning and tracking
+docs/HANDOFF.md
+docs/M4-HANDOFF.md
+docs/M4-PLAN.md
+docs/M2-M3-DIRECTIVE.md
+docs/M2-M3-FOUNDATION.md
+docs/REPAIR-REPORT.md
+docs/REVIEW-ROUND1.md
+docs/REVIEW-ROUND2.md
+docs/NEW-MACHINE-PROMPT.md
+docs/LAPTOP-TRANSFER.md
+docs/TRD.md
+docs/workflows/
+
+# Experiment write-ups: the raw research record behind the measured facts.
+docs/experiments/*.md
+
+# Proof-of-concept harnesses, kept as evidence of how each phase was proven.
+# m4-e2e is the exception and stays tracked: `make lb-e2e` executes it.
+docs/experiments/poc-trees/README.md
+docs/experiments/poc-trees/poc/
+docs/experiments/poc-trees/m4/
+docs/experiments/poc-trees/m4-gate/
+docs/experiments/poc-trees/m4-drop-gate/
+docs/experiments/poc-trees/m4-preconditions/
+docs/experiments/poc-trees/m4-reindex/
+docs/experiments/poc-trees/m4-repair/
+
+# Session tooling for Claude Code, not part of either product.
+.claude/
