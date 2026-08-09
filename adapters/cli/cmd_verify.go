@@ -6,8 +6,8 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/verifier"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/verifier"
 )
 
 // cmdVerify implements `verify <plan>` (FR-VER-5, FR-CLI-14, FR-CLI-15).

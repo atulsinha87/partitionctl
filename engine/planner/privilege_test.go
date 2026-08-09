@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // TestValidateRoleMembership is FR-PLAN-10 / AC-12: the check that must fail at

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // A whole run, in the order the executor performs it, including the

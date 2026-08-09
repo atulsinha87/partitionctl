@@ -3,7 +3,7 @@ package state
 import (
 	"strings"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // DefaultSchema is the dedicated schema the SQL state store lives in,

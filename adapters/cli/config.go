@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
 )
 
 // StateBackend names which [state.StateStore] implementation to use
@@ -58,10 +58,13 @@ type Config struct {
 
 	// The discrete connection parameters, used to build a DSN when none is
 	// given. None of them is secret.
-	Host    string
-	Port    int
-	Dbname  string
-	User    string
+	Host   string
+	Port   int
+	Dbname string
+	User   string
+	// SSLMode is the libpq sslmode. It is constrained to what the shipped
+	// driver accepts, which is NOT all of libpq's set: lib/pq rejects "prefer"
+	// and "allow" outright. See [SupportedSSLModes] and [Config.Validate].
 	SSLMode string
 
 	// State selects the state store implementation.
@@ -106,7 +109,7 @@ func Defaults() Config {
 	return Config{
 		Driver:            "postgres",
 		Port:              5432,
-		SSLMode:           "prefer",
+		SSLMode:           "require",
 		State:             StateSQL,
 		StateSchema:       state.DefaultSchema,
 		LockTimeout:       5 * time.Second,
@@ -131,9 +134,38 @@ func defaultActor() string {
 }
 
 // Validate checks the configuration is usable.
+// SupportedSSLModes lists the sslmode values the shipped driver accepts.
+//
+// This is deliberately NOT libpq's full set. lib/pq -- the only driver
+// cmd/partitionctl registers -- rejects "prefer" and "allow" at connect time
+// with `pq: unsupported sslmode "prefer"`, an error that names the driver
+// rather than the flag that produced it. Checking here turns that into a
+// message the reader can act on, before any connection is attempted.
+//
+// This package may not import a driver (that is what keeps the tree testable
+// offline), so the list is mirrored from lib/pq's own conn.go rather than
+// queried. TestDefaultSSLModeIsAcceptedByTheShippedDriver guards the mirror.
+var SupportedSSLModes = []string{"disable", "require", "verify-ca", "verify-full"}
+
 func (c Config) Validate() error {
 	if c.Driver == "" {
 		return protocol.ErrFailure.Detailf("no database driver name: set --driver or PARTITIONCTL_DRIVER")
+	}
+	if c.DSN == "" && c.SSLMode != "" {
+		ok := false
+		for _, m := range SupportedSSLModes {
+			if c.SSLMode == m {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return protocol.ErrFailure.Detailf(
+				"unsupported sslmode %q: the bundled driver accepts only %s. "+
+					"Set -sslmode, PARTITIONCTL_SSLMODE or PGSSLMODE to one of those, "+
+					"or supply a full data source name in PARTITIONCTL_DSN",
+				c.SSLMode, strings.Join(SupportedSSLModes, ", "))
+		}
 	}
 	if !c.State.Valid() {
 		return protocol.ErrFailure.Detailf(

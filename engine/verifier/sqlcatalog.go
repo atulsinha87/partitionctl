@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Queryer is the only thing [SQLCatalog] is allowed to hold: the query half of

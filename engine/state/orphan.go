@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // FindOrphans implements the detection half of INV-4 and FR-LOCK-4: a run in

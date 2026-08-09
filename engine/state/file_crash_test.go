@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // errCrash stands in for the process dying at a chosen instant.

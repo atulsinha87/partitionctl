@@ -3,7 +3,7 @@ package state
 import (
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // DefaultLeaseTTL is the lease lifetime when a caller does not choose one.

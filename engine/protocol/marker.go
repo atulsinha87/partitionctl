@@ -39,8 +39,7 @@ const (
 //
 // The v0.0 spike measured the two properties this depends on: the comment
 // survives REINDEX CONCURRENTLY's internal index swap, and setting one takes
-// only ShareUpdateExclusiveLock (docs/spikes/v0.0-results.md, questions 2 and
-// 3). It also survives PITR restore and failover, because catalogs restore with
+// only ShareUpdateExclusiveLock (measured on 14.23 and 17.10). It also survives PITR restore and failover, because catalogs restore with
 // the data, which is what retires the "state store rewound underneath us" risk.
 //
 // Every field is tool-generated. Nothing an operator typed is ever interpolated

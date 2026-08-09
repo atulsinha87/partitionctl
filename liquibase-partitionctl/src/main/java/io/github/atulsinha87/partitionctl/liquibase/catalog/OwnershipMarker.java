@@ -28,8 +28,7 @@ package io.github.atulsinha87.partitionctl.liquibase.catalog;
  *
  * <h2>Deliberately does NOT recognise the Go CLI's marker</h2>
  * The Go CLI stamps {@code partitionctl:v1:{...json...}}, which does not match this prefix.
- * That is intended: M4-PLAN.md §8 decision E states the two products are independent and do
- * not interoperate. This extension refuses to drop a tree the Go CLI built, and says so.
+ * That is intended: the two products are independent by decision and do not interoperate. This extension refuses to drop a tree the Go CLI built, and says so.
  */
 public final class OwnershipMarker {
 

@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // maxNamedLeftovers caps how many leftover index names one failure reason

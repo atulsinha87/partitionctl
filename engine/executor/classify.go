@@ -9,7 +9,7 @@ import (
 	"net"
 	"syscall"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // ErrorClass is the retry decision for one failure (FR-EXEC-3).

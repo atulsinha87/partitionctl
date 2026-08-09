@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // fakeCatalog is an in-memory [Catalog]. The whole engine is unit-testable with

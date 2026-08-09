@@ -46,8 +46,8 @@ import java.util.List;
  *
  * <h2>The null-attribute guard is not defensive padding</h2>
  * An XSD attribute name that does not match the Java property binds to <b>null</b> silently, with
- * no error of any kind — the sharpest edge in the whole extension mechanism
- * (docs/experiments/liquibase-mechanism.md, Q4). Without an explicit guard the gate would run a
+ * no error of any kind — the sharpest edge in the whole extension mechanism, and measured
+ * directly against liquibase-core 4.33.0. Without an explicit guard the gate would run a
  * query for an index literally named {@code null}, find nothing, and report a perfectly ordinary
  * "not found" — a misconfiguration wearing the costume of a real verdict. So a null identifier is
  * raised as an ERROR that names the attribute.

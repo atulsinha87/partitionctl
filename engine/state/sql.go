@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // SQLStore is the database/sql [StateStore] (FR-STATE-2), and the default.

@@ -1,4 +1,4 @@
-module github.com/atulsinha/partitionctl
+module github.com/atulsinha87/partitionctl
 
 go 1.22
 

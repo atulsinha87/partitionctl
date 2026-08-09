@@ -3,7 +3,7 @@ package executor
 import (
 	"context"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // AuthorizationDecision is the verdict on one destructive node, reached against

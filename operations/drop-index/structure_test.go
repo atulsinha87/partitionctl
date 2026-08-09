@@ -47,11 +47,11 @@ func TestPackageImportsNothingThatCanExecute(t *testing.T) {
 		"net":                 "a planner never opens a socket",
 		"net/http":            "a planner never opens a socket",
 		"os/exec":             "a planner never shells out",
-		"github.com/atulsinha/partitionctl/engine/executor": "a planner never links the executor",
+		"github.com/atulsinha87/partitionctl/engine/executor": "a planner never links the executor",
 	}
 	allowedNonStdlib := map[string]bool{
-		"github.com/atulsinha/partitionctl/engine/protocol": true,
-		"github.com/atulsinha/partitionctl/engine/planner":  true,
+		"github.com/atulsinha87/partitionctl/engine/protocol": true,
+		"github.com/atulsinha87/partitionctl/engine/planner":  true,
 	}
 
 	fset := token.NewFileSet()

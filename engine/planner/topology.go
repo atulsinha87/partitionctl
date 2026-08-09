@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Topology is a discovered and validated partition tree: a single-level RANGE

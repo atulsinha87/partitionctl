@@ -5,9 +5,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
 )
 
 // executorStore adapts the full [state.StateStore] to the narrow

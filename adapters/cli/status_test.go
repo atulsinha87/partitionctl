@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // AC-25: "`status` returns full core output with the target database

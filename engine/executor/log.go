@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // timeLayout is the one time format this package emits, matching

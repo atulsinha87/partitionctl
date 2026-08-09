@@ -102,7 +102,7 @@ from the extension jar — nothing is fetched over the network, and a trimmed he
 | `tableName` | `orders` | the **partitioned parent**, not a partition |
 | `indexName` | `idx_orders_created` | yours — the parent index. Child names are derived from it per partition and clipped to 63 bytes; a derivation that would collide fails loudly before anything runs |
 | `<column>` elements | `created_at` desc, `customer_id` | your key — order matters, `descending` is per column |
-| `paceSeconds` | `1` | optional; delay between partitions on a busy cluster. Omit for none. Keep it **below** your `statement_timeout` — the sleep runs under it |
+| `paceSeconds` | `1` | optional; delay between partitions on a busy cluster. Omit for none. It is **not** bounded by your `statement_timeout` — the extension lifts the timeout around the sleep and restores it. Budget for total wall-clock instead: `paceSeconds` × partitions, against any CI or deploy job timeout |
 
 ## The two mistakes that cost adopters the most time
 

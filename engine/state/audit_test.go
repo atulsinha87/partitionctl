@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 func TestAuditAppendAndPage(t *testing.T) {

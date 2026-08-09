@@ -1,7 +1,7 @@
 package executor
 
 import (
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Render produces the statement the executor will send for a node.

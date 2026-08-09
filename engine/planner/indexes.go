@@ -3,7 +3,7 @@ package planner
 import (
 	"context"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // IndexCondition classifies an existing index's usability from the three

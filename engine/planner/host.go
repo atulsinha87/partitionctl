@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Specification is the declarative statement of the desired end state: the

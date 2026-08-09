@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // INV-4: a run in RUNNING whose lease has expired and whose advisory lock is

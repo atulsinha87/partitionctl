@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 const parentIndexName = "orders_created_at_idx"

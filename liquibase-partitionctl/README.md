@@ -51,15 +51,28 @@ that verifies the result from `pg_catalog` — is at
 [examples/liquibase/](../examples/liquibase/). `make lb-adopter` from the repository root runs
 it against a throwaway 12-partition database.
 
-Building from source works too, and needs no repository entry:
+Building from source works too, and needs no repository entry — but it installs a **different
+coordinate**, because JitPack's groupId is derived from GitHub and a local build uses the pom's own:
 
 ```bash
 git clone https://github.com/atulsinha87/partitionctl.git
-cd partitionctl && mvn clean install     # installs 0.1.2 into your ~/.m2
+cd partitionctl && ./mvnw clean install
 ```
 
-Build with **JDK 17**: the jar targets Java 8 bytecode and recent javac releases have been
-dropping old `--release` targets.
+That installs `io.github.atulsinha87:liquibase-partitionctl:0.1.2` — note the different groupId and
+**no `v` prefix** on the version. Depend on it with the `<pluginRepositories>` block omitted
+entirely, since it comes from your local `~/.m2`:
+
+```xml
+<dependency>
+  <groupId>io.github.atulsinha87</groupId>
+  <artifactId>liquibase-partitionctl</artifactId>
+  <version>0.1.2</version>
+</dependency>
+```
+
+Use `./mvnw`, not `mvn`: the wrapper pins Maven 3.9.9, and an older Maven silently ignores the
+`<release>` setting that keeps the jar loadable on Java 8.
 
 Licensing is Apache 2.0 (`LICENSE` at the repository root); the copyright holder line in `NOTICE`
 is still a placeholder the project owner must fill in.
@@ -489,9 +502,17 @@ There is no such Maven goal. **Fix:** `mvn liquibase:update -Dliquibase.toTag=yo
 
 ## Compatibility
 
-Verified against **PostgreSQL 17.10** and **liquibase-core 4.33.0**, on JDK 22 with Maven 3.9.6.
-The jar is compiled to **Java 8 bytecode** (`--release 8`, major version 52), matching Liquibase
-4.33.0 throughout, and contains no Liquibase classes and no transitive dependencies.
+Verified against **PostgreSQL 17.10** and **liquibase-core 4.33.0**.
+
+Build and runtime are separate claims, and only the second one constrains you:
+
+| | |
+|---|---|
+| **Runtime** | **Java 8 or newer.** The jar is compiled to Java 8 bytecode (`--release 8`, major version 52), so it loads in any Liquibase host |
+| **Build** | **JDK 17**, Maven 3.9.9 via `./mvnw`. This is what CI and the JitPack release both run. Newer JDKs have been dropping old `--release` targets, and an older Maven silently ignores `<release>` altogether |
+
+The jar contains no Liquibase classes and no transitive dependencies; CI asserts both on every
+build.
 
 `REINDEX INDEX CONCURRENTLY` on a partitioned index also works on PostgreSQL 14.23, contrary to
 some documentation summaries.

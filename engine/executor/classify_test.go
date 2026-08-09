@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 func TestClassifyBySQLState(t *testing.T) {

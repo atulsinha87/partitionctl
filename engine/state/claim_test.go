@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The claim exists before any statement runs. That is INV-1 as amended: the

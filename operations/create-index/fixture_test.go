@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The fixture builds a [planner.FakeCatalog] and runs this operation through a

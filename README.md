@@ -62,11 +62,13 @@ artifact is not in Central.
 coordinate — `make lb-adopter` runs it against a throwaway 12-partition database and verifies the
 result from `pg_catalog`.
 
-Building from source works too, and needs no repository entry:
+Building from source works too, and needs no repository entry — but it installs a **different
+coordinate**: `io.github.atulsinha87:liquibase-partitionctl:0.1.2`, with no `v` on the version,
+because JitPack derives its groupId from GitHub while a local build uses the pom's own.
 
 ```bash
 git clone https://github.com/atulsinha87/partitionctl.git
-cd partitionctl && mvn clean install
+cd partitionctl && ./mvnw clean install
 ```
 
 ### 2. The Go CLI — `engine/`, `operations/`, `adapters/`, `cmd/`
@@ -77,11 +79,21 @@ it runs, independent of Liquibase.
 
 ```bash
 make build
+make db-reset                    # throwaway PostgreSQL 17, 12 partitions, ~1.05M rows
+
+# The DSN carries the password, so it is never a flag (a flag would put it on argv,
+# visible in ps). Point this at your own database to use the CLI for real.
+export PARTITIONCTL_DSN='postgres://postgres:pw@localhost:5432/postgres?sslmode=disable'
+
 build/partitionctl plan -spec examples/local/orders-idx.json -o build/migration.plan
 build/partitionctl render build/migration.plan     # the SQL runbook, offline
 build/partitionctl execute build/migration.plan
 build/partitionctl verify -end-state build/migration.plan
 ```
+
+Without `PARTITIONCTL_DSN` the discrete flags apply, and `sslmode` defaults to `require` — so a
+server without TLS refuses the connection. Pass `-sslmode disable` for a local throwaway database.
+`make demo-all` runs this whole sequence with every command echoed.
 
 ---
 
@@ -115,9 +127,18 @@ with 12 partitions and 1.2M rows, through the whole create → gate → reindex 
 every verdict read from `pg_catalog` rather than from either tool's own log — including
 `SIGKILL` mid-flight and a `lock_timeout` abort, both of which resumed and finished.
 
-Known limitations are documented plainly in
-[liquibase-partitionctl/README.md](liquibase-partitionctl/README.md); they are real constraints
-of PostgreSQL and Liquibase, not a to-do list.
+### Known limitations
+
+**The Liquibase extension's** limitations are documented plainly in
+[liquibase-partitionctl/README.md](liquibase-partitionctl/README.md). They are real constraints of
+PostgreSQL and Liquibase, not a to-do list.
+
+**The Go CLI** carries one measured, open defect —
+[#2](https://github.com/atulsinha87/partitionctl/issues/2). When a generated child index name
+reaches PostgreSQL's 63-byte limit, recovery of a `_ccnew`/`_ccold` leftover's base name is wrong,
+which can strand a reindex and, in the worst case, read an ownership marker off an unrelated index.
+It does not affect the extension, which shares no code with that path. **You are clear of it if
+`indexName` + `_` + your longest partition name stays under 58 bytes.**
 
 ## Verifying a checkout
 

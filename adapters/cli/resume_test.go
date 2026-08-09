@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
 )
 
 // TestCancelStopsAtABoundaryAndResumeCompletes is AC-24 end to end:

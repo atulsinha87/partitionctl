@@ -3,7 +3,7 @@ package reindexindex
 import (
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The renderers here produce Node.RenderedSQL: the preview a reviewer reads in

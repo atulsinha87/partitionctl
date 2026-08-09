@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Node IDs. They are deterministic functions of the relation they act on, so a

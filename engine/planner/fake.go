@@ -4,7 +4,7 @@ import (
 	"context"
 	"sort"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // FakeCatalog is a complete in-memory [CatalogReader].

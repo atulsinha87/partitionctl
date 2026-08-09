@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
 )
 
 // AC-26: "Each failure class in §7.2.12 produces its distinct exit code,

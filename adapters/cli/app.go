@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
-	"github.com/atulsinha/partitionctl/engine/verifier"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/verifier"
 )
 
 // Target is the CLI's whole view of a live database.

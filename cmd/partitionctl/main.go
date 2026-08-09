@@ -29,7 +29,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/atulsinha/partitionctl/adapters/cli"
+	"github.com/atulsinha87/partitionctl/adapters/cli"
 
 	// The one driver import in the tree, and it lives here rather than under
 	// engine/ or adapters/ for the reason given above. lib/pq rather than pgx

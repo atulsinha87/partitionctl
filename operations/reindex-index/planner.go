@@ -6,8 +6,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Node IDs are deterministic functions of the object they act on, so a re-plan

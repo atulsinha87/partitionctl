@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // authFixture builds a destructive node plus a plan for [Authorize] to judge.

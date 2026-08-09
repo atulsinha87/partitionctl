@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // TestFakeCatalogDerivesTheTree: the fake must behave like pg_partition_tree,

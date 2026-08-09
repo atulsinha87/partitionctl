@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Record identifiers are assigned per run and must keep advancing across

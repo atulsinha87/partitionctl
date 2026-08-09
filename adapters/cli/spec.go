@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // SpecFile is the on-disk form of a specification: the declarative statement of

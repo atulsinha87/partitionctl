@@ -5,12 +5,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/verifier"
-	createindex "github.com/atulsinha/partitionctl/operations/create-index"
-	dropindex "github.com/atulsinha/partitionctl/operations/drop-index"
-	reindexindex "github.com/atulsinha/partitionctl/operations/reindex-index"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/verifier"
+	createindex "github.com/atulsinha87/partitionctl/operations/create-index"
+	dropindex "github.com/atulsinha87/partitionctl/operations/drop-index"
+	reindexindex "github.com/atulsinha87/partitionctl/operations/reindex-index"
 )
 
 // operationRegistry is the whole of the CLI's knowledge of which operations

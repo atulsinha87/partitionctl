@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // cmdRender implements `render <plan>` (FR-CLI-4).

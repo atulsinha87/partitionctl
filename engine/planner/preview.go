@@ -1,7 +1,7 @@
 package planner
 
 import (
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Preview fills in a node's [protocol.Node.RenderedSQL]: the NON-AUTHORITATIVE

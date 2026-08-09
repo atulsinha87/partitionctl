@@ -9,8 +9,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
-	"github.com/atulsinha/partitionctl/engine/state"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/state"
 )
 
 // StatusReport is the stable field schema `status --json` emits (FR-CLI-15,

@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // MinServerVersionNum is the oldest server_version_num PartitionCTL plans

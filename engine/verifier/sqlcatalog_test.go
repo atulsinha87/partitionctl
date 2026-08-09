@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // ---------------------------------------------------------------------------

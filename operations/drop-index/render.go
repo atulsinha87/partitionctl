@@ -3,7 +3,7 @@ package dropindex
 import (
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The previews written into Node.RenderedSQL.

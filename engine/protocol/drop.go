@@ -215,7 +215,10 @@ func DecideLeftoverDrop(in LeftoverDropInput) DropVerdict {
 // schema, the name with the _ccnew/_ccold suffix trimmed. ok is false when the
 // name is not a leftover.
 //
-// # KNOWN DEFECT (measured, deferred to the owner -- see docs/REPAIR-REPORT.md)
+// # KNOWN DEFECT (measured, tracked as issue #2)
+//
+// https://github.com/atulsinha87/partitionctl/issues/2 carries the measurements
+// below and both candidate fixes.
 //
 // The trimmed name is only the real base when PostgreSQL did not have to
 // truncate. It builds a leftover name with ChooseRelationName/makeObjectName,

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 func newSQLStoreForTest(t *testing.T, opts SQLOptions) (*SQLStore, *fakeDB) {

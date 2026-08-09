@@ -1,7 +1,7 @@
 package state
 
 import (
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The state store's error kinds. They extend [protocol.ErrorKind] rather than

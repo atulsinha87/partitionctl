@@ -88,6 +88,41 @@
         <artifactId>maven-jar-plugin</artifactId>
         <version>3.4.1</version>
       </plugin>
+
+      <!--
+        Sources and javadoc are built on EVERY build, not behind a release profile.
+
+        Maven Central requires both jars, and the javadoc one did not build at all: two doclint
+        errors (a <table> with no <caption>, an <h2> under an implicit <h3>) had accumulated
+        precisely because nothing ever ran javadoc. Deferring these to a release profile would
+        reproduce that exact failure, with the first sighting arriving mid-release. They cost a
+        few seconds, and CI now fails on a doclint regression instead.
+
+        GPG signing and the Central upload stay out of the normal build; those belong in a
+        release profile, tracked in issue #1.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <goals><goal>jar-no-fork</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.11.2</version>
+        <executions>
+          <execution>
+            <id>attach-javadocs</id>
+            <goals><goal>jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 </project>

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Node IDs. They are deterministic functions of what they act on, so a re-plan

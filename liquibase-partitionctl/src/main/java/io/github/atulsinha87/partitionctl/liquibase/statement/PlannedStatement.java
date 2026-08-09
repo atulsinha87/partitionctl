@@ -65,7 +65,25 @@ public final class PlannedStatement {
 
     /** The text actually sent to PostgreSQL: the label as a leading comment, then the SQL. */
     public String toSql() {
-        return label == null ? sql : "-- " + label + "\n" + sql;
+        return label == null ? sql : "-- " + singleLine(label) + "\n" + sql;
+    }
+
+    /**
+     * Flattens a label to one line before it is prefixed as a {@code --} comment.
+     *
+     * <p>Labels are assembled from catalog-derived identifiers -- schema, table, index and
+     * partition names read back from {@code pg_class}. PostgreSQL permits a newline inside a
+     * quoted identifier, so a relation named {@code "orders<newline>DROP TABLE t;--"} would end
+     * the {@code --} comment and leave the remainder as a statement in its own right. Every
+     * identifier <em>inside</em> the SQL is quoted through {@code Identifiers}; the comment was
+     * the one place a raw name reached the wire unescaped.
+     *
+     * <p>Creating such a relation already requires DDL rights on the schema, so this is hardening
+     * rather than a privilege boundary. It is cheap and it is at the single point every statement
+     * passes through.
+     */
+    private static String singleLine(String text) {
+        return text.replace("\r", " ").replace("\n", " ");
     }
 
     @Override

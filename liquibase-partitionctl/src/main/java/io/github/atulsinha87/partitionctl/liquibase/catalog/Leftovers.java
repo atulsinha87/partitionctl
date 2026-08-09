@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
  * {@code idx_e6_aaaa…aa_ccnew}, whose base part is 57 bytes, not 63.
  *
  * <p>So the base name is <b>not recoverable</b> from the leftover name — the Go product has a
- * standing HIGH defect from trying (docs/REVIEW-ROUND2.md). This class runs the derivation in the
+ * standing HIGH defect from trying (issue #2). This class runs the derivation in the
  * only direction that is total: it takes the base name we already know from the catalog and asks
  * whether a candidate leftover is the name PostgreSQL <em>would</em> have derived from it.
  */

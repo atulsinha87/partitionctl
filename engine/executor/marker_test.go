@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Directive A.5.1's adopt-then-drop row, executed. The object exists because a

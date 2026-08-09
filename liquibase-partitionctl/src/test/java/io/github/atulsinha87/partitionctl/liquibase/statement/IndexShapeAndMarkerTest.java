@@ -18,8 +18,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The two gaps against M4-PLAN.md that this module had drifted away from:
- * the {@code COMMENT ON INDEX} ownership marker (§5.2) and the index-shape attributes (§5.1).
+ * The two gaps in the original design that this module had drifted away from:
+ * the {@code COMMENT ON INDEX} ownership marker and the index-shape attributes.
  *
  * <p>The shape assertions all take the same form — <b>the parent statement and every child
  * statement must carry it</b> — because PostgreSQL 17.10 refuses to attach a child whose

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/planner"
+	"github.com/atulsinha87/partitionctl/engine/planner"
 )
 
 // This file is the machine-checked form of TRD §17.3 and AC-21: operations/
@@ -50,8 +50,8 @@ func TestPackageImportsNothingThatCanExecute(t *testing.T) {
 		"os/exec":             "a planner never shells out",
 	}
 	allowedNonStdlib := map[string]bool{
-		"github.com/atulsinha/partitionctl/engine/protocol": true,
-		"github.com/atulsinha/partitionctl/engine/planner":  true,
+		"github.com/atulsinha87/partitionctl/engine/protocol": true,
+		"github.com/atulsinha87/partitionctl/engine/planner":  true,
 	}
 
 	fset := token.NewFileSet()

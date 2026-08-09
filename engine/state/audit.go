@@ -3,7 +3,7 @@ package state
 import (
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // AuditEventType is the machine-readable class of an audit event. The set is

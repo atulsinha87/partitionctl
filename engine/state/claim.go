@@ -3,7 +3,7 @@ package state
 import (
 	"context"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // ClaimReader is the slice of a store [ClaimsObject] needs. It is separated so

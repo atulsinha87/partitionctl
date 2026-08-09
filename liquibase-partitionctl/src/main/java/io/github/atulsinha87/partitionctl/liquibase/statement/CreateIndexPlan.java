@@ -152,7 +152,7 @@ public final class CreateIndexPlan {
     /**
      * The partial-index predicate, or null.
      *
-     * <h2>This is raw SQL and is not escaped</h2>
+     * <h4>This is raw SQL and is not escaped</h4>
      * A predicate is an arbitrary SQL expression — {@code status <> 'done'},
      * {@code created_at >= now() - interval '30 days'} — so there is no parameter to bind it to
      * and no quoting that would leave it meaning what the author wrote. It is concatenated into

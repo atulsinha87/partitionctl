@@ -4,7 +4,7 @@ import (
 	"context"
 	"sort"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The entry points in this file build their check set from the live catalog

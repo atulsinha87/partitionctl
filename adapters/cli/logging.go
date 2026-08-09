@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/executor"
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/executor"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // timeLayout is the timestamp format in every log record: RFC 3339 with

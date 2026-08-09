@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // Querier is the subset of database/sql the catalog reader uses. *sql.DB,

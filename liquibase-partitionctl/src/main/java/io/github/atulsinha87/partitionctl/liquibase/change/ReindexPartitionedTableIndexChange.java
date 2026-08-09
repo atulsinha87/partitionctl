@@ -192,7 +192,7 @@ public class ReindexPartitionedTableIndexChange extends AbstractChange {
             // cache, so a later call re-queries.
             //
             // Measured, and worth being straight about: this is defence, not a fix for something
-            // observed. liquibase-change-orchestration.md records generateStatements being called
+            // observed. generateStatements was measured being called
             // seven times per update, four of them before the changelog lock. On 4.33.0 through
             // the maven plugin this change is called exactly TWICE, both inside its own
             // "Running Changeset" block and therefore after every earlier changeset has executed

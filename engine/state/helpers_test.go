@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // baseTime is a fixed instant. Every test that cares about ordering or expiry

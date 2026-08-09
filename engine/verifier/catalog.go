@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // IndexState is the catalog state of one index: the columns of pg_index and

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // TestSentinelExitCodes is AC-26 for the planner's share of the failure

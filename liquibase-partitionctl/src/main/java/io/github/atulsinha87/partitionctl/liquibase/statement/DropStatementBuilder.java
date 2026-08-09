@@ -18,6 +18,7 @@ import java.util.List;
  *
  * <h2>Two paths, because PostgreSQL has two situations</h2>
  * <table>
+ *   <caption>How each of the two shapes is removed, and at what lock cost</caption>
  *   <tr><th></th><th>attached tree</th><th>free-standing leftover</th></tr>
  *   <tr><td>what it is</td>
  *       <td>the partitioned index plus every child index that inherits from it</td>

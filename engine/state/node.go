@@ -3,7 +3,7 @@ package state
 import (
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // NodeRecord is one node's state within one run (TRD §10, NODE_STATE).

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // FileStore is the local-filesystem [StateStore] (FR-STATE-2).

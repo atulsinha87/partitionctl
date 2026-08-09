@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // TestStopOnSignalsTreatsBothSignalsAlike proves FR-EXEC-8 against real

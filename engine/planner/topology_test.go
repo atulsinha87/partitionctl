@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // TestDiscoverSupportedTrees covers the two topologies v0.1 supports

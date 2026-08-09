@@ -44,7 +44,7 @@ const (
 	//
 	// The v0.0 spike measured that the statement works on an attached leaf index
 	// and that the attachment survives the internal swap, on 14.23 and 17.10
-	// (docs/spikes/v0.0-results.md, question 1). It also works on the
+	// (measured directly). It also works on the
 	// partitioned parent, which the TRD denied; the planner declines to use the
 	// parent form for reasons of resumability, not legality. See
 	// [ReindexConcurrentlyParams].
@@ -58,7 +58,8 @@ const (
 )
 
 // LockLevel is the heaviest lock a node kind takes on a user relation, as
-// MEASURED in docs/spikes/v0.0-results.md. It exists so `render` and `plan`
+// MEASURED against PostgreSQL 14.23 and 17.10 -- not as documented, which is
+// wrong for two of these (see the LockLevel method for which). It exists so `render` and `plan`
 // output can warn the operator (FR-DROP-5); the executor does not act on it.
 //
 // The spike overrides TRD §7.2.2, which this type used to cite. The one value
@@ -296,7 +297,10 @@ func (k NodeKind) RetrySafe() bool {
 }
 
 // LockLevel returns the heaviest lock k takes on a user relation, as measured
-// in docs/spikes/v0.0-results.md.
+// against 14.23 and 17.10. Two of these contradict the PostgreSQL docs as
+// commonly summarised: CREATE INDEX ON ONLY takes ShareLock on the parent
+// table, and ALTER INDEX ... ATTACH PARTITION takes AccessExclusiveLock on the
+// child index.
 //
 // KindIndexAttach stays at ShareUpdateExclusive deliberately, and this is a
 // recorded decision rather than an omission: the spike measured

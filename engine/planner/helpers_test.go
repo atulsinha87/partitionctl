@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // ctx is the context every test uses. Go 1.22 has no testing.T.Context.

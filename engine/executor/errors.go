@@ -3,7 +3,7 @@ package executor
 import (
 	"errors"
 
-	"github.com/atulsinha/partitionctl/engine/protocol"
+	"github.com/atulsinha87/partitionctl/engine/protocol"
 )
 
 // The executor's error classes. They extend [protocol.ErrorKind] rather than
