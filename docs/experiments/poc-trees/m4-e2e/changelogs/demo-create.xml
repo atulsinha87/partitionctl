@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The demo changelog: build one index across every partition, and stop there.
+
+  Deliberately NOT e2e.xml. That one is the four-stage test - create, gate, reindex, drop -
+  so it finishes by deleting the index it built, and a verdict query run afterwards
+  correctly reports nothing. This file is what an adopter would actually write.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <!--
+      runInTransaction="false"  required: CREATE INDEX CONCURRENTLY cannot run inside a
+                                transaction block, and it is also what makes partial progress
+                                survive a failure.
+      runAlways="true"          the documented default: a succeeded changeset never re-runs, so
+                                partitions added later would silently go unindexed.
+      paceSeconds="1"           breathe between partitions on a busy cluster. Optional.
+    -->
+    <changeSet author="demo" id="demo-create" runInTransaction="false" runAlways="true">
+        <ext:createPartitionedTableIndex schemaName="public"
+                                         tableName="orders"
+                                         indexName="idx_orders_created"
+                                         paceSeconds="1">
+            <column name="created_at" descending="true"/>
+            <column name="customer_id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+</databaseChangeLog>
