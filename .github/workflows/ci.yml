@@ -31,9 +31,9 @@ jobs:
         # reason this tree uses lib/pq. `stable` catches breakage from newer toolchains.
         go: ['1.22', 'stable']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
@@ -61,11 +61,11 @@ jobs:
     name: Java (JDK 17, extension)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # JDK 17, not newer: the jar targets Java 8 bytecode (--release 8) and recent javac
       # versions have been dropping old --release targets. 17 is the newest verified to build it.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
