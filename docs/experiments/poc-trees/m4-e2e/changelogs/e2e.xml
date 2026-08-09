@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The whole plugin in one changelog: create, gate, reindex, drop.
+
+  Driven one stage at a time with `liquibase:updateToTag`, so the catalog can be inspected
+  between stages. `liquibase:update` runs the lot.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <!-- ============ STAGE 1: build the index across all 12 partitions ============ -->
+    <changeSet author="e2e" id="1-create" runInTransaction="false" runAlways="true">
+        <ext:createPartitionedTableIndex schemaName="public"
+                                         tableName="orders"
+                                         indexName="idx_orders_created"
+                                         paceSeconds="1">
+            <column name="created_at" descending="true"/>
+            <column name="customer_id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+    <changeSet author="e2e" id="1-tag"><tagDatabase tag="created"/></changeSet>
+
+    <!-- ============ STAGE 2: the gate, guarding a changeset that depends on the index ====
+         The body is deliberately observable from the catalog. If the gate HALTs, the table
+         is never created, and inspect.sql reports gate_body_rows = 0.                    -->
+    <changeSet author="e2e" id="2-gate">
+        <preConditions onFail="HALT">
+            <ext:partitionctlIndexGate schemaName="public" tableName="orders" indexName="idx_orders_created"/>
+        </preConditions>
+        <createTable tableName="e2e_gate_ran">
+            <column name="note" type="text"/>
+        </createTable>
+        <insert tableName="e2e_gate_ran">
+            <column name="note" value="the index gate passed, so this body executed"/>
+        </insert>
+    </changeSet>
+    <changeSet author="e2e" id="2-tag"><tagDatabase tag="gated"/></changeSet>
+
+    <!-- ============ STAGE 3: rebuild every leaf index in place ============ -->
+    <changeSet author="e2e" id="3-reindex" runInTransaction="false">
+        <ext:reindexPartitionedTableIndex schemaName="public"
+                                          tableName="orders"
+                                          indexName="idx_orders_created"
+                                          paceSeconds="1"/>
+    </changeSet>
+    <changeSet author="e2e" id="3-tag"><tagDatabase tag="reindexed"/></changeSet>
+
+    <!-- ============ STAGE 4: destroy the whole tree ============
+         Two guards, both required and neither substituting for the other: the reindex gate
+         asserts no interrupted rebuild is still in flight, and confirmExclusiveLock is the
+         adopter accepting an AccessExclusiveLock on the table and all 12 leaves at once.
+
+         The ownership marker is the third check and takes no attribute: the drop reads
+         obj_description on the tree and refuses unless createPartitionedTableIndex put it
+         there. Until this session it never had, so this changeset could not have run.     -->
+    <changeSet author="e2e" id="4-drop" runInTransaction="false">
+        <preConditions onFail="HALT">
+            <ext:partitionctlReindexGate schemaName="public" tableName="orders" indexName="idx_orders_created"/>
+        </preConditions>
+        <ext:dropPartitionedTableIndex schemaName="public"
+                                       tableName="orders"
+                                       indexName="idx_orders_created"
+                                       confirmExclusiveLock="true"/>
+    </changeSet>
+
+</databaseChangeLog>

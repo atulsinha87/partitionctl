@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DELIBERATELY BROKEN, and the breakage is the point.
+
+  xmlns:ext is declared, so the element binds and the change runs. partitionctl.xsd is NOT
+  listed in xsi:schemaLocation, so the XSD is never applied and cannot refuse anything. That
+  one-line omission is what makes a misspelled attribute bind to null in total silence.
+
+  Measured on PostgreSQL 17.10 through liquibase-maven-plugin 4.33.0 before the load() guard
+  existed: BUILD SUCCESS, and pg_catalog reported indisunique=f, amname=btree, no predicate.
+
+  Do not "fix" the schemaLocation here. StrictAttributesTest asserts the omission.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet author="strict" id="typo" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public"
+                                         tableName="orders"
+                                         indexName="idx_noxsd"
+                                         uniq="true">
+            <column name="created_at"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+</databaseChangeLog>

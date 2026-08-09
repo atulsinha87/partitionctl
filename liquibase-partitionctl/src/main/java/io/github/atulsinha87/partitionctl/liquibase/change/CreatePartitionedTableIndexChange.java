@@ -3,20 +3,19 @@ package io.github.atulsinha87.partitionctl.liquibase.change;
 import io.github.atulsinha87.partitionctl.liquibase.catalog.PartitionDiscovery;
 import io.github.atulsinha87.partitionctl.liquibase.catalog.TreeState;
 import io.github.atulsinha87.partitionctl.liquibase.statement.CreateIndexPlan;
-import io.github.atulsinha87.partitionctl.liquibase.statement.PlannedStatement;
 import io.github.atulsinha87.partitionctl.liquibase.statement.StatementBuilder;
+import io.github.atulsinha87.partitionctl.liquibase.statement.Statements;
 
-import liquibase.Scope;
 import liquibase.change.AbstractChange;
 import liquibase.change.ChangeMetaData;
 import liquibase.change.ChangeWithColumns;
 import liquibase.change.ColumnConfig;
 import liquibase.change.DatabaseChange;
+import liquibase.changelog.ChangeSet;
 import liquibase.database.Database;
 import liquibase.database.core.PostgresDatabase;
 import liquibase.exception.ValidationErrors;
 import liquibase.statement.SqlStatement;
-import liquibase.statement.core.RawSqlStatement;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -50,6 +49,16 @@ import java.util.List;
  * A changeset that succeeded is never re-run, so partitions created afterwards would silently
  * go unindexed. With {@code runAlways="true"} discovery runs on every deploy and emits nothing
  * when there is nothing to do.
+ *
+ * <h2>Limitation: the shape is honoured at build time only</h2>
+ * {@code unique}, {@code using}, {@code where} and the column list describe how to <em>build</em>
+ * an index that is not there. Coverage is decided from {@code pg_inherits} — is this leaf
+ * attached to this parent index — and never from the index's definition, because that is what
+ * makes a partition PostgreSQL indexed itself count as covered. The consequence, measured: point
+ * a second changeset at an index that already exists with a different {@code where}, and it emits
+ * <b>zero</b> statements and leaves the original predicate in place. Liquibase's own checksum
+ * catches an <em>edited</em> changeset; it cannot catch a new one aimed at the same index.
+ * Changing the shape of an index that exists means dropping it and building it again.
  */
 @DatabaseChange(
         name = "createPartitionedTableIndex",
@@ -71,10 +80,16 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
     private String lockTimeout = "15min";
     private String attachLockTimeout = "30s";
     private Integer paceSeconds;
+    private Boolean unique;
+    private String using;
+    private String where;
     private List<ColumnConfig> columns = new ArrayList<ColumnConfig>();
 
+    /** {@code using} must be a bare identifier; it becomes a quoted identifier in the SQL. */
+    private static final java.util.regex.Pattern IDENTIFIER =
+            java.util.regex.Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
+
     private transient PartitionDiscovery discovery;
-    private transient boolean parentInvalidWarningEmitted;
 
     public String getSchemaName() {
         return schemaName;
@@ -127,6 +142,58 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
         this.paceSeconds = paceSeconds;
     }
 
+    /**
+     * {@code CREATE UNIQUE INDEX}. Default false.
+     *
+     * <p>PostgreSQL requires a unique index on a partitioned table to include every partitioning
+     * column, and says so precisely when it does not — "unique constraint on partitioned table
+     * must include all partitioning columns", naming the missing column. That check is left to
+     * the server rather than duplicated here, where it would need the partition key.
+     */
+    public Boolean getUnique() {
+        return unique;
+    }
+
+    public void setUnique(Boolean unique) {
+        this.unique = unique;
+    }
+
+    /**
+     * Index access method — {@code btree} (PostgreSQL's default), {@code gin}, {@code gist},
+     * {@code brin}, {@code hash}, {@code spgist}, or one an extension provides.
+     *
+     * <p>Emitted as a quoted identifier, so it is matched case-sensitively against {@code pg_am}.
+     * Measured on 17.10: {@code USING "btree"} works and {@code USING "BTREE"} fails with
+     * "access method \"BTREE\" does not exist". Every access method PostgreSQL ships is
+     * lowercase; write it lowercase.
+     */
+    public String getUsing() {
+        return using;
+    }
+
+    public void setUsing(String using) {
+        this.using = using;
+    }
+
+    /**
+     * Partial-index predicate, without the {@code WHERE} keyword — for example
+     * {@code status &lt;&gt; 'archived'}.
+     *
+     * <p><b>Raw SQL, not escaped, and it cannot be.</b> A predicate is an arbitrary expression,
+     * so there is no parameter to bind it to. It is concatenated verbatim into the
+     * {@code CREATE INDEX} text, exactly as the body of a Liquibase {@code <sql>} tag is. Anyone
+     * who can edit the changelog can already run arbitrary SQL through Liquibase, so this opens
+     * no new door — but a changelog generated by string concatenation from untrusted input would
+     * carry that injection straight through, and nothing in this extension would catch it.
+     */
+    public String getWhere() {
+        return where;
+    }
+
+    public void setWhere(String where) {
+        this.where = where;
+    }
+
     @Override
     public List<ColumnConfig> getColumns() {
         return columns;
@@ -162,6 +229,23 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
     @Override
     public boolean generateStatementsVolatile(Database database) {
         return true;
+    }
+
+    /**
+     * Refuses an attribute this element does not define, before Liquibase binds anything.
+     *
+     * <p>See {@link StrictAttributes}. Without it a misspelled attribute is dropped in total
+     * silence whenever the adopter has not listed partitionctl.xsd in their
+     * {@code xsi:schemaLocation} — measured, and {@code unique="true"} misspelled as
+     * {@code uniq="true"} then ships a NON-UNIQUE index reported as success.
+     */
+    @Override
+    public void load(liquibase.parser.core.ParsedNode parsedNode,
+                     liquibase.resource.ResourceAccessor resourceAccessor)
+            throws liquibase.parser.core.ParsedNodeException {
+        StrictAttributes.rejectUnknown(parsedNode, "createPartitionedTableIndex",
+                getSerializableFields(), "column");
+        super.load(parsedNode, resourceAccessor);
     }
 
     /**
@@ -203,6 +287,20 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
         if (paceSeconds != null && paceSeconds < 0) {
             errors.addError("createPartitionedTableIndex: paceSeconds must not be negative");
         }
+        if (using != null && !IDENTIFIER.matcher(using.trim()).matches()) {
+            // Not a substitute for escaping -- the value is quoted, so it cannot break out
+            // whatever it contains. This refuses the nonsense case up front, with a message
+            // that names the attribute, instead of letting PostgreSQL report a syntax error
+            // halfway through a partition tree.
+            errors.addError("createPartitionedTableIndex: using=\"" + using + "\" is not an index "
+                    + "access method name. Expected a bare identifier such as btree, gin, gist, "
+                    + "brin, hash or spgist. It is matched case-sensitively against pg_am, so "
+                    + "write it lowercase.");
+        }
+        if (where != null && where.trim().isEmpty()) {
+            errors.addError("createPartitionedTableIndex: where must not be empty. Omit the "
+                    + "attribute entirely for a full index.");
+        }
         if (database != null && !(database instanceof PostgresDatabase)) {
             errors.addError("createPartitionedTableIndex supports PostgreSQL only, but the target "
                     + "database is " + database.getShortName()
@@ -223,43 +321,35 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
         }
         TreeState state = discovery.inspect(schemaName, tableName, indexName);
 
-        warnOnceIfParentAlreadyInvalid(state);
-
         CreateIndexPlan plan = new CreateIndexPlan()
                 .setSchemaName(schemaName)
                 .setTableName(tableName)
                 .setIndexName(indexName)
                 .setLockTimeout(lockTimeout)
                 .setAttachLockTimeout(attachLockTimeout)
-                .setPaceSeconds(paceSeconds);
+                .setPaceSeconds(paceSeconds)
+                .setUnique(unique)
+                .setUsing(using)
+                .setWhere(where)
+                .setChangeSetId(changeSetId());
         for (ColumnConfig column : columns) {
             plan.addColumn(column.getName(), Boolean.TRUE.equals(column.getDescending()));
         }
 
-        List<PlannedStatement> planned = StatementBuilder.build(plan, state);
-        SqlStatement[] statements = new SqlStatement[planned.size()];
-        for (int i = 0; i < planned.size(); i++) {
-            statements[i] = new RawSqlStatement(planned.get(i).toSql());
-        }
-        return statements;
+        return Statements.toSqlStatements(StatementBuilder.build(plan, state));
     }
 
     /**
-     * A parent found already invalid means a previous run was interrupted or a previous buggy
-     * run attached an invalid child. The gate at the end of the run reports the final state via
-     * RAISE WARNING, which not every host surfaces; this says it up front, once, on the channel
-     * that survives a low log level. Discovery is memoised, so it prints exactly once per update.
+     * {@code path::id::author}, recorded in the ownership marker so a human reading {@code \d+}
+     * can trace an index back to the changelog that built it. Null when the change is used
+     * outside a changeset, which only happens in tests.
      */
-    private void warnOnceIfParentAlreadyInvalid(TreeState state) {
-        if (parentInvalidWarningEmitted || !state.isParentIndexExists() || state.isParentIndexValid()) {
-            return;
+    private String changeSetId() {
+        ChangeSet changeSet = getChangeSet();
+        if (changeSet == null) {
+            return null;
         }
-        parentInvalidWarningEmitted = true;
-        Scope.getCurrentScope().getUI().sendMessage("[partitionctl] "
-                + schemaName + "." + indexName + " exists but is currently indisvalid = false. "
-                + "That is expected mid-build; this run will finish the outstanding leaves. "
-                + "If it is still false afterwards, an invalid child index was attached by an "
-                + "earlier run and the flag is permanent -- the index remains usable.");
+        return changeSet.getFilePath() + "::" + changeSet.getId() + "::" + changeSet.getAuthor();
     }
 
     @Override

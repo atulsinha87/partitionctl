@@ -12,7 +12,40 @@ public final class TreeState {
     private String originalStatementTimeout;
     private String originalLockTimeout;
     private String rootRelkind;
+    private int intermediatePartitionedCount;
+    private String parentIndexOwningTable;
     private final List<LeafPartition> leaves = new ArrayList<LeafPartition>();
+
+    /**
+     * How many relations below the root are themselves partitioned tables ({@code relkind = 'p'}),
+     * i.e. how many levels of sub-partitioning exist. Zero for the ordinary single-level table.
+     *
+     * <p>Non-zero means {@link #getLeaves()} holds grandchildren, and an index built on a
+     * grandchild can never be attached to an index on the root — measured on 17.10,
+     * {@code ALTER INDEX ... ATTACH PARTITION} answers "is not an index on any partition of
+     * table". The build path refuses rather than producing a permanently failing changeset.
+     */
+    public int getIntermediatePartitionedCount() {
+        return intermediatePartitionedCount;
+    }
+
+    public void setIntermediatePartitionedCount(int intermediatePartitionedCount) {
+        this.intermediatePartitionedCount = intermediatePartitionedCount;
+    }
+
+    /**
+     * {@code schema.table} the existing parent index is actually built on, from
+     * {@code pg_index.indrelid}, or null when no index of that name exists. Index names are
+     * unique per schema but say nothing about which table they belong to, so this is the only
+     * way to notice that a changeset has named an index belonging to a different table.
+     */
+    public String getParentIndexOwningTable() {
+        return parentIndexOwningTable;
+    }
+
+    public void setParentIndexOwningTable(String parentIndexOwningTable) {
+        this.parentIndexOwningTable = parentIndexOwningTable;
+    }
 
     /**
      * {@code pg_class.relkind} of the target table: {@code 'p'} for a partitioned table,

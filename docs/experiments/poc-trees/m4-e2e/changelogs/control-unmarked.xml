@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The negative control for the ownership marker.
+
+  Same drop as stage 4 of e2e.xml, run against a tree whose COMMENT ON INDEX markers have been
+  stripped by hand (unmark.sql). It must REFUSE. If it does not, the marker is decorative and
+  the drop's authorisation check proves nothing.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <changeSet author="control" id="unmarked-drop" runInTransaction="false">
+        <ext:dropPartitionedTableIndex schemaName="public"
+                                       tableName="orders"
+                                       indexName="idx_orders_created"
+                                       confirmExclusiveLock="true"/>
+    </changeSet>
+
+</databaseChangeLog>

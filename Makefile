@@ -11,7 +11,9 @@ SHELL := /bin/bash
 .PHONY: help build install test test-race cover fmt vet lint check clean \
         driver driver-status db-up db-down db-wait db-fixture db-psql db-reset \
         demo demo-plan demo-render demo-dry-run demo-execute demo-verify \
-        demo-status demo-clean tree
+        demo-status demo-clean tree \
+        lb-build lb-db-up lb-db-down lb-fixture lb-inspect lb-preview \
+        lb-e2e lb-progress lb-clean
 
 BIN        := build/partitionctl
 PKG        := ./cmd/partitionctl
@@ -22,6 +24,13 @@ PQ_VERSION ?= v1.10.9
 PG_CONTAINER ?= partitionctl-pg
 PG_IMAGE     ?= postgres:17
 PG_PORT      ?= 5432
+
+# The Liquibase plugin is an independent product and gets its own container and port, so a
+# `make lb-e2e` can never disturb a Go CLI demo running against $(PG_CONTAINER).
+LB_DIR          ?= liquibase-partitionctl
+LB_E2E          ?= docs/experiments/poc-trees/m4-e2e
+LB_PG_CONTAINER ?= partitionctl-lb
+LB_PG_PORT      ?= 5559
 PG_PASSWORD  ?= pw
 PG_DB        ?= postgres
 PG_USER      ?= postgres
@@ -186,3 +195,52 @@ demo-all: ## Full scripted walkthrough, every command echoed (add PAUSE=1 to ste
 demo-clean: ## Drop the demo plan and state, leaving the database alone
 	rm -rf $(PLAN) $(STATE_DIR)
 	@echo "removed $(PLAN) and $(STATE_DIR)"
+
+##@ Liquibase plugin
+#
+# The plugin is a separate product from the Go CLI above: it shares no code, no SQL and no
+# naming, and `make lb-e2e` never touches the Go targets or the $(PG_CONTAINER) database.
+# It runs its own PostgreSQL on $(LB_PG_PORT) so a plugin run cannot disturb a CLI demo.
+
+lb-build: ## mvn clean install the extension (always clean; Maven reuses stale classes)
+	cd $(LB_DIR) && mvn -B clean install
+
+lb-db-up: ## Start the plugin's own throwaway PostgreSQL on $(LB_PG_PORT)
+	@docker start $(LB_PG_CONTAINER) >/dev/null 2>&1 || \
+	 docker run -d --name $(LB_PG_CONTAINER) \
+	   -e POSTGRES_PASSWORD=$(PG_PASSWORD) \
+	   -p $(LB_PG_PORT):5432 $(PG_IMAGE) >/dev/null
+	@for i in $$(seq 1 60); do \
+	  docker exec $(LB_PG_CONTAINER) pg_isready -U $(PG_USER) >/dev/null 2>&1 && break; \
+	  sleep 1; \
+	done
+	@echo "postgres up on localhost:$(LB_PG_PORT) as $(LB_PG_CONTAINER)"
+
+lb-db-down: ## Stop and remove the plugin's PostgreSQL
+	@docker rm -f $(LB_PG_CONTAINER) >/dev/null 2>&1 || true
+	@echo "removed $(LB_PG_CONTAINER)"
+
+lb-fixture: lb-db-up ## Load the 12-partition, 1.2M-row orders fixture
+	@docker exec -i $(LB_PG_CONTAINER) psql -q -v ON_ERROR_STOP=1 \
+	  -U $(PG_USER) -d $(PG_DB) < $(LB_E2E)/fixture.sql
+
+lb-inspect: ## Read the whole tree straight from pg_catalog (never from Liquibase's log)
+	@docker exec -i $(LB_PG_CONTAINER) psql -q -U $(PG_USER) -d $(PG_DB) < $(LB_E2E)/inspect.sql
+
+lb-preview: ## liquibase updateSQL for the end-to-end changelog, no database changes
+	@cd $(LB_E2E) && ./run.sh e2e.xml updateSQL >/dev/null
+	@cat $(LB_E2E)/target/liquibase/migrate.sql
+
+lb-e2e: lb-build lb-fixture ## create, gate, reindex, drop in one changelog, catalog-checked at each stage
+	@$(LB_E2E)/e2e.sh
+
+lb-progress: ## Just the create stage, timestamped, to judge the progress output format
+	@docker exec -i $(LB_PG_CONTAINER) psql -q -v ON_ERROR_STOP=1 \
+	  -U $(PG_USER) -d $(PG_DB) < $(LB_E2E)/fixture.sql
+	@cd $(LB_E2E) && ./run.sh e2e.xml update -Dliquibase.toTag=created 2>&1 \
+	  | perl -MTime::HiRes=time -ne 'BEGIN{$$|=1;$$s=time()} printf("%7.2f  %s", time()-$$s, $$_)' \
+	  | grep -E 'partitionctl|Running Changeset|BUILD'
+
+lb-clean: lb-db-down ## Remove the plugin database and the harness build output
+	@rm -rf $(LB_E2E)/target $(LB_DIR)/target
+	@echo "removed $(LB_E2E)/target and $(LB_DIR)/target"

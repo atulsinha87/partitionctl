@@ -1,0 +1,10 @@
+PartitionCTL
+Copyright 2026 The PartitionCTL authors
+
+This product is licensed under the Apache License, Version 2.0; see the LICENSE
+file in the root of this repository, or http://www.apache.org/licenses/LICENSE-2.0.
+
+NOTE FOR THE PROJECT OWNER: "The PartitionCTL authors" above is a placeholder.
+Replace it with the legal copyright holder (an individual or a company) before
+publishing. The <licenses> block in liquibase-partitionctl/pom.xml already
+declares Apache-2.0 and agrees with this file.

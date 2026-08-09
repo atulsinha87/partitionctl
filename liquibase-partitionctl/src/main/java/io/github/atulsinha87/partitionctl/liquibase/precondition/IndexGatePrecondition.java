@@ -1,65 +1,67 @@
 package io.github.atulsinha87.partitionctl.liquibase.precondition;
 
-import liquibase.changelog.ChangeSet;
-import liquibase.changelog.DatabaseChangeLog;
-import liquibase.changelog.visitor.ChangeExecListener;
-import liquibase.database.Database;
-import liquibase.database.DatabaseConnection;
-import liquibase.database.jvm.JdbcConnection;
-import liquibase.exception.PreconditionErrorException;
-import liquibase.exception.PreconditionFailedException;
-import liquibase.exception.ValidationErrors;
-import liquibase.exception.Warnings;
-import liquibase.precondition.AbstractPrecondition;
-import liquibase.precondition.FailedPrecondition;
+import io.github.atulsinha87.partitionctl.liquibase.catalog.GateIndex;
+import io.github.atulsinha87.partitionctl.liquibase.catalog.GateLeaf;
+import io.github.atulsinha87.partitionctl.liquibase.catalog.GateSnapshot;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * {@code <ext:partitionctlIndexGate schema="..." table="..." index="..."/>}
  *
- * <p>Passes iff {@code pg_indexes} shows an index with the given name on the given
- * schema-qualified table. Runs a live SELECT on the JDBC connection Liquibase is already
- * authenticated on — no second credential, no subprocess.
+ * <p>Passes when a partitioned index of that name exists on that table and <b>every leaf
+ * partition</b> carries a child index that is attached to it and is valid, ready and live.
+ *
+ * <pre>{@code
+ * <changeSet author="x" id="9">
+ *   <preConditions onFail="HALT">
+ *     <ext:partitionctlIndexGate schema="public" table="person" index="idx_personaddress"/>
+ *   </preConditions>
+ *   <sql>ALTER TABLE person ADD CONSTRAINT ... </sql>
+ * </changeSet>
+ * }</pre>
  *
  * <p>Useful independently of the changes in this jar: it lets a different changeset assert an
- * index is present before depending on it, including when the index was built out of band.
+ * index is really usable before depending on it, including when the index was built out of band
+ * by the Go CLI or by hand.
+ *
+ * <h2>What "exists" is not</h2>
+ * An earlier version of this class checked {@code pg_indexes} for the name and nothing else.
+ * Measured on 17.10, that check passes on a tree where {@code CREATE INDEX ON ONLY} has run and
+ * <em>not one</em> of six leaves is attached — the parent is {@code indisvalid = f} and covers
+ * nothing, and {@code pg_indexes} lists it anyway. A gate whose whole purpose is "safe to depend
+ * on" cannot answer that question from the index's name.
+ *
+ * <h2>{@code requireValidParent}, and why it defaults to false</h2>
+ * A parent index can be left permanently {@code indisvalid = f} — attach an invalid child and no
+ * later {@code ATTACH} can ever validate it, and no {@code REINDEX} variant clears it either
+ * (limitation L3, re-measured on 17.10). But that flag <b>does not affect query planning</b>: the
+ * planner uses the leaf indexes, and partitions added later are still covered. So the default is
+ * to pass on leaves alone. Hard-failing by default would turn one unrepairable flag into a
+ * deployment that fails forever with no path forward — the same severity split the changes use,
+ * where an invalid leaf is fatal and an invalid parent is a warning.
+ *
+ * <p>Set {@code requireValidParent="true"} when the tree is meant to be pristine and you would
+ * rather stop than proceed. The adopter chooses strictness; the default chooses recoverability.
  */
-public class IndexGatePrecondition extends AbstractPrecondition {
+public class IndexGatePrecondition extends PartitionedIndexPrecondition {
 
-    public static final String NAMESPACE =
-            "http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl";
+    // MUST have an identically named attribute in partitionctl.xsd. A mismatch binds to null
+    // silently: requireValidParent would then read as "not set" and the strictness an adopter
+    // asked for would quietly not happen. PreconditionXsdBindingTest enforces the match.
+    private Boolean requireValidParent;
 
-    private String schema;
-    private String table;
-    private String index;
-
-    public String getSchema() {
-        return schema;
+    /**
+     * When true, the gate additionally requires {@code pg_index.indisvalid} on the partitioned
+     * parent itself. Default false — see the class comment.
+     */
+    public Boolean getRequireValidParent() {
+        return requireValidParent;
     }
 
-    public void setSchema(String schema) {
-        this.schema = schema;
-    }
-
-    public String getTable() {
-        return table;
-    }
-
-    public void setTable(String table) {
-        this.table = table;
-    }
-
-    public String getIndex() {
-        return index;
-    }
-
-    public void setIndex(String index) {
-        this.index = index;
+    public void setRequireValidParent(Boolean requireValidParent) {
+        this.requireValidParent = requireValidParent;
     }
 
     @Override
@@ -68,72 +70,85 @@ public class IndexGatePrecondition extends AbstractPrecondition {
     }
 
     @Override
-    public String getSerializedObjectNamespace() {
-        return NAMESPACE;
+    protected void evaluate(GateSnapshot snapshot, List<String> failures) {
+        if (!requireLeafPartitions(snapshot, failures)) {
+            return;
+        }
+        requireHealthyTree(snapshot, failures, Boolean.TRUE.equals(requireValidParent),
+                getSchemaName(), getTableName(), getIndexName());
     }
 
-    @Override
-    public Warnings warn(Database database) {
-        return new Warnings();
-    }
-
-    @Override
-    public ValidationErrors validate(Database database) {
-        ValidationErrors errors = new ValidationErrors();
-        if (isBlank(schema)) {
-            errors.addError("partitionctlIndexGate: 'schema' attribute is required");
+    /**
+     * The tree assertion shared with {@link ReindexGatePrecondition}: the named index is a
+     * partitioned index on the named table, and every leaf is covered by a usable child index.
+     *
+     * @return true when the tree checks out, so a caller can go on to look at leftovers
+     */
+    static boolean requireHealthyTree(GateSnapshot snapshot, List<String> failures,
+                                      boolean requireValidParent, String schema, String table,
+                                      String index) {
+        if (!snapshot.isNamedIndexExists()) {
+            failures.add("no index named " + schema + "." + index + " exists.");
+            return false;
         }
-        if (isBlank(table)) {
-            errors.addError("partitionctlIndexGate: 'table' attribute is required");
+        if (!snapshot.namedIndexIsPartitioned()) {
+            failures.add(schema + "." + index + " is an ordinary index (pg_class.relkind = '"
+                    + snapshot.getNamedIndexRelkind() + "', expected 'I'), not a partitioned "
+                    + "index. For an ordinary index use Liquibase's own <indexExists> "
+                    + "precondition.");
+            return false;
         }
-        if (isBlank(index)) {
-            errors.addError("partitionctlIndexGate: 'index' attribute is required");
+        String onTable = snapshot.getNamedIndexOnTable();
+        if (onTable != null && !onTable.equals(schema + "." + table)) {
+            // Index names are unique per schema but say nothing about which table they belong
+            // to, so without this a changeset naming the right index and the wrong table would
+            // gate on an index it has no relationship with, and pass.
+            failures.add(schema + "." + index + " is a partitioned index on " + onTable
+                    + ", not on the " + schema + "." + table + " named by this gate.");
+            return false;
         }
-        return errors;
-    }
+        if (!snapshot.isNamedIndexLive() || !snapshot.isNamedIndexReady()) {
+            failures.add("the partitioned index " + schema + "." + index + " is not usable "
+                    + "(indisready=" + snapshot.isNamedIndexReady()
+                    + ", indislive=" + snapshot.isNamedIndexLive()
+                    + "); indislive=false means a DROP INDEX CONCURRENTLY is in progress.");
+            return false;
+        }
 
-    @Override
-    public void check(Database database, DatabaseChangeLog changeLog, ChangeSet changeSet,
-                      ChangeExecListener execListener)
-            throws PreconditionFailedException, PreconditionErrorException {
-
-        boolean found;
-        try {
-            DatabaseConnection dbConnection = database.getConnection();
-            if (!(dbConnection instanceof JdbcConnection)) {
-                throw new PreconditionErrorException(
-                        new IllegalStateException("partitionctlIndexGate requires a JdbcConnection, got "
-                                + (dbConnection == null ? "none" : dbConnection.getClass().getName())),
-                        changeLog, this);
+        List<String> uncovered = new ArrayList<String>();
+        List<String> unusable = new ArrayList<String>();
+        for (GateLeaf leaf : snapshot.getLeaves()) {
+            GateIndex covering = leaf.getCoveringIndex();
+            if (covering == null) {
+                uncovered.add(leaf.toString());
+            } else if (!covering.isUsable()) {
+                unusable.add(leaf + " (" + covering.getIndexName() + ": "
+                        + covering.describeFlags() + ")");
             }
-            Connection connection = ((JdbcConnection) dbConnection).getUnderlyingConnection();
-
-            String sql = "SELECT 1 FROM pg_indexes WHERE schemaname = ? AND tablename = ? AND indexname = ?";
-            try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                ps.setString(1, schema);
-                ps.setString(2, table);
-                ps.setString(3, index);
-                try (ResultSet rs = ps.executeQuery()) {
-                    found = rs.next();
-                }
-            }
-        } catch (PreconditionErrorException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new PreconditionErrorException(e, changeLog, this);
         }
 
-        if (!found) {
-            List<FailedPrecondition> failures = new ArrayList<FailedPrecondition>();
-            failures.add(new FailedPrecondition(
-                    "Index '" + index + "' not found on " + schema + "." + table
-                            + " (checked live via pg_indexes on the changelog's own JDBC connection)",
-                    changeLog, this));
-            throw new PreconditionFailedException(failures);
+        int leaves = snapshot.getLeaves().size();
+        if (!uncovered.isEmpty()) {
+            failures.add(uncovered.size() + " of " + leaves + " leaf partition(s) have no child "
+                    + "index attached to " + schema + "." + index + ": "
+                    + summarise(sorted(uncovered)) + ".");
         }
-    }
+        if (!unusable.isEmpty()) {
+            failures.add(unusable.size() + " of " + leaves + " leaf partition(s) are covered by an "
+                    + "index that is not usable: " + summarise(sorted(unusable)) + ".");
+        }
+        if (!uncovered.isEmpty() || !unusable.isEmpty()) {
+            return false;
+        }
 
-    private static boolean isBlank(String value) {
-        return value == null || value.trim().isEmpty();
+        if (requireValidParent && !snapshot.isNamedIndexValid()) {
+            failures.add("every one of the " + leaves + " leaf partition(s) is covered and usable, "
+                    + "but the partitioned index " + schema + "." + index + " itself is "
+                    + "indisvalid=false and requireValidParent=\"true\" was set. This flag does "
+                    + "not affect query planning and cannot be cleared by any REINDEX variant "
+                    + "(limitation L3); only dropping and rebuilding the index clears it.");
+            return false;
+        }
+        return true;
     }
 }

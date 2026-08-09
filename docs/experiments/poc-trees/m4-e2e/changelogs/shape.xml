@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The three index-shape attributes from M4-PLAN 5.1, each across all 12 partitions.
+
+  What is being proved is not that the SQL is emitted (unit tests cover that) but that the
+  PARENT and every CHILD agree. Measured on 17.10, a mismatch in uniqueness, predicate or access
+  method is refused by ALTER INDEX ... ATTACH PARTITION with "The index definitions do not
+  match", so a tree that reaches 12/12 attached is proof the shape was carried through both.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <!-- partial: only the rows an operational query cares about -->
+    <changeSet author="shape" id="partial" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public" tableName="orders"
+                                         indexName="idx_orders_open"
+                                         where="status &lt;&gt; 'archived'">
+            <column name="created_at" descending="true"/>
+            <column name="customer_id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+    <!-- unique: must include the partition key (created_at), which PostgreSQL enforces itself -->
+    <changeSet author="shape" id="unique" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public" tableName="orders"
+                                         indexName="idx_orders_uniq"
+                                         unique="true">
+            <column name="created_at"/>
+            <column name="id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+    <!-- a non-default access method -->
+    <changeSet author="shape" id="brin" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public" tableName="orders"
+                                         indexName="idx_orders_brin"
+                                         using="brin">
+            <column name="created_at"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+    <!-- all three at once, to prove they compose in PostgreSQL's clause order -->
+    <changeSet author="shape" id="all-three" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public" tableName="orders"
+                                         indexName="idx_orders_all3"
+                                         unique="true" using="btree"
+                                         where="amount &gt; 0">
+            <column name="created_at"/>
+            <column name="id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+</databaseChangeLog>

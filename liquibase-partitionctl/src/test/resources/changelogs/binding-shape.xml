@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Parsed by BindsThroughLiquibaseTest through Liquibase's own XML parser, which is the only
+  thing that proves an XSD attribute actually binds. A name that does not match the Java
+  property binds to null SILENTLY, with no error of any kind.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <changeSet author="binding" id="shape" runInTransaction="false">
+        <ext:createPartitionedTableIndex schemaName="public"
+                                         tableName="orders"
+                                         indexName="idx_orders_shape"
+                                         unique="true"
+                                         using="brin"
+                                         where="status &lt;&gt; 'archived'"
+                                         lockTimeout="9min"
+                                         attachLockTimeout="11s"
+                                         paceSeconds="3">
+            <column name="created_at" descending="true"/>
+            <column name="id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+</databaseChangeLog>

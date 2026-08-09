@@ -28,6 +28,29 @@ public final class CreateIndexPlan {
     /** {@code SELECT pg_sleep(n)} between leaves. Null or 0 disables it. */
     private Integer paceSeconds;
 
+    /**
+     * {@code CREATE UNIQUE INDEX}. Null or false builds an ordinary index.
+     *
+     * <p>PostgreSQL requires a unique index on a partitioned table to contain every partitioning
+     * column — measured on 17.10: {@code CREATE UNIQUE INDEX ... ON ONLY p (addr)} where the
+     * table is partitioned by {@code id} fails with "unique constraint on partitioned table must
+     * include all partitioning columns". That message names the missing column, so it is not
+     * re-checked here.
+     */
+    private Boolean unique;
+
+    /** Index access method: {@code btree} (PostgreSQL's default), {@code gin}, {@code brin}, … */
+    private String using;
+
+    /** Partial index predicate. Raw SQL — see {@link #getWhere()}. */
+    private String where;
+
+    /**
+     * Liquibase's {@code path::id::author} for the running changeset, recorded in the ownership
+     * marker so a human reading {@code \d+} can find the changelog that built the index.
+     */
+    private String changeSetId;
+
     public String getSchemaName() {
         return schemaName;
     }
@@ -93,6 +116,71 @@ public final class CreateIndexPlan {
 
     public CreateIndexPlan setPaceSeconds(Integer paceSeconds) {
         this.paceSeconds = paceSeconds;
+        return this;
+    }
+
+    public Boolean getUnique() {
+        return unique;
+    }
+
+    public boolean isUnique() {
+        return Boolean.TRUE.equals(unique);
+    }
+
+    public CreateIndexPlan setUnique(Boolean unique) {
+        this.unique = unique;
+        return this;
+    }
+
+    /**
+     * The access method, or null for PostgreSQL's default.
+     *
+     * <p>Emitted as a quoted identifier, which makes it case-sensitive against {@code pg_am}.
+     * Measured on 17.10: {@code USING "btree"} works, {@code USING "BTREE"} fails with
+     * "access method \"BTREE\" does not exist". Every access method PostgreSQL ships is
+     * lowercase, so write it lowercase.
+     */
+    public String getUsing() {
+        return using;
+    }
+
+    public CreateIndexPlan setUsing(String using) {
+        this.using = using;
+        return this;
+    }
+
+    /**
+     * The partial-index predicate, or null.
+     *
+     * <h2>This is raw SQL and is not escaped</h2>
+     * A predicate is an arbitrary SQL expression — {@code status <> 'done'},
+     * {@code created_at >= now() - interval '30 days'} — so there is no parameter to bind it to
+     * and no quoting that would leave it meaning what the author wrote. It is concatenated into
+     * the {@code CREATE INDEX} text verbatim, exactly as an author's SQL in a Liquibase
+     * {@code <sql>} tag is. Whoever can edit the changelog can already run arbitrary SQL through
+     * Liquibase, so this widens no boundary — but it does mean a changelog built by string
+     * concatenation from untrusted input would carry that injection straight through, and
+     * nothing here would catch it.
+     *
+     * <p>It is only ever placed at the end of a {@code CREATE INDEX} statement, never inside a
+     * quoted literal and never inside a {@code --} comment label, so it cannot break out of a
+     * context into one it was not written for.
+     */
+    public String getWhere() {
+        return where;
+    }
+
+    public CreateIndexPlan setWhere(String where) {
+        this.where = where;
+        return this;
+    }
+
+    public String getChangeSetId() {
+        return changeSetId;
+    }
+
+    public CreateIndexPlan setChangeSetId(String changeSetId) {
+        this.changeSetId = changeSetId;
         return this;
     }
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.atulsinha87.gate</groupId>
+  <artifactId>partitionctl-e2e-runner</artifactId>
+  <version>0.0.1-E2E</version>
+  <packaging>pom</packaging>
+  <properties><liquibase.version>4.33.0</liquibase.version></properties>
+  <build><plugins><plugin>
+    <groupId>org.liquibase</groupId>
+    <artifactId>liquibase-maven-plugin</artifactId>
+    <version>${liquibase.version}</version>
+    <configuration>
+      <changeLogFile>${changelog}</changeLogFile>
+      <url>jdbc:postgresql://localhost:5559/postgres</url>
+      <username>postgres</username><password>pw</password>
+      <driver>org.postgresql.Driver</driver>
+      <verbose>true</verbose>
+    </configuration>
+    <dependencies>
+      <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.7.4</version></dependency>
+      <dependency><groupId>io.github.atulsinha87</groupId><artifactId>liquibase-partitionctl</artifactId><version>0.1.0-SNAPSHOT</version></dependency>
+    </dependencies>
+  </plugin></plugins></build>
+</project>

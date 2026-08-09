@@ -1,1 +1,3 @@
 io.github.atulsinha87.partitionctl.liquibase.precondition.IndexGatePrecondition
+io.github.atulsinha87.partitionctl.liquibase.precondition.IndexAbsentGatePrecondition
+io.github.atulsinha87.partitionctl.liquibase.precondition.ReindexGatePrecondition

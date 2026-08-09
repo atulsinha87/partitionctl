@@ -206,24 +206,39 @@ class XsdBindingTest {
         return null;
     }
 
-    /** Bean properties declared by the class itself (not inherited), minus the exclusions. */
-    private Set<String> settablePropertiesOf(Class<?> type, String... exclude) {
+    /**
+     * Bean properties this extension declares, minus the exclusions.
+     *
+     * <p>Walks up the hierarchy for as long as the class belongs to this extension, then stops.
+     * Liquibase's own base classes ({@code AbstractChange}, {@code AbstractPrecondition}) carry
+     * setters that are not changelog attributes and must not be compared against the XSD.
+     *
+     * <p>It cannot simply use {@code getDeclaredMethods()} on the leaf class: the three
+     * preconditions declare {@code schema}, {@code table} and {@code index} on a shared
+     * {@code PartitionedIndexPrecondition} base, and a check that ignored inherited properties
+     * would silently stop covering the three attributes that matter most.
+     */
+    static Set<String> settablePropertiesOf(Class<?> type, String... exclude) {
         Set<String> excluded = new LinkedHashSet<String>();
         for (String name : exclude) {
             excluded.add(name);
         }
         Set<String> names = new LinkedHashSet<String>();
-        for (Method method : type.getDeclaredMethods()) {
-            if (!method.getName().startsWith("set")
-                    || method.getParameterCount() != 1
-                    || method.getName().length() < 4
-                    || !java.lang.reflect.Modifier.isPublic(method.getModifiers())) {
-                continue;
-            }
-            String property = Character.toLowerCase(method.getName().charAt(3))
-                    + method.getName().substring(4);
-            if (!excluded.contains(property)) {
-                names.add(property);
+        for (Class<?> c = type;
+             c != null && c.getName().startsWith("io.github.atulsinha87.");
+             c = c.getSuperclass()) {
+            for (Method method : c.getDeclaredMethods()) {
+                if (!method.getName().startsWith("set")
+                        || method.getParameterCount() != 1
+                        || method.getName().length() < 4
+                        || !java.lang.reflect.Modifier.isPublic(method.getModifiers())) {
+                    continue;
+                }
+                String property = Character.toLowerCase(method.getName().charAt(3))
+                        + method.getName().substring(4);
+                if (!excluded.contains(property)) {
+                    names.add(property);
+                }
             }
         }
         return names;

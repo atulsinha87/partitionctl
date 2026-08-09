@@ -1,1 +1,3 @@
 io.github.atulsinha87.partitionctl.liquibase.change.CreatePartitionedTableIndexChange
+io.github.atulsinha87.partitionctl.liquibase.change.DropPartitionedTableIndexChange
+io.github.atulsinha87.partitionctl.liquibase.change.ReindexPartitionedTableIndexChange
