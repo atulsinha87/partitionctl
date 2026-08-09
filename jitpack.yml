@@ -6,11 +6,24 @@
 # Maven's own default JDK 26 was rejected in favour of 17, which is the newest JDK verified
 # to build this tree. Pin it rather than inherit whatever JitPack ships next.
 #
-# install: skip the tests. They pass (217, 0 failures) and are run by the project's own gate;
-# running them again on JitPack only adds build time and a way for the publish to fail for a
-# reason unrelated to packaging.
+# install: ./mvnw, NOT mvn. JitPack's build image ships a Maven older than 3.6.3, and that is
+# not a theoretical problem - it broke the publish twice, measured, once per release:
+#
+#   v0.1.0  its Maven defaulted to maven-compiler-plugin 3.1, which predates <release> support,
+#           so maven.compiler.release=8 was silently ignored and source/target fell back to 1.5:
+#           "Source option 5 is no longer supported. Use 7 or later."
+#   v0.1.1  pinning maven-compiler-plugin 3.13.0 then failed differently:
+#           "The plugin ... requires Maven version 3.6.3"
+#
+# Chasing plugin versions downward was the wrong direction - surefire 3.2.5 has the same Maven
+# floor, so it would have meant downgrading the test runner to satisfy a build that skips tests.
+# The wrapper pins Maven 3.9.9 for every build everywhere instead, which is the actual fix.
+#
+# skip the tests: they pass (217, 0 failures) and are run by the project's own gate. Running them
+# again here only adds build time and another way for a publish to fail for a packaging-unrelated
+# reason.
 jdk:
   - openjdk17
 
 install:
-  - mvn install -DskipTests -B
+  - ./mvnw install -DskipTests -B

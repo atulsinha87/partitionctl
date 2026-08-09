@@ -36,7 +36,7 @@ Building from source works too, and needs no repository entry:
 
 ```bash
 git clone https://github.com/atulsinha87/partitionctl.git
-cd partitionctl && mvn clean install     # installs 0.1.1 into your ~/.m2
+cd partitionctl && mvn clean install     # installs 0.1.2 into your ~/.m2
 ```
 
 Build with **JDK 17**: the jar targets Java 8 bytecode and recent javac releases have been
@@ -74,7 +74,7 @@ is the single most common way to get a "no declaration can be found" error.
     <dependency>
       <groupId>com.github.atulsinha87.partitionctl</groupId>
       <artifactId>liquibase-partitionctl</artifactId>
-      <version>v0.1.1</version>
+      <version>v0.1.2</version>
     </dependency>
   </dependencies>
 </plugin>
