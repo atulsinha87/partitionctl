@@ -1,0 +1,16 @@
+# JitPack build configuration.
+#
+# jdk: JitPack's default JDK is newer than this project can compile against. The extension
+# targets Java 8 bytecode (maven.compiler.release=8) so it runs on any Liquibase host, and
+# recent javac releases have been dropping old --release targets: on the build machine,
+# Maven's own default JDK 26 was rejected in favour of 17, which is the newest JDK verified
+# to build this tree. Pin it rather than inherit whatever JitPack ships next.
+#
+# install: skip the tests. They pass (217, 0 failures) and are run by the project's own gate;
+# running them again on JitPack only adds build time and a way for the publish to fail for a
+# reason unrelated to packaging.
+jdk:
+  - openjdk17
+
+install:
+  - mvn install -DskipTests -B
