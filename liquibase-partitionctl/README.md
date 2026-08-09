@@ -17,19 +17,33 @@ resumes correctly when a run is interrupted.
 just this artifact — and the `pom.xml` has none of the plumbing Central requires (no
 `maven-gpg-plugin`, no source or javadoc jar, no `distributionManagement`).
 
-It is published from GitHub through **JitPack**, which needs no credentials. Add the repository:
+It is published from GitHub through **JitPack**, which needs no credentials. Add the repository —
+as a **`<pluginRepository>`**:
 
 ```xml
-<repositories>
-  <repository>
+<pluginRepositories>
+  <pluginRepository>
     <id>jitpack.io</id>
     <url>https://jitpack.io</url>
-  </repository>
-</repositories>
+  </pluginRepository>
+</pluginRepositories>
 ```
 
-Note the groupId JitPack serves it under — `com.github.atulsinha87.partitionctl` — which is not
-the `io.github.atulsinha87` in this project's own `pom.xml`. JitPack republishes under a
+**`<repositories>` will not work, and the error does not say why.** This extension is declared
+inside the liquibase-maven-plugin's own `<dependencies>` (see below), which makes it a *plugin*
+dependency, and Maven resolves those from plugin repositories only. Declare JitPack under
+`<repositories>` and Maven never contacts it at all — it looks in Central, does not find the
+artifact, and reports:
+
+```
+Could not find artifact com.github.atulsinha87.partitionctl:liquibase-partitionctl:jar:v0.1.2
+  in central (https://repo.maven.apache.org/maven2)
+```
+
+which reads like the artifact does not exist rather than like a misplaced repository.
+
+Note also the groupId JitPack serves it under — `com.github.atulsinha87.partitionctl` — which is
+not the `io.github.atulsinha87` in this project's own `pom.xml`. JitPack republishes under a
 coordinate derived from the GitHub owner and repository.
 
 Building from source works too, and needs no repository entry:

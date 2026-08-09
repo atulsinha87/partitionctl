@@ -32,13 +32,18 @@ pipeline.
 **→ [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md)** — quickstart, full
 attribute reference, troubleshooting and limitations.
 
+It must be `<pluginRepositories>`, **not** `<repositories>`. The extension goes inside the
+liquibase-maven-plugin's own `<dependencies>`, and plugin dependencies are resolved from plugin
+repositories only — with `<repositories>` Maven never contacts JitPack and fails saying the
+artifact is not in Central.
+
 ```xml
-<repositories>
-  <repository>
+<pluginRepositories>
+  <pluginRepository>
     <id>jitpack.io</id>
     <url>https://jitpack.io</url>
-  </repository>
-</repositories>
+  </pluginRepository>
+</pluginRepositories>
 ```
 
 ```xml
