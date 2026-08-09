@@ -6,7 +6,7 @@
 
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.0</version>
+  <version>0.1.1</version>
   <packaging>jar</packaging>
 
   <name>liquibase-partitionctl</name>
@@ -19,7 +19,7 @@
     <connection>scm:git:https://github.com/atulsinha87/partitionctl.git</connection>
     <developerConnection>scm:git:https://github.com/atulsinha87/partitionctl.git</developerConnection>
     <url>https://github.com/atulsinha87/partitionctl</url>
-    <tag>v0.1.0</tag>
+    <tag>v0.1.1</tag>
   </scm>
 
   <licenses>
