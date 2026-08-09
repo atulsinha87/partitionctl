@@ -74,8 +74,8 @@ entirely, since it comes from your local `~/.m2`:
 Use `./mvnw`, not `mvn`: the wrapper pins Maven 3.9.9, and an older Maven silently ignores the
 `<release>` setting that keeps the jar loadable on Java 8.
 
-Licensing is Apache 2.0 (`LICENSE` at the repository root); the copyright holder line in `NOTICE`
-is still a placeholder the project owner must fill in.
+Licensing is Apache 2.0. The jar carries both `META-INF/LICENSE` and `META-INF/NOTICE`, so a
+redistributor has the attribution file Apache-2.0 section 4(d) expects them to propagate.
 
 ---
 
