@@ -89,3 +89,29 @@ func (e *catalogEvaluator) Marker(ctx context.Context, object protocol.ObjectNam
 	}
 	return verifier.IndexMarker(ctx, e.marker, object)
 }
+
+// IndexesOn lists every index on relation, so the executor can resolve a
+// REINDEX CONCURRENTLY leftover to the index it was a rebuild of (issue #2).
+//
+// It reuses TreeIndexes rather than adding a query. TreeIndexes returns the
+// indexes on a relation and on everything beneath it; relation here is a leaf
+// partition, which has nothing beneath it, and the result is filtered on
+// IndexState.Relation regardless so a partitioned argument cannot widen the
+// candidate set. A relation with no indexes is an empty slice and a nil error.
+func (e *catalogEvaluator) IndexesOn(ctx context.Context, relation protocol.ObjectName) ([]protocol.ObjectName, error) {
+	if e.marker == nil {
+		return nil, executor.ErrMissingPort.Detailf(
+			"the indexes on %s cannot be listed: no verifier catalog is configured", relation)
+	}
+	states, err := e.marker.TreeIndexes(ctx, relation)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.ObjectName, 0, len(states))
+	for _, s := range states {
+		if s.Relation == relation {
+			out = append(out, s.Name)
+		}
+	}
+	return out, nil
+}

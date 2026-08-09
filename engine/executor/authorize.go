@@ -125,16 +125,46 @@ func authorizeProvenance(ctx context.Context, store AuthorityReader, cat Catalog
 // CONCURRENTLY by hand on an index this tool never built must not have the
 // wreckage deleted by it (AC-19).
 func authorizeLeftover(ctx context.Context, cat CatalogEvaluator, d AuthorizationDecision, auth *protocol.Authorization) (AuthorizationDecision, error) {
-	base, ok := protocol.LeftoverBase(auth.Object)
-	if !ok {
+	if kind, _ := protocol.ClassifyLeftover(auth.Object.Name); kind == protocol.LeftoverNone {
 		v := protocol.DecideLeftoverDrop(protocol.LeftoverDropInput{Object: auth.Object})
 		d.Reason = v.Reason
 		return d, nil
 	}
 	if cat == nil {
 		return d, ErrMissingPort.Detailf(
-			"a CatalogEvaluator is required to read the ownership marker on %s (FR-AUTH-3)", base)
+			"a CatalogEvaluator is required to read the ownership marker for %s (FR-AUTH-3)", auth.Object)
 	}
+	if auth.Relation == nil {
+		return d, ErrMissingPort.Detailf(
+			"the authorization for leftover %s names no relation, so its base index cannot be "+
+				"resolved (issue #2)", auth.Object)
+	}
+
+	// Resolve against the indexes that actually exist on the relation, never by
+	// trimming the suffix. PostgreSQL truncates the base to make room for
+	// _ccnew/_ccold, so a trimmed stem can name a DIFFERENT index -- and reading
+	// a marker off that one is the forgery INV-7/AC-19 exist to prevent.
+	candidates, err := cat.IndexesOn(ctx, *auth.Relation)
+	if err != nil {
+		return d, err
+	}
+	base, res := protocol.ResolveLeftoverBase(auth.Object, candidates)
+	switch res {
+	case protocol.LeftoverResolved:
+		// fall through to the marker read below
+	case protocol.LeftoverAmbiguous:
+		d.Reason = "several indexes on " + auth.Relation.String() + " could be the base of " +
+			auth.Object.String() + ": PostgreSQL truncated the name to fit " +
+			"63 bytes and the distinguishing bytes are gone, so ownership cannot be " +
+			"established from the catalog. Drop it by hand (issue #2)"
+		return d, nil
+	default:
+		d.Reason = "no index on " + auth.Relation.String() + " could have produced the leftover " +
+			auth.Object.String() + ", so there is no base whose ownership marker could authorize " +
+			"dropping it (FR-AUTH-3, AC-19)"
+		return d, nil
+	}
+
 	marker, status, err := cat.Marker(ctx, base)
 	if err != nil {
 		return d, err

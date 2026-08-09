@@ -133,12 +133,13 @@ every verdict read from `pg_catalog` rather than from either tool's own log — 
 [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md). They are real constraints of
 PostgreSQL and Liquibase, not a to-do list.
 
-**The Go CLI** carries one measured, open defect —
-[#2](https://github.com/atulsinha87/partitionctl/issues/2). When a generated child index name
-reaches PostgreSQL's 63-byte limit, recovery of a `_ccnew`/`_ccold` leftover's base name is wrong,
-which can strand a reindex and, in the worst case, read an ownership marker off an unrelated index.
-It does not affect the extension, which shares no code with that path. **You are clear of it if
-`indexName` + `_` + your longest partition name stays under 58 bytes.**
+**The Go CLI** has one behaviour worth knowing about at PostgreSQL's 63-byte identifier limit.
+When a `_ccnew`/`_ccold` leftover fills all 63 bytes, PostgreSQL has truncated the base name to
+make room for the suffix, and the bytes that would tell two similarly-named indexes apart are
+gone. Where more than one index on the partition could have produced the leftover, the CLI
+**refuses to act rather than guess** — it will not take an ownership marker off an object that
+might not be the right one. Resolve it by hand and re-run. This was [#2](https://github.com/atulsinha87/partitionctl/issues/2),
+fixed; the refusal is the deliberate end state, not a remaining bug.
 
 ## Verifying a checkout
 

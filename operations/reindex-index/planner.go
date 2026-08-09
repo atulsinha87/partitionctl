@@ -213,6 +213,14 @@ func (pl Planner) classifyLeaves(
 		on := byTable[leaf.OID]
 		sort.Slice(on, func(i, j int) bool { return on[i].Name.Name < on[j].Name.Name })
 
+		// The candidate set a leftover is resolved against: every index on this
+		// leaf. Trimming a leftover's suffix does not recover its base once
+		// PostgreSQL has truncated the name (issue #2).
+		onNames := make([]protocol.ObjectName, 0, len(on))
+		for _, idx := range on {
+			onNames = append(onNames, idx.Name)
+		}
+
 		child, err := attachedChild(leaf, on, pidx, parentIndex)
 		if err != nil {
 			return nil, err
@@ -235,8 +243,11 @@ func (pl Planner) classifyLeaves(
 			// some unrelated index on the same partition is dropped, because
 			// the terminal CheckNoLeftoverIndexes demands the leaf be clean,
 			// but it is not evidence that our rebuild already succeeded.
-			base, ok := protocol.LeftoverBase(idx.Name)
-			if !ok || base != child.Name {
+			// Resolve against every index on this leaf, not by trimming the
+			// suffix: a truncated name would either miss the match or point at
+			// an unrelated index (issue #2).
+			base, res := protocol.ResolveLeftoverBase(idx.Name, onNames)
+			if res != protocol.LeftoverResolved || base != child.Name {
 				continue
 			}
 			if kind == protocol.LeftoverOld {
@@ -319,7 +330,14 @@ func authorizeLeftover(
 	byName map[protocol.ObjectName]planner.Index,
 ) error {
 	in := protocol.LeftoverDropInput{Object: leftover.Name}
-	if base, ok := protocol.LeftoverBase(leftover.Name); ok {
+	candidates := make([]protocol.ObjectName, 0, len(byName))
+	for n := range byName {
+		candidates = append(candidates, n)
+	}
+	// Resolved against the candidate set rather than by trimming: see issue #2.
+	// Ambiguous and unresolved both leave BaseExists false, which DecideLeftoverDrop
+	// already refuses -- the safe direction.
+	if base, res := protocol.ResolveLeftoverBase(leftover.Name, candidates); res == protocol.LeftoverResolved {
 		baseIdx, exists := byName[base]
 		in.BaseExists = exists
 		if exists {

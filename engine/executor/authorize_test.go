@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,13 @@ func TestAuthorizeLeftoverModeNeedsBothConditions(t *testing.T) {
 				Relation: objPtr(t, relation),
 			}
 			f := newAuthFixture(t, auth, tc.index)
+			// The base must actually exist on the relation. Before issue #2 was
+			// closed the base name was invented by trimming the leftover's
+			// suffix, so these cases passed without any index being there --
+			// which is precisely how a marker could be read off an unrelated
+			// index. The candidate set now has to contain it.
+			f.catalog.setIndexes(obj(t, relation),
+				obj(t, "public.orders_idx"), obj(t, tc.index))
 			if tc.markedBase != "" {
 				f.catalog.mark(t, obj(t, tc.markedBase), "run-reindex-9")
 			}
@@ -370,5 +378,71 @@ func TestAuthorizationIsReEvaluatedAtDispatchNotTakenFromThePlan(t *testing.T) {
 	h2.catalog.mark(t, obj(t, "public.orders_created_at_idx_orders_2026_03"), "run-0")
 	if _, err := h2.run(t, plan); err != nil {
 		t.Fatalf("Run with the marker present: %v", err)
+	}
+}
+
+// Issue #2, consequence 3: the forgery this fix exists to prevent.
+//
+// PostgreSQL truncates the base to make room for _ccnew, so once a leftover
+// fills all 63 bytes the bytes that told two indexes apart are gone. The old
+// code trimmed the suffix and read the ownership marker off whatever carried
+// the resulting name -- which could be an entirely different index. If that one
+// happened to be marked, an unrelated object's marker authorized the drop.
+//
+// Resolution now runs forwards against the indexes that actually exist on the
+// relation, and refuses when more than one derives the leftover.
+func TestAuthorizeLeftoverRefusesWhenTruncationMakesTheBaseAmbiguous(t *testing.T) {
+	// The exact shape of the forgery. The leftover fills all 63 bytes, so the
+	// trimmed stem is 57. A DIFFERENT index happens to be named exactly that
+	// stem, and it is one of ours, marked. The leftover's real base is a longer
+	// name that truncates to the same 57 bytes.
+	//
+	// Old behaviour: trim to the stem, read the marker off whatever carries that
+	// name -- the unrelated index -- find it ours, and authorize. That is an
+	// ownership proof taken from the wrong object.
+	stem := "idx_" + strings.Repeat("a", 53) // 57 bytes
+	unrelatedButMarked := "public." + stem   // an ordinary index that merely has this name
+	realBase := "public." + stem + "xxx"     // 60 bytes, truncates to the same stem
+	leftover := "public." + stem + "_ccnew"  // 63 bytes
+
+	auth := &protocol.Authorization{
+		Mode:     protocol.AuthLeftover,
+		Object:   obj(t, leftover),
+		Relation: objPtr(t, "public.orders_2026_03"),
+	}
+	f := newAuthFixture(t, auth, leftover)
+	f.catalog.setIndexes(obj(t, "public.orders_2026_03"),
+		obj(t, unrelatedButMarked), obj(t, realBase), obj(t, leftover))
+	f.catalog.mark(t, obj(t, unrelatedButMarked), "run-reindex-9")
+
+	d := f.authorize(t)
+
+	if d.Satisfied {
+		t.Fatal("authorized a drop on a marker that may belong to a different index (issue #2)")
+	}
+	if !strings.Contains(d.Reason, "truncated") {
+		t.Fatalf("the refusal must explain that truncation made it undecidable, got: %s", d.Reason)
+	}
+}
+
+// The base is resolved even when PostgreSQL truncated it, so the ordinary case
+// on long names still authorizes rather than halting for no reason.
+func TestAuthorizeLeftoverResolvesATruncatedBase(t *testing.T) {
+	base := "public.idx_" + strings.Repeat("b", 54)                 // 58-byte base name
+	leftover := "public.idx_" + strings.Repeat("b", 52) + "_ccnew1" // truncated to 56 + suffix
+
+	auth := &protocol.Authorization{
+		Mode:     protocol.AuthLeftover,
+		Object:   obj(t, leftover),
+		Relation: objPtr(t, "public.orders_2026_03"),
+	}
+	f := newAuthFixture(t, auth, leftover)
+	f.catalog.setIndexes(obj(t, "public.orders_2026_03"), obj(t, base), obj(t, leftover))
+	f.catalog.mark(t, obj(t, base), "run-reindex-9")
+
+	d := f.authorize(t)
+
+	if !d.Satisfied {
+		t.Fatalf("a truncated but unambiguous base was not resolved: %s", d.Reason)
 	}
 }

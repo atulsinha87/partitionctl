@@ -86,6 +86,22 @@ This project has shipped a wrong design twice by trusting a documentation summar
 
 ---
 
+## Nothing is published without the owner approving the diff
+
+**Commit freely. Do not push, tag, or open anything outward-facing until the owner has seen the
+complete diff and said yes.**
+
+A push to a public repository is irreversible in the way that matters: the content is disclosed,
+and may be forked, indexed or cached. Reverting afterwards does not undo publication. Verifying a
+change and getting agreement on it are different things, and doing the first well is not a
+substitute for the second.
+
+- Commit locally as much as you like, then stop and show the diff — `git show --stat` plus the
+  substantive hunks, or a file-by-file walk when it is large.
+- A request to fix or build something is **not** authorisation to publish the result.
+- This covers pushes, tags, GitHub issues, releases and repository settings. Approval for one does
+  not carry to the next.
+
 ## Checkpointing
 
 Before compacting context or pausing work, use the `smart-compact` skill. It stops background work, verifies the build by running it, commits, updates the handoff, and refreshes this index. The skill lives in `.claude/`, which is gitignored, so it is present on the author's machine and not in a fresh clone.

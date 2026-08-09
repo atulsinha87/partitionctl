@@ -219,12 +219,111 @@ const (
 // The suffix is matched as a pattern: "_ccnew" or "_ccold" followed by an
 // optional run of decimal digits, anchored at the end of the name.
 func ClassifyLeftover(indexName string) (kind LeftoverKind, base string) {
+	kind, stem, _ := splitLeftover(indexName)
+	return kind, stem
+}
+
+// splitLeftover separates a leftover name into the stem PostgreSQL truncated
+// and the suffix it appended, e.g. "idx_ccnew1" -> ("idx", "_ccnew1").
+//
+// The stem is NOT the base index name whenever PostgreSQL had to truncate. Use
+// [ResolveLeftoverBase] to recover the base; nothing outside this file should
+// treat the stem as a name.
+func splitLeftover(indexName string) (kind LeftoverKind, stem, suffix string) {
 	trimmed := strings.TrimRight(indexName, "0123456789")
+	digits := indexName[len(trimmed):]
 	switch {
 	case strings.HasSuffix(trimmed, LeftoverNewPrefix):
-		return LeftoverNew, strings.TrimSuffix(trimmed, LeftoverNewPrefix)
+		return LeftoverNew, strings.TrimSuffix(trimmed, LeftoverNewPrefix), LeftoverNewPrefix + digits
 	case strings.HasSuffix(trimmed, LeftoverOldPrefix):
-		return LeftoverOld, strings.TrimSuffix(trimmed, LeftoverOldPrefix)
+		return LeftoverOld, strings.TrimSuffix(trimmed, LeftoverOldPrefix), LeftoverOldPrefix + digits
 	}
-	return LeftoverNone, indexName
+	return LeftoverNone, indexName, ""
+}
+
+// DerivesLeftover reports whether PostgreSQL would have produced leftover when
+// rebuilding base.
+//
+// This is the only direction that is total. Trimming the suffix off a leftover
+// does not recover the base, because makeObjectName truncates the BASE so that
+// base + suffix fits in NAMEDATALEN-1 bytes. Measured on 17.10 by cancelling
+// real REINDEX INDEX CONCURRENTLY runs:
+//
+//	base 57 B -> <base>_ccnew   (63 B)  trimming recovers the base
+//	base 58 B -> <56 B>_ccnew1  (63 B)  trimming recovers 56 B, not the base
+//	base 63 B -> <57 B>_ccnew   (63 B)  trimming recovers 57 B, not the base
+//
+// Going forwards instead reproduces all three: the observed suffix fixes the
+// budget, so the base is truncated to MaxIdentifierBytes-len(suffix) and the
+// suffix appended.
+func DerivesLeftover(base, leftover string) bool {
+	kind, _, suffix := splitLeftover(leftover)
+	if kind == LeftoverNone {
+		return false
+	}
+	budget := MaxIdentifierBytes - len(suffix)
+	if budget < 0 {
+		budget = 0
+	}
+	return truncateUTF8(base, budget)+suffix == leftover
+}
+
+// LeftoverResolution is the outcome of resolving a leftover to its base index.
+type LeftoverResolution int
+
+const (
+	// LeftoverNotAName means the name is not a leftover at all.
+	LeftoverNotAName LeftoverResolution = iota
+	// LeftoverResolved means exactly one candidate derives this leftover.
+	LeftoverResolved
+	// LeftoverAmbiguous means several candidates derive it. The truncation
+	// destroyed the distinguishing bytes, so this cannot be decided from
+	// names, and the caller must halt rather than guess: guessing here is what
+	// would read an ownership marker off an unrelated index.
+	LeftoverAmbiguous
+	// LeftoverUnresolved means no candidate derives it, so the base is gone
+	// or was never on this relation.
+	LeftoverUnresolved
+)
+
+// ResolveLeftoverBase recovers the base index a leftover was a rebuild of, by
+// asking which of the indexes that actually exist on the relation PostgreSQL
+// would have derived this name from.
+//
+// candidates must be every index on the same relation. Leftovers among them are
+// skipped: a leftover is never the base of another leftover.
+func ResolveLeftoverBase(leftover ObjectName, candidates []ObjectName) (ObjectName, LeftoverResolution) {
+	kind, _, _ := splitLeftover(leftover.Name)
+	if kind == LeftoverNone {
+		return ObjectName{}, LeftoverNotAName
+	}
+
+	var found ObjectName
+	n := 0
+	for _, c := range candidates {
+		if c.Schema != leftover.Schema || c.Name == leftover.Name {
+			continue
+		}
+		if k, _, _ := splitLeftover(c.Name); k != LeftoverNone {
+			continue
+		}
+		if !DerivesLeftover(c.Name, leftover.Name) {
+			continue
+		}
+		// No short circuit on an exact, untruncated match. When the leftover
+		// fills all 63 bytes, an index named exactly the stem and a longer one
+		// whose first bytes are that stem BOTH derive it, and PostgreSQL
+		// appends the digit only on conflict, so neither can be ruled out.
+		// That is genuinely undecidable from names, and must count as such.
+		found = c
+		n++
+	}
+	switch n {
+	case 0:
+		return ObjectName{}, LeftoverUnresolved
+	case 1:
+		return found, LeftoverResolved
+	default:
+		return ObjectName{}, LeftoverAmbiguous
+	}
 }

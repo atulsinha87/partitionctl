@@ -144,12 +144,19 @@ func TestLeftoverDropRefusesAHandMadeLeftover(t *testing.T) {
 	}
 }
 
-func TestLeftoverBase(t *testing.T) {
-	got, ok := LeftoverBase(NewObjectName("app", "idx_ccnew12"))
-	if !ok || got != NewObjectName("app", "idx") {
-		t.Fatalf("LeftoverBase = %v, %t", got, ok)
+// Was TestLeftoverBase. LeftoverBase trimmed the suffix and returned the stem,
+// which is only the base when PostgreSQL did not truncate; it is gone (issue
+// #2). The same short names now go through the resolver, against the candidate
+// set. Truncation itself is covered in leftoverbase_test.go.
+func TestResolveLeftoverBaseOnUntruncatedNames(t *testing.T) {
+	base := NewObjectName("app", "idx")
+
+	got, res := ResolveLeftoverBase(NewObjectName("app", "idx_ccnew12"), []ObjectName{base})
+	if res != LeftoverResolved || got != base {
+		t.Fatalf("ResolveLeftoverBase = %v, %v; want %v, LeftoverResolved", got, res, base)
 	}
-	if _, ok := LeftoverBase(NewObjectName("app", "idx")); ok {
-		t.Fatal("a plain name is not a leftover")
+
+	if _, res := ResolveLeftoverBase(NewObjectName("app", "idx"), []ObjectName{base}); res != LeftoverNotAName {
+		t.Fatalf("a plain name is not a leftover, got %v", res)
 	}
 }

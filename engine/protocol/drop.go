@@ -211,69 +211,13 @@ func DecideLeftoverDrop(in LeftoverDropInput) DropVerdict {
 	}
 }
 
-// LeftoverBase returns the base index a leftover was a rebuild of: the same
-// schema, the name with the _ccnew/_ccold suffix trimmed. ok is false when the
-// name is not a leftover.
+// The base index a leftover was a rebuild of is NOT recoverable from the
+// leftover's name alone: PostgreSQL truncates the base to make room for the
+// _ccnew/_ccold suffix, so the trimmed stem can be a prefix of the real base --
+// or of a different index entirely, which is how an ownership marker could be
+// read off the wrong object (issue #2, closed).
 //
-// # KNOWN DEFECT (measured, tracked as issue #2)
-//
-// https://github.com/atulsinha87/partitionctl/issues/2 carries the measurements
-// below and both candidate fixes.
-//
-// The trimmed name is only the real base when PostgreSQL did not have to
-// truncate. It builds a leftover name with ChooseRelationName/makeObjectName,
-// which truncates the BASE so that base + "_ccnew" fits in NAMEDATALEN-1 = 63
-// bytes. Measured on PG 17.10 by forcing real REINDEX INDEX CONCURRENTLY
-// cancellations:
-//
-//	base 57 B -> leftover <base>_ccnew   (63 B)  trim recovers the base
-//	base 58 B -> leftover <56 B>_ccnew1  (63 B)  trim recovers 56 B, WRONG
-//	base 63 B -> leftover <57 B>_ccnew   (63 B)  trim recovers 57 B, WRONG
-//
-// [ChildIndexName] emits names of exactly 63 bytes whenever parentIndex + "_" +
-// partition exceeds 63, so this tool's own generator produces the exposed case.
-// Three consequences, in increasing severity:
-//
-//  1. authorizeLeftover halts the whole plan reporting that a base index "does
-//     not exist" under a name the tool truncated itself. The reindex operation
-//     is then permanently non-convergent for that tree: nothing in the tool
-//     clears the leftover (resume's cleanup and drop-index's findOrphans both
-//     iterate generated child names only), while verify --end-state's
-//     CheckNoLeftoverIndexes does see it and fails. Only a hand-run DROP INDEX
-//     CONCURRENTLY breaks the loop.
-//  2. A truncated base makes `base != child.Name` in the reindex planner always
-//     true, so a leaf whose rebuild DID succeed is rebuilt again -- hours on a
-//     large leaf.
-//  3. The truncated name can collide with a DIFFERENT real index in the same
-//     schema. [DecideLeftoverDrop] would then read that unrelated index's
-//     marker and, if it carries one, return DropAuthorized: an ownership proof
-//     taken from the wrong object, which is the forgery INV-7/AC-19 exist to
-//     prevent.
-//
-// # Why it is not fixed here
-//
-// The resolution has to be "the trimmed stem is a prefix of exactly one index
-// on the same relation", which needs the candidate set. The planner has it
-// (operations/reindex-index/planner.go holds every index on the leaf), but the
-// executor re-derives the base at dispatch through
-// [executor.CatalogEvaluator.Marker], which takes one name and cannot list. So
-// a planner-only fix moves the halt from plan time to dispatch time without
-// restoring convergence, and leaves consequence 3 -- the dangerous one -- fully
-// open on the executor path.
-//
-// Closing it properly requires one of two owner decisions:
-//
-//   - add an index-listing method to executor.CatalogEvaluator (an internal
-//     port: two implementations, one new catalog query), or
-//   - carry the resolved base on protocol.Authorization so the executor does
-//     not have to re-derive it (additive, but it is a plan-schema change and
-//     plan artifacts are committed and reviewed).
-//
-// Neither is an integration repair, so neither was taken unilaterally.
-func LeftoverBase(leftover ObjectName) (ObjectName, bool) {
-	kind, base := ClassifyLeftover(leftover.Name)
-	if kind == LeftoverNone {
-		return ObjectName{}, false
-	}
-	return NewObjectName(leftover.Schema, base), true
-}
+// Use [ResolveLeftoverBase] with every index on the same relation instead. It
+// runs the derivation in the only direction that is total: forwards, from a
+// candidate whose name is known, asking whether PostgreSQL would have produced
+// this leftover from it.

@@ -105,6 +105,20 @@ type CatalogEvaluator interface {
 	// failure. An error means the catalog could not be read, which is "cannot
 	// decide" and halts rather than denying.
 	Marker(ctx context.Context, object protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error)
+
+	// IndexesOn lists every index on relation, so a REINDEX CONCURRENTLY
+	// leftover can be resolved to the index it was a rebuild of.
+	//
+	// Marker alone cannot do this. It takes one name, and the name a leftover
+	// implies is not recoverable by trimming its suffix: PostgreSQL truncates
+	// the base to make room for _ccnew/_ccold, so the trimmed stem may be a
+	// prefix of the real base -- or of a different index entirely. Resolving it
+	// needs the candidate set, which is why this method exists (issue #2).
+	//
+	// A relation that does not exist, or that carries no indexes, is an empty
+	// slice and a nil error: absence is an answer. An error means the catalog
+	// could not be read, which halts rather than denies.
+	IndexesOn(ctx context.Context, relation protocol.ObjectName) ([]protocol.ObjectName, error)
 }
 
 // ---------------------------------------------------------------------------

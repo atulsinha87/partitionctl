@@ -338,10 +338,19 @@ type fakeCatalog struct {
 	mu       sync.Mutex
 	comments map[string]string
 	markerFn func(protocol.ObjectName) (protocol.Marker, protocol.MarkerStatus, error)
+
+	// indexes is the candidate set IndexesOn returns, keyed by relation. A
+	// relation with no entry has no indexes, which is a normal answer.
+	indexes   map[string][]protocol.ObjectName
+	indexesFn func(protocol.ObjectName) ([]protocol.ObjectName, error)
 }
 
 func newFakeCatalog(rec *recorder) *fakeCatalog {
-	return &fakeCatalog{rec: rec, comments: map[string]string{}}
+	return &fakeCatalog{
+		rec:      rec,
+		comments: map[string]string{},
+		indexes:  map[string][]protocol.ObjectName{},
+	}
 }
 
 // Marker implements [CatalogEvaluator]. The fake stores raw comment text and
@@ -356,6 +365,25 @@ func (c *fakeCatalog) Marker(_ context.Context, object protocol.ObjectName) (pro
 	defer c.mu.Unlock()
 	m, status := protocol.ParseMarker(c.comments[object.String()])
 	return m, status, nil
+}
+
+// IndexesOn implements [CatalogEvaluator]. It is what lets a leftover be
+// resolved to its base without trimming the name (issue #2).
+func (c *fakeCatalog) IndexesOn(_ context.Context, relation protocol.ObjectName) ([]protocol.ObjectName, error) {
+	c.rec.add("indexes_on:%s", relation)
+	if c.indexesFn != nil {
+		return c.indexesFn(relation)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.indexes[relation.String()], nil
+}
+
+// setIndexes declares the indexes that exist on a relation.
+func (c *fakeCatalog) setIndexes(relation protocol.ObjectName, names ...protocol.ObjectName) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.indexes[relation.String()] = names
 }
 
 // setComment gives an object a comment, ours or otherwise.
