@@ -15,6 +15,7 @@ Partition-aware online schema evolution for PostgreSQL. It exists because `CREAT
 |---|---|
 | [docs/M4-HANDOFF.md](docs/M4-HANDOFF.md) | **Start here.** Where work stopped, what is verified vs merely written, settled decisions |
 | [docs/LAPTOP-TRANSFER.md](docs/LAPTOP-TRANSFER.md) | Moving the repo to another machine, and the prerequisites to re-establish |
+| [docs/NEW-MACHINE-PROMPT.md](docs/NEW-MACHINE-PROMPT.md) | The first prompt to paste after a move — what a fresh session cannot infer |
 | [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md) | The adopter-facing quickstart, attribute reference and troubleshooting |
 | [docs/M4-PLAN.md](docs/M4-PLAN.md) | The Liquibase plugin design, with every question answered by experiment |
 | [docs/experiments/](docs/experiments/) | **Measured facts. These override the TRD wherever they disagree.** |
