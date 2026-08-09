@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Build one index across every partition of a partitioned table, online.
+
+  Every line of the header matters. Both namespace declarations and BOTH schemaLocation
+  pairs: Liquibase strips the protocol from the second URL and resolves it as a classpath
+  resource, which the extension jar provides — nothing is fetched over the network.
+-->
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:ext="http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
+                            http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
+
+    <!--
+      runInTransaction="false"  REQUIRED. CREATE INDEX CONCURRENTLY cannot run inside a
+                                transaction block, and the same flag is what lets partial
+                                progress survive a failure so a re-run resumes.
+      runAlways="true"          recommended. A succeeded changeset never re-runs, so
+                                partitions added later would silently go unindexed. With
+                                runAlways the extension re-discovers on every deploy, and
+                                does nothing (in milliseconds) when there is nothing to do.
+      paceSeconds="1"           optional. Breathe between partitions on a busy cluster.
+    -->
+    <changeSet author="example" id="orders-created-idx" runInTransaction="false" runAlways="true">
+        <ext:createPartitionedTableIndex schemaName="public"
+                                         tableName="orders"
+                                         indexName="idx_orders_created"
+                                         paceSeconds="1">
+            <column name="created_at" descending="true"/>
+            <column name="customer_id"/>
+        </ext:createPartitionedTableIndex>
+    </changeSet>
+
+</databaseChangeLog>

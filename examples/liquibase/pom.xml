@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A complete, minimal consumer of the liquibase-partitionctl extension, resolved from
+  JitPack the way any adopter would. Nothing here is copied from the extension's own
+  build: if this project runs, the published artifact works.
+
+  Run it against a throwaway PostgreSQL with `make lb-adopter` from the repository root,
+  or against your own database:
+
+    mvn liquibase:update -Ddb.url=jdbc:postgresql://host:5432/db \
+                         -Ddb.username=me -Ddb.password=secret
+
+  The one thing people get wrong (we did too, in the first version of this example):
+
+    JitPack must be declared as a <pluginRepository>, NOT a <repository>. The extension
+    sits inside the liquibase-maven-plugin's own <dependencies>, which makes it a PLUGIN
+    dependency, and Maven resolves those from plugin repositories only. Declared under
+    <repositories>, Maven never contacts JitPack and fails with a misleading
+    "Could not find artifact ... in central".
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>partitionctl-liquibase-example</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <!-- Overridable so the same pom drives the local demo database and yours. -->
+    <db.url>jdbc:postgresql://localhost:5559/postgres</db.url>
+    <db.username>postgres</db.username>
+    <db.password>pw</db.password>
+  </properties>
+
+  <pluginRepositories>
+    <pluginRepository>
+      <id>jitpack.io</id>
+      <url>https://jitpack.io</url>
+    </pluginRepository>
+  </pluginRepositories>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.liquibase</groupId>
+        <artifactId>liquibase-maven-plugin</artifactId>
+        <version>4.33.0</version>
+        <configuration>
+          <changeLogFile>changelogs/changelog.xml</changeLogFile>
+          <url>${db.url}</url>
+          <username>${db.username}</username>
+          <password>${db.password}</password>
+          <driver>org.postgresql.Driver</driver>
+        </configuration>
+        <dependencies>
+          <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
+          </dependency>
+          <!-- The extension. Note the JitPack coordinate: the groupId is derived from
+               the GitHub owner and repository, and the version is the git tag. -->
+          <dependency>
+            <groupId>com.github.atulsinha87.partitionctl</groupId>
+            <artifactId>liquibase-partitionctl</artifactId>
+            <version>v0.1.2</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>

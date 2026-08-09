@@ -13,7 +13,7 @@ SHELL := /bin/bash
         demo demo-plan demo-render demo-dry-run demo-execute demo-verify \
         demo-status demo-clean tree \
         lb-build lb-db-up lb-db-down lb-fixture lb-inspect lb-preview \
-        lb-e2e lb-progress lb-clean
+        lb-e2e lb-progress lb-adopter lb-clean
 
 BIN        := build/partitionctl
 PKG        := ./cmd/partitionctl
@@ -241,6 +241,21 @@ lb-progress: ## Just the create stage, timestamped, to judge the progress output
 	  | perl -MTime::HiRes=time -ne 'BEGIN{$$|=1;$$s=time()} printf("%7.2f  %s", time()-$$s, $$_)' \
 	  | grep -E 'partitionctl|Running Changeset|BUILD'
 
+lb-adopter: lb-fixture ## Prove the PUBLISHED artifact: examples/liquibase resolved from JitPack, verified from pg_catalog
+	@echo "== examples/liquibase: mvn liquibase:update, extension resolved from JitPack =="
+	@cd examples/liquibase && MAVEN_OPTS=-Duser.timezone=UTC mvn -B liquibase:update
+	@echo
+	@echo "== verdict, read from pg_catalog rather than from the log above =="
+	@docker exec -i $(LB_PG_CONTAINER) psql -q -U $(PG_USER) -d $(PG_DB) -c " \
+	  WITH p AS (SELECT c.oid, i.indisvalid FROM pg_class c \
+	               JOIN pg_index i ON i.indexrelid = c.oid \
+	              WHERE c.relname = 'idx_orders_created' AND c.relkind = 'I') \
+	  SELECT (SELECT indisvalid FROM p) AS parent_valid, \
+	         (SELECT count(*) FROM pg_inherits WHERE inhparent = (SELECT oid FROM p)) AS attached, \
+	         (SELECT count(*) FROM pg_inherits ii JOIN pg_index ix ON ix.indexrelid = ii.inhrelid \
+	           WHERE ii.inhparent = (SELECT oid FROM p) AND ix.indisvalid) AS attached_and_valid, \
+	         (SELECT count(*) FROM orders) AS rows_intact;"
+
 lb-clean: lb-db-down ## Remove the plugin database and the harness build output
-	@rm -rf $(LB_E2E)/target $(LB_DIR)/target
-	@echo "removed $(LB_E2E)/target and $(LB_DIR)/target"
+	@rm -rf $(LB_E2E)/target $(LB_DIR)/target examples/liquibase/target
+	@echo "removed $(LB_E2E)/target, $(LB_DIR)/target and examples/liquibase/target"

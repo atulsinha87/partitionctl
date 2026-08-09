@@ -46,6 +46,11 @@ Note also the groupId JitPack serves it under — `com.github.atulsinha87.partit
 not the `io.github.atulsinha87` in this project's own `pom.xml`. JitPack republishes under a
 coordinate derived from the GitHub owner and repository.
 
+A complete, runnable consumer of the published coordinate — pom, changelog, and a Make target
+that verifies the result from `pg_catalog` — is at
+[examples/liquibase/](../examples/liquibase/). `make lb-adopter` from the repository root runs
+it against a throwaway 12-partition database.
+
 Building from source works too, and needs no repository entry:
 
 ```bash

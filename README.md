@@ -55,6 +55,10 @@ artifact is not in Central.
 </dependency>
 ```
 
+**[examples/liquibase/](examples/liquibase/)** is a complete, runnable consumer of exactly this
+coordinate — `make lb-adopter` runs it against a throwaway 12-partition database and verifies the
+result from `pg_catalog`.
+
 Building from source works too, and needs no repository entry:
 
 ```bash
