@@ -310,8 +310,7 @@ public final class ReindexStatementBuilder {
         String schema = Identifiers.literal(plan.getSchemaName());
         String table = Identifiers.literal(plan.getTableName());
         String index = Identifiers.literal(plan.getIndexName());
-        return ""
-            + "DO $partitionctl$\n"
+        return Identifiers.doBlock(""
             + "DECLARE\n"
             + "  rootkind \"char\"; pidx oid; pvalid boolean;\n"
             + "  nleaf int; ncov int; ninvalid int; nleft int; nsub int;\n"
@@ -409,7 +408,6 @@ public final class ReindexStatementBuilder {
             + "    RAISE NOTICE 'partitionctl: %.% VALID, % of % leaf partitions covered and valid',\n"
             + "      " + schema + ", " + index + ", ncov, nleaf;\n"
             + "  END IF;\n"
-            + "END\n"
-            + "$partitionctl$";
+            + "END\n");
     }
 }

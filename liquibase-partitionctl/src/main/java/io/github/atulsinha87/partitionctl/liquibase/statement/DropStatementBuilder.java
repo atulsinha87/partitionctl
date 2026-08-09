@@ -201,6 +201,30 @@ public final class DropStatementBuilder {
                 foreignChild = child.getIndexName() + ": \"" + oneLine(child.getComment()) + "\"";
             }
         }
+
+        // A foreign comment on ANY attached child refuses the whole drop, for exactly the reason
+        // stated above for the parent: a comment that is not ours is a positive signal to keep
+        // hands off. This check must precede the markedChildren test, because DROP INDEX on the
+        // parent destroys every attached child in one statement and there is no way to spare one
+        // -- PostgreSQL has no ALTER INDEX ... DETACH PARTITION.
+        //
+        // Before this guard, one marked sibling authorised destroying the whole tree. Measured:
+        // a hand-built index labelled 'DBA ticket OPS-4471 -- do not remove' was dropped with
+        // BUILD SUCCESS and no warning, because eleven siblings the plugin had built said the
+        // tree was ours. The count went 1 -> 0.
+        //
+        // An ABSENT comment stays acceptable: PostgreSQL names and creates child indexes itself
+        // when a partition is attached later, and those carry no comment. Only a present, foreign
+        // one refuses.
+        if (foreignChild != null) {
+            throw new PlanException("partitionctl: refusing to drop " + qualifiedIndex()
+                    + ". One of its attached child indexes carries a COMMENT written by something "
+                    + "other than this plugin -- " + foreignChild + ". Dropping the partitioned "
+                    + "index destroys every attached child with it in the same statement, and "
+                    + "PostgreSQL offers no way to detach one first, so that index would go too. "
+                    + blastRadius() + " Nothing was executed. Remove the comment if the index is "
+                    + "in fact ours to drop, or drop the tree by hand if you are sure.");
+        }
         if (markedChildren > 0) {
             return;
         }
@@ -229,7 +253,6 @@ public final class DropStatementBuilder {
                 + ", none of its " + children.size() + " attached child index(es) carries a "
                 + "partitionctl marker, and neither does any of the " + orphanLeaves.size()
                 + " unattached leftover(s)"
-                + (foreignChild == null ? "" : " (one child carries a foreign comment -- " + foreignChild + ")")
                 + ". createPartitionedTableIndex stamps every child index it builds with a COMMENT "
                 + "beginning \"" + OwnershipMarker.PREFIX + "\". " + blastRadius()
                 + " Nothing was executed. If this index was built by hand, or by the partitionctl "
@@ -436,8 +459,7 @@ public final class DropStatementBuilder {
         int children = target.attachedChildren().size();
         int leaves = target.getLeaves().size();
 
-        return ""
-            + "DO $partitionctl$\n"
+        return Identifiers.doBlock(""
             + "DECLARE\n"
             + "  attempt int := 0;\n"
             + "  backoff numeric := " + FIRST_BACKOFF_SECONDS + ";\n"
@@ -466,8 +488,7 @@ public final class DropStatementBuilder {
             + "      backoff := backoff * 2;\n"
             + "    END;\n"
             + "  END LOOP;\n"
-            + "END\n"
-            + "$partitionctl$";
+            + "END\n");
     }
 
     /**
@@ -482,8 +503,7 @@ public final class DropStatementBuilder {
         String index = Identifiers.literal(plan.getIndexName());
 
         StringBuilder sql = new StringBuilder();
-        sql.append("DO $partitionctl$\n")
-           .append("DECLARE\n")
+        sql.append("DECLARE\n")
            .append("  nparent int; nleft int := 0;\n")
            .append("BEGIN\n")
            .append("  SELECT count(*) INTO nparent FROM pg_class c\n")
@@ -520,9 +540,8 @@ public final class DropStatementBuilder {
         sql.append("  RAISE NOTICE 'partitionctl: %.% is gone; % leftover child index(es) removed "
                    + "with it', ").append(schema).append(", ").append(index).append(", ")
            .append(orphanLeaves.size()).append(";\n")
-           .append("END\n")
-           .append("$partitionctl$");
-        return sql.toString();
+           .append("END\n");
+        return Identifiers.doBlock(sql.toString());
     }
 
     // ------------------------------------------------------------------ pieces

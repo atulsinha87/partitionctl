@@ -98,7 +98,8 @@ public final class PartitionDiscovery {
       + "         WHERE n.nspname = ? AND c.relname = ?) AS root_relkind,"
       + "       (SELECT count(*) FROM tree WHERE relkind = 'p' AND depth > 0)::int"
       + "         AS intermediate_partitioned,"
-      + "       (SELECT owning_table FROM parent_idx) AS parent_owning_table"
+      + "       (SELECT owning_table FROM parent_idx) AS parent_owning_table,"
+      + "       NULL::text AS index_comment"
       + " UNION ALL "
       + "SELECT 'L'::text,"
       + "       l.leaf_schema,"
@@ -113,7 +114,10 @@ public final class PartitionDiscovery {
       + "       NULL::text,"
       + "       NULL::text,"
       + "       0,"
-      + "       NULL::text"
+      + "       NULL::text,"
+      // The child index's COMMENT. An index at the conventional name may have been built by a
+      // DBA rather than by us, and adopting it silently is what let a later drop destroy it.
+      + "       obj_description(ic.oid, 'pg_class')"
       + "  FROM leaf l"
       + "  LEFT JOIN pg_index ix ON ix.indrelid = l.oid"
       + "  LEFT JOIN pg_class ic ON ic.oid = ix.indexrelid"
@@ -203,7 +207,8 @@ public final class PartitionDiscovery {
                                     indexOnLeaf,
                                     rs.getBoolean("index_valid"),
                                     rs.getBoolean("attached_to_target"),
-                                    rs.getBoolean("attached_to_any")));
+                                    rs.getBoolean("attached_to_any"),
+                                    rs.getString("index_comment")));
                         }
                     }
                 }

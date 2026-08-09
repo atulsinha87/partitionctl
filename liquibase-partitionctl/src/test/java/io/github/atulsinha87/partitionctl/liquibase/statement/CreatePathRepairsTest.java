@@ -1,7 +1,9 @@
 package io.github.atulsinha87.partitionctl.liquibase.statement;
 
 import io.github.atulsinha87.partitionctl.liquibase.catalog.IndexNaming;
+import io.github.atulsinha87.partitionctl.liquibase.catalog.LeafIndex;
 import io.github.atulsinha87.partitionctl.liquibase.catalog.LeafPartition;
+import io.github.atulsinha87.partitionctl.liquibase.catalog.OwnershipMarker;
 import io.github.atulsinha87.partitionctl.liquibase.catalog.TreeState;
 
 import org.junit.jupiter.api.DisplayName;
@@ -58,6 +60,74 @@ class CreatePathRepairsTest {
             out.add(statement.getSql());
         }
         return out;
+    }
+
+    // --------------------------------------------------- adopting a pre-existing child index
+
+    @Test
+    @DisplayName("a pre-existing child index with a FOREIGN comment is refused, not absorbed")
+    void aForeignChildIndexIsNotAbsorbed() {
+        // <indexName>_<leafTableName> is also the name a human would pick -- it is the convention
+        // this plugin's own README documents -- so a DBA's index can land exactly here. Attaching
+        // it makes it part of our tree, and from then on the tree reads as wholly ours, so a
+        // later dropPartitionedTableIndex destroys it in the same statement with no way to spare
+        // it. Measured end to end by an adversarial review: the index went 1 -> 0 with
+        // BUILD SUCCESS and no warning.
+        TreeState state = healthyTree(2);
+        state.getLeaves().get(0).addIndex(new LeafIndex(
+                "idx_personaddress_person_p01", true, false, false,
+                "DBA ticket OPS-4471 -- do not remove, backs the month-end reconciliation report"));
+
+        PlanException e = assertThrows(PlanException.class,
+                () -> StatementBuilder.build(plan(), state));
+        assertTrue(e.getMessage().contains("OPS-4471"), e.getMessage());
+        assertTrue(e.getMessage().contains("Nothing was executed"), e.getMessage());
+    }
+
+    @Test
+    @DisplayName("an UNMARKED pre-existing child index is stamped before it is attached")
+    void anUnmarkedChildIndexIsStampedOnAdoption() {
+        // Without the stamp the tree is only partly attributed, and the drop's ownership guard
+        // then rests on whichever siblings we happened to build ourselves.
+        TreeState state = healthyTree(2);
+        state.getLeaves().get(0).addIndex(
+                new LeafIndex("idx_personaddress_person_p01", true, false, false, null));
+
+        List<String> sql = sqlOf(StatementBuilder.build(plan(), state));
+
+        int comment = -1;
+        int attach = -1;
+        for (int i = 0; i < sql.size(); i++) {
+            if (sql.get(i).startsWith("COMMENT ON INDEX \"public\".\"idx_personaddress_person_p01\"")) {
+                comment = i;
+            }
+            if (sql.get(i).contains("ATTACH PARTITION \"public\".\"idx_personaddress_person_p01\"")) {
+                attach = i;
+            }
+        }
+        assertTrue(comment >= 0, "the adopted index was never stamped: " + sql);
+        assertTrue(attach > comment,
+                "the stamp must land before the ATTACH, or a failure between them leaves the "
+                        + "index in our tree unattributed: " + sql);
+    }
+
+    @Test
+    @DisplayName("an index we already marked is attached without a second stamp")
+    void ourOwnInterruptedBuildIsJustAttached() {
+        TreeState state = healthyTree(2);
+        state.getLeaves().get(0).addIndex(new LeafIndex(
+                "idx_personaddress_person_p01", true, false, false,
+                OwnershipMarker.forChildIndex(INDEX, SCHEMA, TABLE, "changelog.xml::7::alice")));
+
+        List<String> sql = sqlOf(StatementBuilder.build(plan(), state));
+
+        int stamps = 0;
+        for (String s : sql) {
+            if (s.startsWith("COMMENT ON INDEX \"public\".\"idx_personaddress_person_p01\"")) {
+                stamps++;
+            }
+        }
+        assertEquals(0, stamps, "already ours; re-stamping is pointless work: " + sql);
     }
 
     // ------------------------------------------------------------------ paceSeconds

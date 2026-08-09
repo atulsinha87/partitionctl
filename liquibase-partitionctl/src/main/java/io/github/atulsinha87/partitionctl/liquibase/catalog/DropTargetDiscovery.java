@@ -45,7 +45,12 @@ public final class DropTargetDiscovery {
       + "    UNION ALL"
       + "    SELECT c2.oid, c2.relkind"
       + "      FROM tree t"
-      + "      JOIN pg_inherits i ON i.inhparent = t.oid"
+      // NOT i.inhdetachpending, matching PartitionDiscovery and GateInspection. A partition left
+      // half-detached by an interrupted ALTER TABLE ... DETACH PARTITION CONCURRENTLY is no
+      // longer part of the table for PostgreSQL's purposes, so counting it here would over-report
+      // the blast radius in the very message an operator reads before confirming an exclusive
+      // drop -- and would enumerate an index sitting on a table that has left the tree.
+      + "      JOIN pg_inherits i ON i.inhparent = t.oid AND NOT i.inhdetachpending"
       + "      JOIN pg_class c2 ON c2.oid = i.inhrelid"
       + "),"
         // Deliberately NOT filtered to relkind = 'I'. "no partitioned index of that name" and

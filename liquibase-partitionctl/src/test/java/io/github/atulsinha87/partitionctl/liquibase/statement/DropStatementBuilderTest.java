@@ -507,6 +507,49 @@ class DropStatementBuilderTest {
                 e.getMessage());
     }
 
+    @Test
+    @DisplayName("a foreign comment on ONE attached child refuses the drop, whatever the siblings say")
+    void aForeignChildRefusesEvenWhenSiblingsAreOurs() {
+        // The reported case: a security review built one index by hand, labelled it with a ticket
+        // number, then ran create (which absorbed it) and drop. Eleven marked siblings said the
+        // tree was ours, so the drop proceeded and the labelled index went from 1 to 0 with
+        // BUILD SUCCESS and no warning. DROP INDEX on the parent takes every attached child with
+        // it in one statement and PostgreSQL has no ALTER INDEX ... DETACH PARTITION, so there is
+        // no way to spare one -- the only safe answer is to refuse the whole drop.
+        DropTarget target = base(3);
+        target.setIndexRelkind("I");
+        target.setIndexValid(true);
+        target.setIndexComment(null);
+        attach(target.getLeaves().get(0),
+                IndexNaming.childIndexName("idx_a", target.getLeaves().get(0).getTableName()), MARKER);
+        attach(target.getLeaves().get(1),
+                IndexNaming.childIndexName("idx_a", target.getLeaves().get(1).getTableName()), MARKER);
+        attach(target.getLeaves().get(2),
+                IndexNaming.childIndexName("idx_a", target.getLeaves().get(2).getTableName()),
+                "DBA ticket OPS-4471 -- do not remove, backs the month-end reconciliation report");
+
+        PlanException e = assertThrows(PlanException.class,
+                () -> DropStatementBuilder.build(plan().setConfirmExclusiveLock(true), target));
+        assertTrue(e.getMessage().contains("OPS-4471"), e.getMessage());
+        assertTrue(e.getMessage().contains("written by something other than this plugin"),
+                e.getMessage());
+    }
+
+    @Test
+    @DisplayName("an ABSENT comment on a child is still fine: PostgreSQL names later children itself")
+    void anUnmarkedChildIsStillAcceptable() {
+        DropTarget target = base(3);
+        target.setIndexRelkind("I");
+        target.setIndexValid(true);
+        target.setIndexComment(null);
+        attach(target.getLeaves().get(0),
+                IndexNaming.childIndexName("idx_a", target.getLeaves().get(0).getTableName()), MARKER);
+        attach(target.getLeaves().get(1), "person_p02_address_idx", null);
+        attach(target.getLeaves().get(2), "person_p03_address_idx", null);
+
+        assertFalse(DropStatementBuilder.build(plan().setConfirmExclusiveLock(true), target).isEmpty());
+    }
+
     private static DropTarget tree(int leaves, boolean marked) {
         DropTarget target = base(leaves);
         target.setIndexRelkind("I");

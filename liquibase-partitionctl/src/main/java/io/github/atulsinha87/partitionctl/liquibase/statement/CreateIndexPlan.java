@@ -162,9 +162,13 @@ public final class CreateIndexPlan {
      * concatenation from untrusted input would carry that injection straight through, and
      * nothing here would catch it.
      *
-     * <p>It is only ever placed at the end of a {@code CREATE INDEX} statement, never inside a
-     * quoted literal and never inside a {@code --} comment label, so it cannot break out of a
-     * context into one it was not written for.
+     * <p>Its position at the end of the {@code CREATE INDEX} text buys nothing in particular: a
+     * {@code ;} in the predicate ends that statement and everything after it runs as a statement
+     * of its own, with the migration role's privileges. Measured on 17.10 through pgjdbc, on the
+     * parent {@code ON ONLY} statement, which is not {@code CONCURRENTLY} and so is not protected
+     * by the implicit-transaction refusal:
+     * {@code ... WHERE 1=1; DROP TABLE victim; SELECT 1} executed with no error and the table was
+     * gone. Treat the predicate as what it is — SQL the changelog author is running.
      */
     public String getWhere() {
         return where;

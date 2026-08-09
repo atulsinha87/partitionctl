@@ -155,9 +155,30 @@ public final class StatementBuilder {
             } else if (named == null) {
                 emitBuild(leaf, position, "building");
                 action = "build + attach";
+            } else if (OwnershipMarker.isForeign(named.getComment())) {
+                // A valid, unattached index at the conventional name whose COMMENT says somebody
+                // else made it. Attaching it would fold a stranger's index into our tree, and from
+                // then on the tree reads as wholly ours -- so a later dropPartitionedTableIndex
+                // destroys that index too, in the same statement, with no way to spare it.
+                //
+                // The collision is not exotic: <indexName>_<leafTableName> is also the name a
+                // human would pick, and it is the convention this plugin's own README documents.
+                throw new PlanException("partitionctl: cannot build " + parentQualified + " over "
+                        + leaf + ": an index named \"" + child + "\" already exists there and "
+                        + "carries a COMMENT written by something other than this plugin -- \""
+                        + oneLine(named.getComment()) + "\". Attaching it would make it part of "
+                        + "this tree, and dropping the tree later would destroy it with no way to "
+                        + "detach it first. Nothing was executed. Choose a different indexName, or "
+                        + "remove that comment if the index really is ours to absorb.");
+            } else if (named.getComment() == null || named.getComment().trim().isEmpty()) {
+                // Unmarked, so we cannot tell our own interrupted work from a hand-built index
+                // that merely shares the name. Stamping it before the ATTACH costs one
+                // COMMENT ON INDEX at ShareUpdateExclusiveLock (~1ms) and makes the tree the drop
+                // later reads fully attributed instead of partly.
+                emitOwnershipMarker(leaf, position);
+                action = "adopt existing child index (unmarked) + attach";
             } else {
-                // A valid, unattached index already carries the conventional name. Only the
-                // ATTACH is outstanding -- an interrupted run that died between the two.
+                // Marked as ours: an interrupted run that died between the build and the ATTACH.
                 action = "attach (child index already built)";
             }
 
@@ -323,6 +344,11 @@ public final class StatementBuilder {
      * {@code REINDEX INDEX CONCURRENTLY} — leaf-level and parent-level — even though the
      * relfilenode changes each time. So a tree stays recognisable across a reindex.
      */
+    /** Flattens a COMMENT for a single-line error message. */
+    private static String oneLine(String text) {
+        return text == null ? "" : text.replace("\r", " ").replace("\n", " ").trim();
+    }
+
     private void emitOwnershipMarker(LeafPartition leaf, String position) {
         String marker = OwnershipMarker.forChildIndex(plan.getIndexName(), plan.getSchemaName(),
                 plan.getTableName(), plan.getChangeSetId());
@@ -483,8 +509,7 @@ public final class StatementBuilder {
         String schema = Identifiers.literal(plan.getSchemaName());
         String table = Identifiers.literal(plan.getTableName());
         String index = Identifiers.literal(plan.getIndexName());
-        return ""
-            + "DO $partitionctl$\n"
+        return Identifiers.doBlock(""
             + "DECLARE\n"
             + "  pidx oid; pvalid boolean; nleaf int; ncov int; ninvalid int;\n"
             + "BEGIN\n"
@@ -530,7 +555,6 @@ public final class StatementBuilder {
             + "    RAISE NOTICE 'partitionctl: %.% VALID, % of % leaf partitions covered',\n"
             + "      " + schema + ", " + index + ", ncov, nleaf;\n"
             + "  END IF;\n"
-            + "END\n"
-            + "$partitionctl$";
+            + "END\n");
     }
 }
