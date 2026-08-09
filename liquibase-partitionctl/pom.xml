@@ -61,6 +61,23 @@
 
   <build>
     <plugins>
+      <!--
+        Pinned, and it must stay pinned. Without an explicit version Maven supplies its own
+        default, and that default varies by Maven version: 3.9.x gives compiler plugin 3.15.0,
+        but older Mavens - JitPack's build image among them - give 3.1, which predates
+        <release> support (added in 3.6). On 3.1 the maven.compiler.release property above is
+        silently ignored, source/target fall back to 1.5, and any JDK 12 or newer refuses:
+
+            Source option 5 is no longer supported. Use 7 or later.
+
+        That is exactly how the first v0.1.0 JitPack build failed while `mvn clean install`
+        passed here. Pinning the version is what makes the build reproducible off this machine.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
