@@ -14,7 +14,9 @@ Partition-aware online schema evolution for PostgreSQL. It exists because `CREAT
 | Document | When |
 |---|---|
 | [README.md](README.md) | What this is, which of the two products to pick |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | The verification bar, the non-negotiable constraints, and the release recipe |
 | [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md) | The adopter-facing quickstart, attribute reference and troubleshooting |
+| [examples/liquibase/](examples/liquibase/) | A runnable consumer of the published coordinate. `make lb-adopter` runs it |
 | `docs/experiments/poc-trees/m4-e2e/` | The live end-to-end harness. `make lb-e2e` runs it |
 
 ### Working documents, on the author's disk only — not in this repository

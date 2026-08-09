@@ -1,5 +1,8 @@
 # PartitionCTL
 
+[![CI](https://github.com/atulsinha87/partitionctl/actions/workflows/ci.yml/badge.svg)](https://github.com/atulsinha87/partitionctl/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 Partition-aware online schema evolution for PostgreSQL.
 
 `CREATE INDEX CONCURRENTLY` is **rejected outright** on a partitioned parent table:
@@ -135,6 +138,16 @@ make lb-e2e                        # the extension: create, gate, reindex, drop
 
 On macOS the Liquibase Maven plugin needs `MAVEN_OPTS=-Duser.timezone=UTC`, or the JDBC connect
 fails on a non-UTC system timezone. The harness scripts set it.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: **run it, and say what it printed.**
+A green test suite is treated as weak evidence here — this project has shipped a feature broken
+for every possible input while 579 tests passed, and two releases that built cleanly and failed
+on publish. Pull requests should keep "written" and "verified" visibly separate.
+
+CI runs the two offline gates above on every pull request. The Docker-backed gates are run
+locally; `CONTRIBUTING.md` says which one matches your change.
 
 ## Licence
 

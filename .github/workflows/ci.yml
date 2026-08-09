@@ -1,0 +1,101 @@
+# The offline gates, on every push and pull request.
+#
+# Scope, deliberately: this runs only what needs no database. The Docker-backed gates -
+# `make demo-all`, `make lb-e2e`, and `make lb-adopter` - are run locally by maintainers and
+# contributors, and CONTRIBUTING.md says which one to run for which change. `lb-adopter` in
+# particular resolves the published artifact from jitpack.io, so putting it here would make
+# every build depend on a third-party service being up.
+#
+# What this DOES buy: an incoming pull request becomes reviewable without checking out the
+# branch. That matters in a repository whose stated position is that a claim you have not run
+# is not evidence.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.22 is the floor declared in go.mod and in CONTRIBUTING.md, and it is pinned here so
+        # the constraint is enforced rather than asserted - pgx v5 needs 1.25, which is the whole
+        # reason this tree uses lib/pq. `stable` catches breakage from newer toolchains.
+        go: ['1.22', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "unformatted files:"; echo "$out"
+            echo "run: gofmt -w ."
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  java:
+    name: Java (JDK 17, extension)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 17, not newer: the jar targets Java 8 bytecode (--release 8) and recent javac
+      # versions have been dropping old --release targets. 17 is the newest verified to build it.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # ./mvnw, not mvn. The wrapper pins Maven 3.9.9. An older Maven supplies an older default
+      # maven-compiler-plugin that silently ignores <release> - that is exactly how the v0.1.0
+      # publish produced Java 5 bytecode targets and failed.
+      - name: mvnw clean install
+        run: ./mvnw -B clean install
+
+      - name: Assert the jar ships no Liquibase classes and targets Java 8
+        run: |
+          jar=$(ls liquibase-partitionctl/target/liquibase-partitionctl-*.jar | head -1)
+          echo "jar: $jar"
+
+          shipped=$(unzip -l "$jar" | awk '{print $4}' | grep -c '^liquibase/' || true)
+          if [ "$shipped" -ne 0 ]; then
+            echo "FAIL: jar contains $shipped entry/entries under liquibase/."
+            echo "liquibase-core must stay at provided scope; shipping it lets this jar"
+            echo "override the host's own Liquibase version."
+            exit 1
+          fi
+          echo "liquibase/ entries: 0"
+
+          cls=$(unzip -l "$jar" | awk '/\.class$/{print $4; exit}')
+          # NR==1 matters: od emits a trailing line, and without it awk yields "52\n0".
+          major=$(unzip -p "$jar" "$cls" | od -An -tu1 -j6 -N2 | awk 'NR==1{print $1*256+$2}')
+          if [ "$major" -ne 52 ]; then
+            echo "FAIL: bytecode major version is $major, expected 52 (Java 8)."
+            exit 1
+          fi
+          echo "bytecode major: 52 (Java 8)"
