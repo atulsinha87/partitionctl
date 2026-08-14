@@ -6,7 +6,7 @@
 
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.2</version>
+  <version>0.1.3</version>
   <packaging>jar</packaging>
 
   <name>liquibase-partitionctl</name>
@@ -19,8 +19,17 @@
     <connection>scm:git:https://github.com/atulsinha87/partitionctl.git</connection>
     <developerConnection>scm:git:https://github.com/atulsinha87/partitionctl.git</developerConnection>
     <url>https://github.com/atulsinha87/partitionctl</url>
-    <tag>v0.1.2</tag>
+    <tag>v0.1.3</tag>
   </scm>
+
+  <!-- Required by Maven Central. No email: the GitHub profile is the contact point. -->
+  <developers>
+    <developer>
+      <id>atulsinha87</id>
+      <name>Atul Sinha</name>
+      <url>https://github.com/atulsinha87</url>
+    </developer>
+  </developers>
 
   <licenses>
     <license>
@@ -125,4 +134,63 @@
       </plugin>
     </plugins>
   </build>
+
+  <!--
+    Publication to Maven Central, kept in a profile so that nothing here runs during an ordinary
+    build. Signing needs a GPG key and a passphrase, and uploading needs a Central token; a
+    contributor cloning this repository has neither, and `./mvnw clean install` must keep working
+    for them without either. CI never activates this profile.
+
+    Deploy with:  ./mvnw -Prelease deploy
+
+    Prerequisites, all of them the project owner's and none of them in this repository:
+      1. A Central Portal account with the io.github.atulsinha87 namespace verified.
+      2. A GPG key whose public half is published to a keyserver, so Central can check it.
+      3. ~/.m2/settings.xml holding a <server> with id "central" and the Portal token, plus
+         gpg.passphrase (or a gpg-agent that supplies it).
+
+    Central is IMMUTABLE: a released version can never be deleted, replaced or overwritten, only
+    superseded by a higher one. Do not deploy a version that has not been exercised.
+  -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <!--
+              0.11.0, not 0.7.0. Central's API returns a "warnings" field that 0.7.0's response
+              model does not declare, so Jackson throws UnrecognizedPropertyException and the build
+              fails AFTER a successful upload and validation - the artifact is fine, the client
+              cannot read the reply. Keep this current with the API.
+            -->
+            <version>0.11.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!--
+                false: the upload is staged and waits for a human to release it in the Portal.
+                Given that a released version is permanent, the last step stays manual.
+              -->
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
