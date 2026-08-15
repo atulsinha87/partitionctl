@@ -174,6 +174,23 @@ partitions created *after* it ran would silently go unindexed. With `runAlways` 
 re-discovers on every deploy and covers new partitions automatically — and does nothing, in about
 15 ms, when there is nothing to do.
 
+**`runAlways` and `update-count` do not mix, and the failure is silent.** `liquibase update-count N`
+applies the first N *pending* changesets in changelog order, and a `runAlways` changeset is pending
+on every single run. So it consumes the budget every time, and everything after it is never reached
+— not "later", never. Measured on Liquibase 4.30.0 with two `runAlways` changesets and
+`update-count --count=1`:
+
+```
+run 1:  Running Changeset: ...::first::t     Run: 1   Filtered out: 1
+run 2:  Running Changeset: ...::first::t     Run: 1   Filtered out: 1
+run 3:  Running Changeset: ...::first::t     Run: 1   Filtered out: 1
+```
+
+The second index was never created, and nothing failed: three green deploys, one index missing.
+The same changelog under plain `update` ran both changesets on every run. **Use `update`.** If a
+pipeline needs `update-count`, the count has to exceed the number of `runAlways` changesets ahead
+of the one you want applied, which breaks again the moment somebody adds another one.
+
 One consequence to plan for: `runAlways` means a changeset pointed at a table that is later
 **dropped** fails on every deploy forever. Pair it with a precondition so a retired table
 degrades to a skip instead of a permanent red build:
@@ -376,6 +393,7 @@ pipeline {
 | **Credentials** | `withCredentials`, passed as `-D` properties. Never in the pom |
 | **Timeout** | Generous. `CREATE INDEX CONCURRENTLY` across many partitions runs for hours |
 | **Changeset flags** | `runInTransaction="false"` is mandatory; `runAlways="true"` for create, never for reindex |
+| **Command** | `update`, **not** `update-count` — see the starvation note above; `update-count` silently skips every changeset after the first `runAlways` one |
 
 Since it is on Maven Central, there is no repository to declare and nothing for a corporate proxy
 to whitelist beyond Central itself, which every Java shop already allows.
