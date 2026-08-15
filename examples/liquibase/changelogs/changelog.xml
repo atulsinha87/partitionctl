@@ -18,14 +18,13 @@
     <!--
       runInTransaction="false"  REQUIRED. CREATE INDEX CONCURRENTLY cannot run inside a
                                 transaction block, and the same flag is what lets partial
-                                progress survive a failure so a re-run resumes.
-      runAlways="true"          recommended. A succeeded changeset never re-runs, so
+                                progress survive a failure so a re-run resumes.          recommended. A succeeded changeset never re-runs, so
                                 partitions added later would silently go unindexed. With
                                 runAlways the extension re-discovers on every deploy, and
                                 does nothing (in milliseconds) when there is nothing to do.
       paceSeconds="1"           optional. Breathe between partitions on a busy cluster.
     -->
-    <changeSet author="example" id="orders-created-idx" runInTransaction="false" runAlways="true">
+    <changeSet author="example" id="orders-created-idx" runInTransaction="false">
         <ext:createPartitionedTableIndex schemaName="public"
                                          tableName="orders"
                                          indexName="idx_orders_created"

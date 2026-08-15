@@ -257,19 +257,35 @@ class StatementBuilderTest {
     }
 
     @Test
-    @DisplayName("lock_timeout: 15min for the concurrent build, 30s for the attach, restored at the end")
+    @DisplayName("lock_timeout: the build and the attach get their OWN values, restored at the end")
     void lockTimeoutsDifferPerStatement() {
+        // Distinct, deliberately unequal values. Both defaults are 5s since 0.1.4, so asserting
+        // the defaults here would pass even if the builder applied one value to both statements --
+        // which is exactly the bug this test exists to catch.
+        List<PlannedStatement> statements = StatementBuilder.build(
+                plan().setLockTimeout("90s").setAttachLockTimeout("3s"),
+                state(true, false, new LeafPartition(SCHEMA, "person_p01")));
+
+        int build = indexOf(statements, "CREATE INDEX CONCURRENTLY");
+        int attach = indexOf(statements, "ATTACH PARTITION");
+        assertEquals("SET lock_timeout = '90s'", statements.get(build - 1).getSql());
+        assertEquals("SET lock_timeout = '3s'", statements.get(attach - 1).getSql());
+
+        // restored just before the gate, so a failing gate still leaves a clean session
+        assertEquals("SET lock_timeout = '0'", statements.get(statements.size() - 2).getSql(),
+                sqlOf(statements));
+    }
+
+    @Test
+    @DisplayName("the defaults are 5s for both, and they reach the emitted SQL")
+    void defaultLockTimeoutsAreFiveSeconds() {
         List<PlannedStatement> statements = StatementBuilder.build(plan(),
                 state(true, false, new LeafPartition(SCHEMA, "person_p01")));
 
         int build = indexOf(statements, "CREATE INDEX CONCURRENTLY");
         int attach = indexOf(statements, "ATTACH PARTITION");
-        assertEquals("SET lock_timeout = '15min'", statements.get(build - 1).getSql());
-        assertEquals("SET lock_timeout = '30s'", statements.get(attach - 1).getSql());
-
-        // restored just before the gate, so a failing gate still leaves a clean session
-        assertEquals("SET lock_timeout = '0'", statements.get(statements.size() - 2).getSql(),
-                sqlOf(statements));
+        assertEquals("SET lock_timeout = '5s'", statements.get(build - 1).getSql());
+        assertEquals("SET lock_timeout = '5s'", statements.get(attach - 1).getSql());
     }
 
     @Test

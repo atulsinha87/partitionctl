@@ -18,7 +18,7 @@ public final class ReindexIndexPlan {
      * in place and the {@code pg_inherits} attachment survives, measured on 14.23 and 17.10. So
      * nothing this operation emits ever asks for an {@code AccessExclusiveLock}.
      */
-    private String lockTimeout = "15min";
+    private String lockTimeout = "5s";
 
     /** {@code SELECT pg_sleep(n)} after each leaf that was actually rebuilt. Null or 0 disables it. */
     private Integer paceSeconds;

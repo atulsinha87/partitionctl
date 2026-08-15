@@ -19,7 +19,7 @@ resumes correctly when a run is interrupted.
 <dependency>
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.3</version>
+  <version>0.1.4</version>
 </dependency>
 ```
 
@@ -72,7 +72,7 @@ is the single most common way to get a "no declaration can be found" error.
     <dependency>
       <groupId>io.github.atulsinha87</groupId>
       <artifactId>liquibase-partitionctl</artifactId>
-      <version>0.1.3</version>
+      <version>0.1.4</version>
     </dependency>
   </dependencies>
 </plugin>
@@ -84,7 +84,7 @@ jar contains **zero** Liquibase classes and no transitive dependencies at all.
 ### 2. Copy this changelog
 
 Every line of the header matters. Both namespace declarations, **both** `xsi:schemaLocation`
-pairs, `runInTransaction="false"` and `runAlways="true"`:
+pairs, and `runInTransaction="false"`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -97,7 +97,7 @@ pairs, `runInTransaction="false"` and `runAlways="true"`:
                         http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl
                         http://www.liquibase.org/xml/ns/dbchangelog-ext/partitionctl.xsd">
 
-  <changeSet author="you" id="1" runInTransaction="false" runAlways="true">
+  <changeSet author="you" id="1" runInTransaction="false">
     <ext:createPartitionedTableIndex indexName="idx_orders_created"
                                      schemaName="public"
                                      tableName="orders">
@@ -145,8 +145,8 @@ SELECT count(*) FILTER (WHERE ix.indisvalid) AS valid_children,
  WHERE ii.inhparent = 'public.idx_orders_created'::regclass;
 ```
 
-**A second run is a no-op.** It emits exactly one statement, the verification block, and no DDL.
-That is what makes `runAlways="true"` safe.
+**A second run is a no-op.** If you do add `runAlways="true"`, the re-run emits exactly one
+statement — the verification block — and no DDL. That is what makes the flag safe when you want it.
 
 ### What failure looks like
 
@@ -169,10 +169,27 @@ outstanding. There is no state file to clean up and no `--force` to remember.
 properties: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block at all, and partial
 progress has to survive a failure for the resume-by-re-running design to work.
 
-**`runAlways="true"` is strongly recommended.** A changeset that succeeded is never re-run, so
-partitions created *after* it ran would silently go unindexed. With `runAlways` the extension
-re-discovers on every deploy and covers new partitions automatically — and does nothing, in about
-15 ms, when there is nothing to do.
+**`runAlways="true"` is optional, and earlier versions of this document oversold it.** It claimed
+that without `runAlways`, partitions created after the changeset ran would silently go unindexed.
+**That is wrong.** Once the partitioned parent index exists, PostgreSQL propagates it to new
+partitions itself, and has since v11. Measured on 17.10:
+
+| How the partition arrives | Child index |
+|---|---|
+| `CREATE TABLE … PARTITION OF parent` | created and attached automatically, valid |
+| `ALTER TABLE parent ATTACH PARTITION t` | PostgreSQL builds it during the ATTACH, valid |
+
+In both cases the parent's attached count rose with no Liquibase run at all. So routine partition
+rollover needs nothing from this extension.
+
+What `runAlways` actually buys is narrower: it re-checks coverage on every deploy, so an index a
+human dropped by hand gets rebuilt. It is **not** needed for resume either — a failed changeset is
+never written to `DATABASECHANGELOG`, so the next run retries it regardless.
+
+Weigh that against the costs: a no-op run still costs a round trip per changeset, it is
+incompatible with `update-count` (below), and it keeps rewriting the `DATABASECHANGELOG` row. If
+you want drift detection without the re-run, use `<ext:partitionctlIndexGate>` in its own
+changeset — it verifies coverage and fails loudly, and it issues no DDL.
 
 **`runAlways` and `update-count` do not mix, and the failure is silent.** `liquibase update-count N`
 applies the first N *pending* changesets in changelog order, and a `runAlways` changeset is pending
@@ -219,12 +236,12 @@ Builds an index over every leaf partition. Requires `runInTransaction="false"`.
 |---|---|---|---|
 | `schemaName` | yes | — | Schema of the partitioned table. |
 | `tableName` | yes | — | The partitioned table (`relkind = 'p'`). |
-| `indexName` | yes | — | Name of the partitioned parent index. Child names are derived from it and clipped to 63 bytes; a derivation that would collide fails loudly before anything runs. |
+| `indexName` | yes | — | Name of the partitioned parent index. Child names are derived from it per leaf. If the derived name would exceed PostgreSQL's 63-byte limit it is clipped and given a short deterministic tag, so long table names and date-range partitions do not collide — see [Child index names](#child-index-names). |
 | `unique` | no | `false` | `CREATE UNIQUE INDEX`. PostgreSQL requires every partitioning column to be included and names the missing one if not. |
 | `using` | no | `btree` | Access method: `btree`, `gin`, `gist`, `brin`, `hash`, `spgist`. Emitted as a quoted identifier, so it is **case-sensitive** — write it lowercase. |
 | `where` | no | none | Partial-index predicate, without the `WHERE` keyword. **Raw SQL** — see the security note below. |
-| `lockTimeout` | no | `15min` | `lock_timeout` for each `CREATE INDEX CONCURRENTLY`. That statement takes only `ShareUpdateExclusiveLock`, so waiting is cheap and the value is generous. |
-| `attachLockTimeout` | no | `30s` | `lock_timeout` for `ALTER INDEX ... ATTACH PARTITION`, which takes `AccessExclusiveLock` on the child index. Short, because a queued exclusive request blocks everything behind it. |
+| `lockTimeout` | no | `5s` | `lock_timeout` for each `CREATE INDEX CONCURRENTLY`. That statement takes only `ShareUpdateExclusiveLock`, so waiting harms nothing in the database — but it stalls the deploy, and a failed changeset is not recorded, so a retry costs less than a long wait. Raise it if conflicting DDL or autovacuum is common on these tables. |
+| `attachLockTimeout` | no | `5s` | `lock_timeout` for `ALTER INDEX ... ATTACH PARTITION`, which takes `AccessExclusiveLock` on the child index. **Do not raise this casually.** A queued exclusive request blocks everything behind it — measured on 17.10, a plain `SELECT` conflicting with nothing waited 8 seconds behind one. |
 | `paceSeconds` | no | none | Seconds to sleep between partitions, to spread I/O on a large table. |
 
 Child elements: one or more `<column name="..." descending="true|false"/>`. Both `<column/>` and
@@ -254,7 +271,7 @@ partition at a time. Requires `runInTransaction="false"`.
 | `schemaName` | yes | — | Schema of the partitioned table. |
 | `tableName` | yes | — | The partitioned table. |
 | `indexName` | yes | — | The existing partitioned index to rebuild. |
-| `lockTimeout` | no | `15min` | `lock_timeout` for each rebuild and for dropping leftovers. |
+| `lockTimeout` | no | `5s` | `lock_timeout` for each rebuild and for dropping leftovers. |
 | `paceSeconds` | no | none | Seconds to sleep after each partition that was actually rebuilt. |
 
 There is no `attachLockTimeout`: the rebuild swaps the index in place and the `pg_inherits`
@@ -278,7 +295,7 @@ drop is a one-shot intent.
 | `tableName` | yes | — | The partitioned table. Checked against the index's real owner, so a wrong `tableName` is refused rather than dropping the right index by accident. |
 | `indexName` | yes | — | The partitioned index to drop. |
 | `confirmExclusiveLock` | see below | `false` | Acknowledges that dropping an attached tree takes `AccessExclusiveLock` on the table **and every leaf at once**. Required whenever an attached tree is present. |
-| `lockTimeout` | no | `15min` | `lock_timeout` for `DROP INDEX CONCURRENTLY` on unattached leftovers, which is fully online. |
+| `lockTimeout` | no | `5s` | `lock_timeout` for `DROP INDEX CONCURRENTLY` on unattached leftovers, which is fully online. |
 | `exclusiveLockTimeout` | no | `5s` | `lock_timeout` for **one lock acquisition** during the exclusive drop. |
 | `exclusiveRetries` | no | `5` | Attempts at the exclusive drop, with doubling backoff. A failed attempt releases every lock it took before backing off. |
 | `exclusiveTotalTimeout` | no | `5min` | Hard ceiling on the whole retry loop, as `statement_timeout`. |
@@ -354,6 +371,55 @@ A hand-written rollback block works end to end:
 `confirmExclusiveLock="true"` is not optional there — without it the rollback refuses.
 
 ---
+
+## Child index names
+
+Each leaf gets a child index named after the parent index and the leaf table. When that fits in
+PostgreSQL's 63-byte identifier limit it is used verbatim:
+
+```
+idx_orders_created  +  orders_2024_01   ->  idx_orders_created_orders_2024_01
+```
+
+When it does not fit, the readable part is clipped and a 12-character tag derived from the
+**untruncated** names is appended:
+
+```
+idx_order_product_v2_order_id_shipment_id  +  order_product_v2_2026_09_01
+   ->  idx_order_product_v2_order_id_shipment_id_order_pr_nnm4nzhgjwqg
+```
+
+This matters because plain truncation collapses date-range partitions onto one name — a
+`v2`-style table name plus a descriptive index name overflows immediately, and every leaf clips to
+the same 63 bytes. **Before 0.1.4 that was a hard refusal**, reported as `IndexNamingException`
+with nothing executed; the only fix was a shorter `indexName`. Now the names simply stay distinct.
+
+Two properties worth knowing:
+
+- **Stable.** The name is a pure function of the index name and the leaf table name, so re-running
+  produces the same names and a completed run is a no-op. It does not depend on how many
+  partitions exist.
+- **Upgrade-safe.** Coverage is decided from `pg_inherits`, never from the name, so children built
+  by an older version under plain-truncated names are still recognised as covering their leaf.
+  Verified by building with 0.1.3 and re-running with 0.1.4: same children, nothing rebuilt.
+
+You do not need to name anything defensively. A long `indexName` costs readability in the child
+names, nothing more.
+
+## Which edits are safe on a changeset that already ran
+
+Liquibase records an MD5SUM per changeset and validates it on every later run. The checksum covers
+the changeset's **content**, not how it is executed — verified against a recorded row:
+
+| Edit | Checksum |
+|---|---|
+| add or remove `runAlways`, `runInTransaction`, `dbms`, contexts, labels | **unchanged** — safe |
+| change `indexName`, `schemaName`, `tableName`, any `<column>` | **changes** — validation fails |
+| change `lockTimeout`, `attachLockTimeout`, `paceSeconds`, `unique`, `using`, `where` | **changes** — validation fails |
+
+So the timeouts are worth getting right *before* a changeset first runs. Afterwards, tuning them
+means either a new changeset, a `<validCheckSum>` entry, or `clearCheckSums` — and `clearCheckSums`
+re-baselines the whole changelog, so it is the blunt option, not the default one.
 
 ## Running it from CI (Jenkins, and anything like it)
 

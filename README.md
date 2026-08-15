@@ -43,7 +43,7 @@ liquibase-maven-plugin's own `<dependencies>`:
 <dependency>
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.3</version>
+  <version>0.1.4</version>
 </dependency>
 ```
 
@@ -113,7 +113,7 @@ explicit confirmation flag, and say what the lock will cost before they take it.
 
 ## Status
 
-`v0.1.3`, published to Maven Central. Both products have been exercised against a live PostgreSQL 17.10
+`v0.1.4`, published to Maven Central. Both products have been exercised against a live PostgreSQL 17.10
 with 12 partitions and 1.2M rows, through the whole create → gate → reindex → drop cycle, with
 every verdict read from `pg_catalog` rather than from either tool's own log — including
 `SIGKILL` mid-flight and a `lock_timeout` abort, both of which resumed and finished.

@@ -28,8 +28,9 @@ Expected output, one line per partition, while it runs:
 [INFO] BUILD SUCCESS
 ```
 
-Run it a second time: it emits no DDL and finishes in milliseconds. That idempotence is what
-makes `runAlways="true"` safe, and it is what covers partitions created after the first run.
+Run it a second time: it emits no DDL and finishes in milliseconds. That idempotence is what makes
+`runAlways="true"` safe if you choose to add it — but it is not needed for new partitions.
+PostgreSQL propagates a partitioned index to partitions created later on its own.
 
 ## Run this example against your own database
 
@@ -60,7 +61,7 @@ pom — the dependency, inside **the plugin's own `<dependencies>`**:
 <dependency>
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.3</version>
+  <version>0.1.4</version>
 </dependency>
 ```
 
@@ -72,7 +73,7 @@ configuration:
 |---|---|
 | Plugin's `<dependencies>` | the extension **and** a PostgreSQL JDBC driver |
 | Coordinate | `io.github.atulsinha87:liquibase-partitionctl` |
-| Version | `0.1.3` |
+| Version | `0.1.4` |
 
 ### `changelogs/changelog.xml` — what to change, what must stay
 
@@ -86,7 +87,7 @@ from the extension jar — nothing is fetched over the network, and a trimmed he
 | Attribute | Why |
 |---|---|
 | `runInTransaction="false"` | **Required** — the change refuses to run without it. CIC cannot run in a transaction block, and this is also what lets partial progress survive a failure so a re-run resumes |
-| `runAlways="true"` | Strongly recommended for `createPartitionedTableIndex` — without it, partitions added after the first run silently go unindexed. Do **not** use it with `reindexPartitionedTableIndex`, which is not idempotent |
+| `runAlways="true"` | **Optional, and not used in this example.** PostgreSQL indexes new partitions itself, so this is only drift detection against a hand-dropped index. It is also incompatible with `liquibase update-count`, which it starves. Never use it with `reindexPartitionedTableIndex`, which is not idempotent |
 
 **Change to match your table:**
 
@@ -95,7 +96,7 @@ from the extension jar — nothing is fetched over the network, and a trimmed he
 | `author` / `id` | `example` / `orders-created-idx` | your changeset identity — Liquibase keys history on it, so pick once and never change it |
 | `schemaName` | `public` | your schema |
 | `tableName` | `orders` | the **partitioned parent**, not a partition |
-| `indexName` | `idx_orders_created` | yours — the parent index. Child names are derived from it per partition and clipped to 63 bytes; a derivation that would collide fails loudly before anything runs |
+| `indexName` | `idx_orders_created` | yours — the parent index. Child names are derived from it per partition; if they would exceed 63 bytes they are clipped and tagged so they stay distinct, so a long table name is not a problem |
 | `<column>` elements | `created_at` desc, `customer_id` | your key — order matters, `descending` is per column |
 | `paceSeconds` | `1` | optional; delay between partitions on a busy cluster. Omit for none. It is **not** bounded by your `statement_timeout` — the extension lifts the timeout around the sleep and restores it. Budget for total wall-clock instead: `paceSeconds` × partitions, against any CI or deploy job timeout |
 

@@ -92,7 +92,7 @@ class ReindexPartitionedTableIndexChangeTest {
         ReindexPartitionedTableIndexChange change = new ReindexPartitionedTableIndexChange();
         // ShareUpdateExclusiveLock queues nothing harmful behind it, so waiting is nearly free
         // and the work being protected can be hours.
-        org.junit.jupiter.api.Assertions.assertEquals("15min", change.getLockTimeout());
+        org.junit.jupiter.api.Assertions.assertEquals("5s", change.getLockTimeout());
         org.junit.jupiter.api.Assertions.assertNull(change.getPaceSeconds());
     }
 

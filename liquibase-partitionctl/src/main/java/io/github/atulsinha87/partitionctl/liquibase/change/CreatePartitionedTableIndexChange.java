@@ -77,8 +77,8 @@ public class CreatePartitionedTableIndexChange extends AbstractChange
     private String schemaName;
     private String tableName;
     private String indexName;
-    private String lockTimeout = "15min";
-    private String attachLockTimeout = "30s";
+    private String lockTimeout = "5s";
+    private String attachLockTimeout = "5s";
     private Integer paceSeconds;
     private Boolean unique;
     private String using;

@@ -76,7 +76,7 @@ public class DropPartitionedTableIndexChange extends AbstractChange {
     private String tableName;
     private String indexName;
     private Boolean confirmExclusiveLock;
-    private String lockTimeout = "15min";
+    private String lockTimeout = "5s";
     private String exclusiveLockTimeout = "5s";
     private Integer exclusiveRetries = 5;
     private String exclusiveTotalTimeout = "5min";

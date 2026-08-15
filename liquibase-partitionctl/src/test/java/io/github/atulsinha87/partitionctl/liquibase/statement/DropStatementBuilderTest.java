@@ -245,7 +245,7 @@ class DropStatementBuilderTest {
     // ------------------------------------------------------------------ timeouts
 
     @Test
-    @DisplayName("lock_timeout: 15min for the concurrent drops, 5s for the exclusive one, restored after")
+    @DisplayName("lock_timeout: 5s for the concurrent drops, 5s for the exclusive one, restored after")
     void lockTimeoutsDifferByStatement() {
         DropTarget target = tree(2, true);
         target.setOriginalLockTimeout("250ms");
@@ -255,7 +255,7 @@ class DropStatementBuilderTest {
 
         List<String> sql = statementsOf(DropStatementBuilder.build(plan(), target));
 
-        assertEquals("SET lock_timeout = '15min'", sql.get(0));
+        assertEquals("SET lock_timeout = '5s'", sql.get(0));
         assertTrue(sql.get(1).startsWith("DROP INDEX CONCURRENTLY"), sql.toString());
         assertEquals("SET lock_timeout = '5s'", sql.get(2));
         // The exclusive block always bounds itself, whatever the adopter arrived with.

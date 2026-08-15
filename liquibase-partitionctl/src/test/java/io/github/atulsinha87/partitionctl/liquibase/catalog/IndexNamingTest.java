@@ -4,10 +4,13 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -45,11 +48,15 @@ class IndexNamingTest {
     }
 
     @Test
-    @DisplayName("64 bytes: one over the limit, clipped to 63")
+    @DisplayName("64 bytes: one over the limit, clipped and tagged to exactly 63")
     void sixtyFourBytes() {
         String name = IndexNaming.childIndexName("i", repeat('a', 62));
+
         assertEquals(63, IndexNaming.byteLength(name));
-        assertEquals("i_" + repeat('a', 61), name);
+        assertTrue(IndexNaming.looksTagged(name), name);
+        // Plain truncation would have produced this. It no longer does, because a second leaf
+        // could truncate to the same thing.
+        assertNotEquals("i_" + repeat('a', 61), name);
     }
 
     @Test
@@ -122,22 +129,62 @@ class IndexNamingTest {
     // ---------------------------------------------------------------- collisions
 
     @Test
-    @DisplayName("truncation collision fails loudly at plan time, naming both leaves")
-    void collisionFailsLoudly() {
+    @DisplayName("leaves that used to collide after truncation now get distinct names")
+    void truncationCollisionIsResolvedByTheTag() {
+        // Before 0.1.4 this threw IndexNamingException and nothing ran: both leaves clipped to the
+        // same 63 bytes. The tag is derived from the untruncated names, so they differ.
         String indexName = repeat('i', 40);
         List<LeafPartition> leaves = new ArrayList<LeafPartition>();
         leaves.add(new LeafPartition("public", repeat('p', 30) + "_alpha"));
         leaves.add(new LeafPartition("public", repeat('p', 30) + "_beta"));
 
-        IndexNamingException thrown = assertThrows(IndexNamingException.class,
-                () -> IndexNaming.assignChildIndexNames(indexName, leaves));
+        IndexNaming.assignChildIndexNames(indexName, leaves);
 
-        String message = thrown.getMessage();
-        assertTrue(message.contains("collide"), message);
-        assertTrue(message.contains("_alpha"), message);
-        assertTrue(message.contains("_beta"), message);
-        assertTrue(message.contains("Nothing was executed"), message);
-        assertTrue(message.contains("63"), message);
+        String alpha = leaves.get(0).getChildIndexName();
+        String beta = leaves.get(1).getChildIndexName();
+        assertNotEquals(alpha, beta, "the whole point of the tag");
+        assertEquals(63, IndexNaming.byteLength(alpha));
+        assertEquals(63, IndexNaming.byteLength(beta));
+        assertTrue(IndexNaming.looksTagged(alpha), alpha);
+        assertTrue(IndexNaming.looksTagged(beta), beta);
+    }
+
+    @Test
+    @DisplayName("the real-world case: a v2 table with date-range partitions")
+    void dateRangePartitionsOnALongTableName() {
+        // Reported from a live deployment on PostgreSQL 15.18. indexName 41 bytes, leaves up to
+        // 38, so every child name overflowed and all five collapsed to the same 63 bytes.
+        String indexName = "idx_order_product_v2_order_id_shipment_id";
+        List<LeafPartition> leaves = new ArrayList<LeafPartition>();
+        for (String leaf : new String[]{
+                "order_product_v2_2026_06_01_2026_09_01", "order_product_v2_2026_09_01",
+                "order_product_v2_2026_09_08", "order_product_v2_2026_09_15",
+                "order_product_v2_2026_09_22"}) {
+            leaves.add(new LeafPartition("public", leaf));
+        }
+
+        IndexNaming.assignChildIndexNames(indexName, leaves);
+
+        Set<String> names = new HashSet<String>();
+        for (LeafPartition leaf : leaves) {
+            String name = leaf.getChildIndexName();
+            assertTrue(IndexNaming.byteLength(name) <= 63, name);
+            assertTrue(names.add(name), "duplicate child index name: " + name);
+        }
+        assertEquals(5, names.size());
+    }
+
+    @Test
+    @DisplayName("a tag-shaped name that fits is tagged anyway, so it cannot be forged by truncation")
+    void nameThatLooksTaggedIsTaggedAnyway() {
+        // If this were returned untouched, a leaf could be named exactly what a longer leaf
+        // truncates to, and the two would generate the same child name.
+        String tagShaped = "orders_2024_abcdefghijkl";
+        assertTrue(IndexNaming.looksTagged("i_" + tagShaped));
+
+        String name = IndexNaming.childIndexName("i", tagShaped);
+        assertNotEquals("i_" + tagShaped, name);
+        assertTrue(IndexNaming.looksTagged(name), name);
     }
 
     @Test

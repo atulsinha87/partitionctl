@@ -13,17 +13,22 @@ public final class CreateIndexPlan {
 
     /**
      * {@code lock_timeout} for CREATE/DROP/REINDEX INDEX CONCURRENTLY. These take
-     * ShareUpdateExclusiveLock, which is compatible with reads and writes and queues nothing
-     * harmful behind it, so waiting is nearly free — and the work being protected can be hours.
+     * ShareUpdateExclusiveLock, so waiting harms nothing in the database — but it does stall the
+     * deploy, and the default is chosen for the deploy rather than for the database.
+     *
+     * <p>5s, not the 15min this used to be. Failing fast is cheap here: a failed changeset is
+     * never written to DATABASECHANGELOG, so the next run re-discovers and rebuilds only what is
+     * missing. Waiting a quarter of an hour to find out that autovacuum held a conflicting lock
+     * buys nothing that a retry does not.
      */
-    private String lockTimeout = "15min";
+    private String lockTimeout = "5s";
 
     /**
      * {@code lock_timeout} for ALTER INDEX ... ATTACH PARTITION. AccessExclusiveLock on the
      * child index. A queued exclusive request blocks everything behind it — a plain SELECT
      * conflicting with nothing was measured waiting 8 seconds behind one — so this is short.
      */
-    private String attachLockTimeout = "30s";
+    private String attachLockTimeout = "5s";
 
     /** {@code SELECT pg_sleep(n)} between leaves. Null or 0 disables it. */
     private Integer paceSeconds;

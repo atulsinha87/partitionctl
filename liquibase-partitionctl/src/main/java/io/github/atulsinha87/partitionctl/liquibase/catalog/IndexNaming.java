@@ -1,6 +1,8 @@
 package io.github.atulsinha87.partitionctl.liquibase.catalog;
 
 import java.io.UnsupportedEncodingException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,13 +27,37 @@ import java.util.Map;
  * the server. Character-aware truncation would be wrong: a 40-character name of 3-byte
  * characters is 120 bytes.
  *
- * <p>Truncation can make two different leaves produce the same name. That is a
- * {@link IndexNamingException} at plan time, before any DDL runs.
+ * <h2>Truncation alone is not enough</h2>
+ * Two leaves that share a long prefix truncate to the same 63 bytes. That is not exotic: a table
+ * named {@code order_product_v2} with date-range partitions overflows on any descriptive index
+ * name, and every leaf collapses to the same child name. Until 0.1.4 this threw and nothing ran.
+ *
+ * <p>So an overflowing name is disambiguated instead: the readable part is clipped to make room,
+ * and a short tag derived from the <em>untruncated</em> inputs is appended. Two leaves that differ
+ * anywhere differ in the tag, so the result is collision-free by construction rather than by luck,
+ * and it stays a pure function of (indexName, leafTableName) — which is what the resume design
+ * needs. {@link IndexNamingException} remains for the case the tag cannot fix.
+ *
+ * <p>A name that fits but already <em>looks</em> tagged is tagged too. Otherwise a leaf could be
+ * named exactly what some longer leaf truncates to, and the two would generate the same child
+ * name — the collision this is meant to remove, reachable by naming a partition.
+ *
+ * <p>Changing a generated name does not disturb an index already built: coverage is decided from
+ * {@code pg_inherits} ({@link LeafPartition#getCoveringIndex()}), never from the name. The name
+ * only identifies an <em>unattached</em> child left by an interrupted run.
  */
 public final class IndexNaming {
 
     /** {@code NAMEDATALEN - 1}. The number of bytes PostgreSQL keeps of an identifier. */
     public static final int NAMEDATALEN_BYTES = 63;
+
+    /** Characters of base32 in the disambiguating tag. 12 gives 60 bits. */
+    static final int TAG_LENGTH = 12;
+
+    /** Domain separator, so this hash cannot collide with any other use of SHA-256 here. */
+    private static final String TAG_DOMAIN = "partitionctl.childindex.v1";
+
+    private static final String BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
     private static final String UTF8 = "UTF-8";
 
@@ -49,7 +75,96 @@ public final class IndexNaming {
         if (leafTableName == null || leafTableName.isEmpty()) {
             throw new IllegalArgumentException("leafTableName must not be empty");
         }
-        return clipToNameDataLen(indexName + "_" + leafTableName);
+        String natural = indexName + "_" + leafTableName;
+        if (byteLength(natural) <= NAMEDATALEN_BYTES && !looksTagged(natural)) {
+            return natural;
+        }
+        String tag = childIndexTag(indexName, leafTableName);
+        int budget = NAMEDATALEN_BYTES - 1 - tag.length();
+        if (budget < 0) {
+            budget = 0;
+        }
+        return clipToBytes(natural, budget) + "_" + tag;
+    }
+
+    /**
+     * The disambiguating suffix: {@value #TAG_LENGTH} characters of lowercase RFC 4648 base32 over
+     * a domain-separated SHA-256 of the untruncated inputs.
+     *
+     * <p>Base32 rather than hex because its alphabet excludes {@code 0 1 8 9}, so an ordinary name
+     * ending in a date — {@code ..._20260601} — cannot be mistaken for a tag by
+     * {@link #looksTagged(String)}. Inputs are length-prefixed so that ("ab","c") and ("a","bc")
+     * cannot hash alike.
+     */
+    static String childIndexTag(String indexName, String leafTableName) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            writeLengthPrefixed(digest, TAG_DOMAIN);
+            writeLengthPrefixed(digest, indexName);
+            writeLengthPrefixed(digest, leafTableName);
+            return base32(digest.digest(), TAG_LENGTH);
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is required of every Java SE implementation.
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /**
+     * Whether a name already ends in something shaped like a tag: an underscore followed by
+     * exactly {@value #TAG_LENGTH} lowercase base32 characters.
+     */
+    static boolean looksTagged(String s) {
+        if (s.length() < TAG_LENGTH + 1) {
+            return false;
+        }
+        if (s.charAt(s.length() - TAG_LENGTH - 1) != '_') {
+            return false;
+        }
+        for (int i = s.length() - TAG_LENGTH; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if ((c < 'a' || c > 'z') && (c < '2' || c > '7')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void writeLengthPrefixed(MessageDigest digest, String value) {
+        byte[] bytes = utf8(value);
+        digest.update((byte) (bytes.length >>> 24));
+        digest.update((byte) (bytes.length >>> 16));
+        digest.update((byte) (bytes.length >>> 8));
+        digest.update((byte) bytes.length);
+        digest.update(bytes);
+    }
+
+    /** Lowercase RFC 4648 base32 of the first bytes of {@code data}, truncated to {@code chars}. */
+    private static String base32(byte[] data, int chars) {
+        StringBuilder out = new StringBuilder(chars);
+        int buffer = 0;
+        int bits = 0;
+        for (int i = 0; i < data.length && out.length() < chars; i++) {
+            buffer = (buffer << 8) | (data[i] & 0xFF);
+            bits += 8;
+            while (bits >= 5 && out.length() < chars) {
+                bits -= 5;
+                out.append(BASE32_ALPHABET.charAt((buffer >>> bits) & 0x1F));
+            }
+        }
+        return out.toString();
+    }
+
+    /** Like {@link #clipToNameDataLen(String)} but to an arbitrary byte budget. */
+    private static String clipToBytes(String identifier, int maxBytes) {
+        byte[] bytes = utf8(identifier);
+        if (bytes.length <= maxBytes) {
+            return identifier;
+        }
+        int end = maxBytes;
+        while (end > 0 && (bytes[end] & 0xC0) == 0x80) {
+            end--;
+        }
+        return decode(bytes, end);
     }
 
     /**

@@ -60,7 +60,7 @@ public class ReindexPartitionedTableIndexChange extends AbstractChange {
     private String schemaName;
     private String tableName;
     private String indexName;
-    private String lockTimeout = "15min";
+    private String lockTimeout = "5s";
     private Integer paceSeconds;
 
     private transient PartitionDiscovery discovery;

@@ -20,7 +20,7 @@ public final class DropIndexPlan {
      * ShareUpdateExclusiveLock: compatible with reads and writes, nothing queues harmfully
      * behind it, so waiting is nearly free. Default {@code 15min}.
      */
-    private String lockTimeout = "15min";
+    private String lockTimeout = "5s";
 
     /**
      * {@code lock_timeout} for {@code DROP INDEX} on the partitioned parent. AccessExclusiveLock

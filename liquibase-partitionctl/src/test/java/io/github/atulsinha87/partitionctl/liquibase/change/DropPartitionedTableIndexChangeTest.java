@@ -198,7 +198,7 @@ class DropPartitionedTableIndexChangeTest {
     void defaultsMatchTheDocumentation() {
         DropPartitionedTableIndexChange fresh = new DropPartitionedTableIndexChange();
 
-        assertEquals("15min", fresh.getLockTimeout());
+        assertEquals("5s", fresh.getLockTimeout());
         assertEquals("5s", fresh.getExclusiveLockTimeout());
         assertEquals("5min", fresh.getExclusiveTotalTimeout());
         assertEquals(Integer.valueOf(5), fresh.getExclusiveRetries());
