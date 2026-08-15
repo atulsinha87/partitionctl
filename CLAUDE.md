@@ -56,7 +56,7 @@ mvn clean install                                  # from the root, or from liqu
 
 Build with **JDK 17**. The jar targets Java 8 bytecode (`--release 8`) and recent javac releases
 have been dropping old `--release` targets — a JDK 26 default was rejected in favour of 17, which
-is the newest verified to build this tree. `jitpack.yml` pins the same.
+is the newest verified to build this tree.
 
 Live database work needs Docker:
 

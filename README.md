@@ -35,36 +35,27 @@ pipeline.
 **→ [liquibase-partitionctl/README.md](liquibase-partitionctl/README.md)** — quickstart, full
 attribute reference, troubleshooting and limitations.
 
-It must be `<pluginRepositories>`, **not** `<repositories>`. The extension goes inside the
-liquibase-maven-plugin's own `<dependencies>`, and plugin dependencies are resolved from plugin
-repositories only — with `<repositories>` Maven never contacts JitPack and fails saying the
-artifact is not in Central.
-
-```xml
-<pluginRepositories>
-  <pluginRepository>
-    <id>jitpack.io</id>
-    <url>https://jitpack.io</url>
-  </pluginRepository>
-</pluginRepositories>
-```
+It is on Maven Central, so there is no repository to declare — one dependency, in the
+liquibase-maven-plugin's own `<dependencies>`:
 
 ```xml
 <!-- inside the liquibase-maven-plugin's OWN <dependencies>, not your project's -->
 <dependency>
-  <groupId>com.github.atulsinha87.partitionctl</groupId>
+  <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>v0.1.2</version>
+  <version>0.1.3</version>
 </dependency>
 ```
+
+The plugin's `<dependencies>`, not your project's, is the one thing worth getting right: in your
+project's dependencies the extension is invisible to Liquibase and every `<ext:...>` tag fails
+with "no declaration can be found".
 
 **[examples/liquibase/](examples/liquibase/)** is a complete, runnable consumer of exactly this
 coordinate — `make lb-adopter` runs it against a throwaway 12-partition database and verifies the
 result from `pg_catalog`.
 
-Building from source works too, and needs no repository entry — but it installs a **different
-coordinate**: `io.github.atulsinha87:liquibase-partitionctl:0.1.2`, with no `v` on the version,
-because JitPack derives its groupId from GitHub while a local build uses the pom's own.
+Building from source works too, and installs the same coordinate:
 
 ```bash
 git clone https://github.com/atulsinha87/partitionctl.git
@@ -122,7 +113,7 @@ explicit confirmation flag, and say what the lock will cost before they take it.
 
 ## Status
 
-`v0.1.2`, the first working release. Both products have been exercised against a live PostgreSQL 17.10
+`v0.1.3`, published to Maven Central. Both products have been exercised against a live PostgreSQL 17.10
 with 12 partitions and 1.2M rows, through the whole create → gate → reindex → drop cycle, with
 every verdict read from `pg_catalog` rather than from either tool's own log — including
 `SIGKILL` mid-flight and a `lock_timeout` abort, both of which resumed and finished.

@@ -241,8 +241,8 @@ lb-progress: ## Just the create stage, timestamped, to judge the progress output
 	  | perl -MTime::HiRes=time -ne 'BEGIN{$$|=1;$$s=time()} printf("%7.2f  %s", time()-$$s, $$_)' \
 	  | grep -E 'partitionctl|Running Changeset|BUILD'
 
-lb-adopter: lb-fixture ## Prove the PUBLISHED artifact: examples/liquibase resolved from JitPack, verified from pg_catalog
-	@echo "== examples/liquibase: mvn liquibase:update, extension resolved from JitPack =="
+lb-adopter: lb-fixture ## Prove the PUBLISHED artifact: examples/liquibase resolved from Maven Central, verified from pg_catalog
+	@echo "== examples/liquibase: mvn liquibase:update, extension resolved from Maven Central =="
 	@cd examples/liquibase && MAVEN_OPTS=-Duser.timezone=UTC mvn -B liquibase:update
 	@echo
 	@echo "== verdict, read from pg_catalog rather than from the log above =="

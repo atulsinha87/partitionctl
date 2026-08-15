@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   A complete, minimal consumer of the liquibase-partitionctl extension, resolved from
-  JitPack the way any adopter would. Nothing here is copied from the extension's own
-  build: if this project runs, the published artifact works.
+  Maven Central the way any adopter would. Nothing here is copied from the extension's
+  own build: if this project runs, the published artifact works.
 
   Run it against a throwaway PostgreSQL with `make lb-adopter` from the repository root,
   or against your own database:
@@ -10,13 +10,9 @@
     mvn liquibase:update -Ddb.url=jdbc:postgresql://host:5432/db \
                          -Ddb.username=me -Ddb.password=secret
 
-  The one thing people get wrong (we did too, in the first version of this example):
-
-    JitPack must be declared as a <pluginRepository>, NOT a <repository>. The extension
-    sits inside the liquibase-maven-plugin's own <dependencies>, which makes it a PLUGIN
-    dependency, and Maven resolves those from plugin repositories only. Declared under
-    <repositories>, Maven never contacts JitPack and fails with a misleading
-    "Could not find artifact ... in central".
+  The one thing people get wrong: the extension belongs in the liquibase-maven-plugin's
+  OWN <dependencies>, not the project's. In the project's dependencies it is invisible to
+  Liquibase and every <ext:...> tag fails with "no declaration can be found".
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -35,12 +31,6 @@
     <db.password>pw</db.password>
   </properties>
 
-  <pluginRepositories>
-    <pluginRepository>
-      <id>jitpack.io</id>
-      <url>https://jitpack.io</url>
-    </pluginRepository>
-  </pluginRepositories>
 
   <build>
     <plugins>
@@ -61,12 +51,11 @@
             <artifactId>postgresql</artifactId>
             <version>42.7.4</version>
           </dependency>
-          <!-- The extension. Note the JitPack coordinate: the groupId is derived from
-               the GitHub owner and repository, and the version is the git tag. -->
+          <!-- The extension, straight from Maven Central. -->
           <dependency>
-            <groupId>com.github.atulsinha87.partitionctl</groupId>
+            <groupId>io.github.atulsinha87</groupId>
             <artifactId>liquibase-partitionctl</artifactId>
-            <version>v0.1.2</version>
+            <version>0.1.3</version>
           </dependency>
         </dependencies>
       </plugin>

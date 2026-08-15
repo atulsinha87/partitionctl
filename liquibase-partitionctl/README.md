@@ -13,62 +13,28 @@ resumes correctly when a run is interrupted.
 
 ## Where to get it
 
-**Not on Maven Central.** `io.github.atulsinha87` returns HTTP 404 there — the whole groupId, not
-just this artifact — and the `pom.xml` has none of the plumbing Central requires (no
-`maven-gpg-plugin`, no source or javadoc jar, no `distributionManagement`).
-
-It is published from GitHub through **JitPack**, which needs no credentials. Add the repository —
-as a **`<pluginRepository>`**:
-
-```xml
-<pluginRepositories>
-  <pluginRepository>
-    <id>jitpack.io</id>
-    <url>https://jitpack.io</url>
-  </pluginRepository>
-</pluginRepositories>
-```
-
-**`<repositories>` will not work, and the error does not say why.** This extension is declared
-inside the liquibase-maven-plugin's own `<dependencies>` (see below), which makes it a *plugin*
-dependency, and Maven resolves those from plugin repositories only. Declare JitPack under
-`<repositories>` and Maven never contacts it at all — it looks in Central, does not find the
-artifact, and reports:
-
-```
-Could not find artifact com.github.atulsinha87.partitionctl:liquibase-partitionctl:jar:v0.1.2
-  in central (https://repo.maven.apache.org/maven2)
-```
-
-which reads like the artifact does not exist rather than like a misplaced repository.
-
-Note also the groupId JitPack serves it under — `com.github.atulsinha87.partitionctl` — which is
-not the `io.github.atulsinha87` in this project's own `pom.xml`. JitPack republishes under a
-coordinate derived from the GitHub owner and repository.
-
-A complete, runnable consumer of the published coordinate — pom, changelog, and a Make target
-that verifies the result from `pg_catalog` — is at
-[examples/liquibase/](../examples/liquibase/). `make lb-adopter` from the repository root runs
-it against a throwaway 12-partition database.
-
-Building from source works too, and needs no repository entry — but it installs a **different
-coordinate**, because JitPack's groupId is derived from GitHub and a local build uses the pom's own:
-
-```bash
-git clone https://github.com/atulsinha87/partitionctl.git
-cd partitionctl && ./mvnw clean install
-```
-
-That installs `io.github.atulsinha87:liquibase-partitionctl:0.1.2` — note the different groupId and
-**no `v` prefix** on the version. Depend on it with the `<pluginRepositories>` block omitted
-entirely, since it comes from your local `~/.m2`:
+**Maven Central.** No repository to declare, no credentials — just the dependency:
 
 ```xml
 <dependency>
   <groupId>io.github.atulsinha87</groupId>
   <artifactId>liquibase-partitionctl</artifactId>
-  <version>0.1.2</version>
+  <version>0.1.3</version>
 </dependency>
+```
+
+It goes in the **liquibase-maven-plugin's own `<dependencies>`**, not your project's — see the
+Quickstart below. That is the single most common way to get a "no declaration can be found" error.
+
+A complete, runnable consumer of exactly this coordinate — pom, changelog, and a Make target that
+verifies the result from `pg_catalog` — is at [examples/liquibase/](../examples/liquibase/).
+`make lb-adopter` from the repository root runs it against a throwaway 12-partition database.
+
+Building from source installs the same coordinate:
+
+```bash
+git clone https://github.com/atulsinha87/partitionctl.git
+cd partitionctl && ./mvnw clean install
 ```
 
 Use `./mvnw`, not `mvn`: the wrapper pins Maven 3.9.9, and an older Maven silently ignores the
@@ -104,9 +70,9 @@ is the single most common way to get a "no declaration can be found" error.
       <version>42.7.4</version>
     </dependency>
     <dependency>
-      <groupId>com.github.atulsinha87.partitionctl</groupId>
+      <groupId>io.github.atulsinha87</groupId>
       <artifactId>liquibase-partitionctl</artifactId>
-      <version>v0.1.2</version>
+      <version>0.1.3</version>
     </dependency>
   </dependencies>
 </plugin>
@@ -509,7 +475,7 @@ Build and runtime are separate claims, and only the second one constrains you:
 | | |
 |---|---|
 | **Runtime** | **Java 8 or newer.** The jar is compiled to Java 8 bytecode (`--release 8`, major version 52), so it loads in any Liquibase host |
-| **Build** | **JDK 17**, Maven 3.9.9 via `./mvnw`. This is what CI and the JitPack release both run. Newer JDKs have been dropping old `--release` targets, and an older Maven silently ignores `<release>` altogether |
+| **Build** | **JDK 17**, Maven 3.9.9 via `./mvnw`. This is what CI and the release build both run. Newer JDKs have been dropping old `--release` targets, and an older Maven silently ignores `<release>` altogether |
 
 The jar contains no Liquibase classes and no transitive dependencies; CI asserts both on every
 build.

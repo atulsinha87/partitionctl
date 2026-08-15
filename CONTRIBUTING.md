@@ -57,7 +57,7 @@ Run the gate that matches what you touched:
 | packaging, versions, or the published coordinate | `make lb-adopter` |
 
 `make lb-adopter` is the only gate that exercises the **published** artifact. `make lb-e2e`
-resolves the extension from your local `~/.m2`, so it passes even when what is on JitPack is
+resolves the extension from your local `~/.m2`, so it passes even when what is on Central is
 broken — which is exactly how two releases got out. Use it before any release.
 
 Build the Java side with **JDK 17**. The jar targets Java 8 bytecode (`--release 8`) and recent
@@ -114,19 +114,30 @@ Do not "fix" code to match the spec on these points.
 
 ## Releasing
 
-Only relevant to maintainers, and it has bitten twice, so it is written down.
+Only relevant to maintainers. Published to **Maven Central**, and every step below exists because
+something failed there.
 
 1. Bump the version in `pom.xml`, `liquibase-partitionctl/pom.xml`,
-   `examples/liquibase/pom.xml`, `docs/experiments/poc-trees/m4-e2e/pom.xml`, and both READMEs.
+   `examples/liquibase/pom.xml`, `docs/experiments/poc-trees/m4-e2e/pom.xml`, and all three
+   READMEs. `git grep -n 0\.1\.` finds them.
 2. `./mvnw clean install` and the Go gate.
-3. Tag `vX.Y.Z` and push the tag.
-4. Wait for `https://jitpack.io/api/builds/com.github.atulsinha87/partitionctl/vX.Y.Z` to report
-   `"status": "ok"`. Read the build log if it does not.
-5. `make lb-adopter`.
+3. `./mvnw -Prelease deploy`. This signs with GPG and **stages** to the Central Portal; it does not
+   publish. `autoPublish=false` is deliberate.
+4. Publish the staged deployment at
+   [central.sonatype.com/publishing/deployments](https://central.sonatype.com/publishing/deployments),
+   after checking the file list carries jar, sources, javadoc, pom and an `.asc` for each.
+5. Wait for it to reach `repo1.maven.org` (10-30 minutes), then `make lb-adopter`, which resolves
+   the *published* artifact rather than a local build.
+6. Tag `vX.Y.Z` and push the tag.
 
-**JitPack caches one build result per version, permanently.** A failed build means that version is
-spent: re-pointing the tag does *not* retrigger it, the API keeps reporting the original commit.
-Cut the next version instead. Never move a published tag.
+**A published version is permanent.** Central allows no delete, replace or overwrite - only a
+higher version. Everything before step 4 can be dropped and redone; nothing after it can.
+
+Prerequisites, none of which live in this repository: a Central Portal account with the
+`io.github.atulsinha87` namespace verified, a GPG key whose public half is on a keyserver, and
+`~/.m2/settings.xml` with a `<server>` whose id is `central`. Verify the key is genuinely
+retrievable — `gpg --send-keys` reports success on submission, not on acceptance, and a key that
+never landed fails validation with "Could not find a public key by the key fingerprint".
 
 ---
 

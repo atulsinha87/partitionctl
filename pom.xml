@@ -2,9 +2,9 @@
 <!--
   Aggregator, and nothing more.
 
-  It exists so JitPack can build this repository: the Maven project lives in
-  liquibase-partitionctl/, not at the root, and JitPack builds from the root. Listing the
-  module here is what makes `mvn install` at the root reach it.
+  It exists so that `mvn` at the repository root reaches the module: the Maven project lives
+  in liquibase-partitionctl/, not at the root. Listing the module here is what makes
+  `./mvnw clean install` at the root build it.
 
   It does NOT make the repository a Maven project. The root is a Go CLI; the Java extension
   under liquibase-partitionctl/ is a separate product that shares no code with it. This
@@ -42,7 +42,7 @@
   </scm>
 
   <!--
-    Never deployed. This aggregator exists only so JitPack (and `mvn` at the root) can reach the
+    Never deployed. This aggregator exists only so `mvn` at the root can reach the
     module; it is not an artifact anyone should depend on, and it has no distributionManagement,
     so maven-deploy-plugin would fail the release trying to publish it. The extension module
     publishes itself through central-publishing-maven-plugin.

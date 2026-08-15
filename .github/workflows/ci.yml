@@ -3,7 +3,7 @@
 # Scope, deliberately: this runs only what needs no database. The Docker-backed gates -
 # `make demo-all`, `make lb-e2e`, and `make lb-adopter` - are run locally by maintainers and
 # contributors, and CONTRIBUTING.md says which one to run for which change. `lb-adopter` in
-# particular resolves the published artifact from jitpack.io, so putting it here would make
+# particular resolves the published artifact from Maven Central, so putting it here would make
 # every build depend on a third-party service being up.
 #
 # What this DOES buy: an incoming pull request becomes reviewable without checking out the

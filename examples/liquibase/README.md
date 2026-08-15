@@ -1,7 +1,7 @@
-# Using liquibase-partitionctl from JitPack — a complete example
+# Using liquibase-partitionctl from Maven Central — a complete example
 
 The smallest working consumer of the extension: one `pom.xml`, one changelog. The extension is
-resolved from JitPack exactly as an adopter would resolve it — nothing here is built from this
+resolved from Maven Central exactly as an adopter would resolve it — nothing here is built from this
 repository's source, so this example doubles as the release gate: **if it runs, the published
 artifact works.**
 
@@ -50,23 +50,19 @@ connect otherwise fails with `invalid value for parameter "TimeZone"`.
 
 ## Adapting this to your own project
 
-### `pom.xml` — copy two blocks, verbatim
+### `pom.xml` — copy one block, verbatim
 
-If you already have a Maven project with the liquibase-maven-plugin, you take exactly two
-things from this example's pom:
+The extension is on Maven Central, so there is no repository to declare. If you already have a
+Maven project with the liquibase-maven-plugin, you take exactly one thing from this example's
+pom — the dependency, inside **the plugin's own `<dependencies>`**:
 
-1. **The `<pluginRepositories>` block**, as-is. It must be `pluginRepositories` — see the
-   mistakes section below for why `<repositories>` fails misleadingly.
-
-2. **The extension dependency, inside the liquibase-maven-plugin's own `<dependencies>`:**
-
-   ```xml
-   <dependency>
-     <groupId>com.github.atulsinha87.partitionctl</groupId>
-     <artifactId>liquibase-partitionctl</artifactId>
-     <version>v0.1.2</version>
-   </dependency>
-   ```
+```xml
+<dependency>
+  <groupId>io.github.atulsinha87</groupId>
+  <artifactId>liquibase-partitionctl</artifactId>
+  <version>0.1.3</version>
+</dependency>
+```
 
 Everything else in this example's pom — the `db.*` properties, the changelog path, the driver —
 is scaffolding for the demo; keep whatever your project already has. What must hold in *your*
@@ -74,10 +70,9 @@ configuration:
 
 | In your pom | Requirement |
 |---|---|
-| `<pluginRepositories>` | contains `https://jitpack.io` |
 | Plugin's `<dependencies>` | the extension **and** a PostgreSQL JDBC driver |
-| Coordinate | `com.github.atulsinha87.partitionctl` — the JitPack groupId, **not** the `io.github.atulsinha87` you will see inside the jar's own pom |
-| Version | a git tag, `v`-prefix included: `v0.1.2` |
+| Coordinate | `io.github.atulsinha87:liquibase-partitionctl` |
+| Version | `0.1.3` |
 
 ### `changelogs/changelog.xml` — what to change, what must stay
 
@@ -104,17 +99,12 @@ from the extension jar — nothing is fetched over the network, and a trimmed he
 | `<column>` elements | `created_at` desc, `customer_id` | your key — order matters, `descending` is per column |
 | `paceSeconds` | `1` | optional; delay between partitions on a busy cluster. Omit for none. It is **not** bounded by your `statement_timeout` — the extension lifts the timeout around the sleep and restores it. Budget for total wall-clock instead: `paceSeconds` × partitions, against any CI or deploy job timeout |
 
-## The two mistakes that cost adopters the most time
+## The mistake that costs adopters the most time
 
-1. **JitPack must be a `<pluginRepository>`, not a `<repository>`.** The extension lives inside
-   the liquibase-maven-plugin's own `<dependencies>`, which makes it a *plugin* dependency, and
-   Maven resolves those from plugin repositories only. Under `<repositories>` Maven never
-   contacts JitPack and fails with `Could not find artifact ... in central` — which reads like
-   the artifact does not exist, not like a misplaced element.
-
-2. **The extension goes in the plugin's `<dependencies>`, not the project's.** In your project's
-   dependencies it is invisible to Liquibase, and every `<ext:...>` tag fails with
-   "no declaration can be found".
+**The extension goes in the plugin's `<dependencies>`, not the project's.** In your project's
+dependencies it is invisible to Liquibase, and every `<ext:...>` tag fails with "no declaration
+can be found" — an error that points at your changelog rather than at your pom, which is what
+makes it cost an hour.
 
 For the full attribute reference, the reindex and drop changes, preconditions, rollback and
 troubleshooting, see [liquibase-partitionctl/README.md](../../liquibase-partitionctl/README.md).
