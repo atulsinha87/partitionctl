@@ -1,0 +1,64 @@
+# Weekly proof that the PUBLISHED artifact still works.
+#
+# This is the only gate that resolves io.github.atulsinha87:liquibase-partitionctl from Maven
+# Central and runs it against a real PostgreSQL. Everything in ci.yml builds from source, so all
+# of it would stay green if the published jar were broken, missing, or never uploaded.
+#
+# Why it is scheduled rather than run on every pull request: it depends on Maven Central being
+# reachable and on a version that does not change between commits. On the PR path that buys
+# nothing and makes an unrelated outage look like a broken branch.
+#
+# It also covers a platform this project otherwise never tests. Every other measurement in this
+# repository was taken on macOS/arm64; this runs on Linux/amd64.
+#
+# NOTE: GitHub disables scheduled workflows in a repository with no pushes for 60 days, and
+# re-enabling is manual. If this stops reporting, check that first.
+name: Adopter (published artifact)
+
+on:
+  schedule:
+    # Mondays, 06:17 UTC. Off the hour deliberately: scheduled jobs at :00 queue behind the
+    # whole platform's cron stampede and start late.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adopter:
+    name: examples/liquibase against Maven Central
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # Fails fast and unambiguously if Central is the problem, before a database is involved.
+      # An empty local repository is the point: with the default one, an artifact cached by an
+      # earlier step could make a vanished release look present.
+      - name: Resolve the published artifact from Maven Central
+        run: |
+          version=$(sed -n 's/.*<version>\(.*\)<\/version>.*/\1/p' \
+                     liquibase-partitionctl/pom.xml | head -1)
+          echo "version under test: $version"
+          mvn -B -q dependency:get \
+            -Dartifact=io.github.atulsinha87:liquibase-partitionctl:$version \
+            -Dmaven.repo.local=/tmp/central-only
+          find /tmp/central-only -name 'liquibase-partitionctl-*.jar'
+
+      # `make lb-adopter` starts its own PostgreSQL 17 container, loads the 12-partition
+      # 1.2M-row fixture, runs `mvn liquibase:update` in examples/liquibase, and then ASSERTS
+      # the result from pg_catalog. The assertion is in the Makefile rather than here so that a
+      # local run and this job execute the same check.
+      - name: make lb-adopter
+        run: make lb-adopter
+
+      - name: Show the container log if it failed
+        if: failure()
+        run: docker logs partitionctl-lb 2>&1 | tail -50 || true

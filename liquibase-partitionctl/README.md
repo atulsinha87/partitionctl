@@ -338,6 +338,65 @@ A hand-written rollback block works end to end:
 
 ---
 
+## Running it from CI (Jenkins, and anything like it)
+
+Nothing here is CI-aware — it is an ordinary Maven dependency, so the work is classpath,
+credentials and timeouts. A Jenkins pipeline needs four things.
+
+```groovy
+pipeline {
+  agent any
+  environment {
+    // A non-UTC agent fails the JDBC connect outright with
+    //   invalid value for parameter "TimeZone"
+    MAVEN_OPTS = '-Duser.timezone=UTC'
+  }
+  stages {
+    stage('Migrate') {
+      steps {
+        // Hours, not minutes, on a large partitioned table. See the note below on aborts.
+        timeout(time: 4, unit: 'HOURS') {
+          withCredentials([usernamePassword(credentialsId: 'pg-migrator',
+                                            usernameVariable: 'DB_USER',
+                                            passwordVariable: 'DB_PASS')]) {
+            sh '''mvn -B liquibase:update \
+                     -Dliquibase.username=$DB_USER \
+                     -Dliquibase.password=$DB_PASS'''
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+| | |
+|---|---|
+| **Timezone** | `MAVEN_OPTS=-Duser.timezone=UTC` on any agent that is not already UTC |
+| **Credentials** | `withCredentials`, passed as `-D` properties. Never in the pom |
+| **Timeout** | Generous. `CREATE INDEX CONCURRENTLY` across many partitions runs for hours |
+| **Changeset flags** | `runInTransaction="false"` is mandatory; `runAlways="true"` for create, never for reindex |
+
+Since it is on Maven Central, there is no repository to declare and nothing for a corporate proxy
+to whitelist beyond Central itself, which every Java shop already allows.
+
+### What happens when the job is killed
+
+Better than you would expect, and worth knowing before you set that timeout:
+
+- **A failed or aborted changeset is never written to `DATABASECHANGELOG`** — not even as a failed
+  marker. The next run retries it, re-discovers the catalog, and emits only the outstanding work.
+  Resume is automatic: no state file, no `--force`. Verified here with `SIGKILL` mid-flight.
+- An interrupted `CREATE INDEX CONCURRENTLY` leaves an **invalid** child index. Discovery treats
+  invalid children as absent and rebuilds them rather than attaching them, so a re-run repairs it.
+- **The one thing needing a human:** a killed JVM can leave `DATABASECHANGELOGLOCK` held, and the
+  next run then fails with "Could not acquire change log lock". That is Liquibase's behaviour, not
+  this extension's. Clear it with `mvn liquibase:releaseLocks`, and only once you are certain no
+  run is still live.
+
+Progress is one line per partition at the default log level, so a long run keeps producing output
+rather than looking hung to a "no output for N minutes" watchdog.
+
 ## Troubleshooting
 
 Every error below is verbatim from a real run.

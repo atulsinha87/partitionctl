@@ -255,6 +255,25 @@ lb-adopter: lb-fixture ## Prove the PUBLISHED artifact: examples/liquibase resol
 	         (SELECT count(*) FROM pg_inherits ii JOIN pg_index ix ON ix.indexrelid = ii.inhrelid \
 	           WHERE ii.inhparent = (SELECT oid FROM p) AND ix.indisvalid) AS attached_and_valid, \
 	         (SELECT count(*) FROM orders) AS rows_intact;"
+	@# The table above is for a human. This asserts it, because a target that only prints
+	@# cannot fail, and a check that cannot fail is not a check. Until this existed, a run
+	@# that indexed 3 of 12 leaves exited 0 exactly like one that indexed all 12.
+	@got=$$(docker exec -i $(LB_PG_CONTAINER) psql -qtAX -U $(PG_USER) -d $(PG_DB) -c " \
+	  WITH p AS (SELECT c.oid, i.indisvalid FROM pg_class c \
+	               JOIN pg_index i ON i.indexrelid = c.oid \
+	              WHERE c.relname = 'idx_orders_created' AND c.relkind = 'I') \
+	  SELECT (SELECT indisvalid FROM p)::text \
+	    || '|' || (SELECT count(*) FROM pg_inherits WHERE inhparent = (SELECT oid FROM p)) \
+	    || '|' || (SELECT count(*) FROM pg_inherits ii JOIN pg_index ix ON ix.indexrelid = ii.inhrelid \
+	                WHERE ii.inhparent = (SELECT oid FROM p) AND ix.indisvalid) \
+	    || '|' || (SELECT count(*) FROM orders);"); \
+	 want='true|12|12|1200000'; \
+	 if [ "$$got" != "$$want" ]; then \
+	   echo "FAIL: parent_valid|attached|attached_and_valid|rows_intact was [$$got], want [$$want]"; \
+	   echo "The PUBLISHED artifact did not index this fixture correctly."; \
+	   exit 1; \
+	 fi; \
+	 echo "PASS: $$want"
 
 lb-clean: lb-db-down ## Remove the plugin database and the harness build output
 	@rm -rf $(LB_E2E)/target $(LB_DIR)/target examples/liquibase/target
